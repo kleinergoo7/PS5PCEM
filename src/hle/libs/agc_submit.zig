@@ -1065,6 +1065,30 @@ fn findSubmissionHeaderCollision(address: u64, byte_length: usize) ?SubmissionHe
     return null;
 }
 
+/// Upper bound for one on-demand commit. The largest legitimate span seen is
+/// a 320 MiB depth array; the cap only stops a wild descriptor from asking for
+/// an arbitrary amount of host memory.
+const on_demand_commit_limit: u64 = 512 * 1024 * 1024;
+
+var commit_reports: std.atomic.Value(u32) = .init(0);
+
+/// Commit reservation pages covering [address, address+size) so a GPU access
+/// into the uncommitted remainder of an arena can proceed. Returns the number
+/// of pages committed; committed intervals and holes are left untouched.
+fn commitReservationPages(address: u64, size: usize) usize {
+    const space = memory.attachedAddressSpace() orelse return 0;
+    if (size == 0 or size > on_demand_commit_limit) return 0;
+    const page = guest_address_space.page_size;
+    const start = address & ~(page - 1);
+    const end = (address +| @as(u64, size) +| (page - 1)) & ~(page - 1);
+    if (end <= start) return 0;
+    const committed = space.commitReserved(start, end - start, .read_write);
+    if (committed != 0 and commit_reports.fetchAdd(1, .monotonic) < 8) {
+        std.debug.print("[commit] addr=0x{x} size=0x{x} pages={d}\n", .{ start, end - start, committed });
+    }
+    return committed;
+}
+
 fn borrowGuestRead(space: *guest_address_space.AddressSpace, address: u64, size: usize) ?guest_address_space.AddressSpace.ReadLease {
     if (space.borrowReadable(address, size)) |lease| return lease;
     // Alias lookup never holds its lock while acquiring the mapping lock.
@@ -1076,10 +1100,21 @@ fn borrowGuestRead(space: *guest_address_space.AddressSpace, address: u64, size:
 pub fn readGuestMemory(context: ?*anyopaque, address: u64, bytes: []u8) bool {
     if (video_out.readLabelMemory(address, bytes)) return true;
     if (addressSpaceFromContext(context) orelse memory.attachedAddressSpace()) |space| {
-        var lease = borrowGuestRead(space, address, bytes.len) orelse return false;
-        defer lease.release();
-        gpu.parallel_copy.guest_copy_pool.copy(bytes, lease.bytes);
-        return true;
+        var lease = borrowGuestRead(space, address, bytes.len);
+        if (lease == null) {
+            // GPU scratch: the title reserves VA and commits pieces lazily.
+            // Commit what is still reserved so the GPU can read the data
+            // instead of failing the whole dispatch.
+            _ = commitReservationPages(address, bytes.len);
+            lease = borrowGuestRead(space, address, bytes.len);
+        }
+        if (lease) |held| {
+            var mutable = held;
+            defer mutable.release();
+            gpu.parallel_copy.guest_copy_pool.copy(bytes, mutable.bytes);
+            return true;
+        }
+        return false;
     }
     // Prefer a known AGC arena alias. Compact GPU VAs live in the broad guest
     // reservation too, but do not necessarily have committed CPU pages there.
@@ -1458,6 +1493,12 @@ fn writeGuestMemoryWithPattern(context: ?*anyopaque, address: u64, bytes: []cons
             submission_header_write_reports += 1;
         }
         return false;
+    }
+    // GPU scratch written by an earlier pass may sit in an uncommitted
+    // reservation; commit it here, at the write entry point, so writeback can
+    // reach it. `resolveGuestMemoryAddress` stays a pure translation.
+    if (!memory.isGuestRangeAccessible(address, bytes.len)) {
+        _ = commitReservationPages(address, bytes.len);
     }
     const resolved = resolveGuestMemoryAddress(address, bytes.len) orelse return false;
     const trace_min = @atomicLoad(u64, &trace_guest_write_min_bytes, .monotonic);

@@ -538,6 +538,25 @@ test "mapping identities survive splits and reject remapped allocation backing" 
     try std.testing.expectEqual(@as(u64, 0), space.mappingIdentity(std.math.maxInt(u64), 2));
 }
 
+test "commitReserved fills only reservation intervals" {
+    var space = try AddressSpace.init(std.testing.allocator);
+    defer space.deinit();
+
+    const base = user.start + 0x400000;
+    try space.reserveFixed(base, 6 * page_size);
+    try space.mapInReservation(base + 2 * page_size, page_size, .read_write, .private, null);
+
+    const committed = space.commitReserved(base, 6 * page_size, .read_write);
+    try std.testing.expectEqual(@as(usize, 5), committed);
+    try std.testing.expectEqual(MappingKind.private, space.query(base, false).?.kind);
+    try std.testing.expectEqual(MappingKind.private, space.query(base + 5 * page_size, false).?.kind);
+    try std.testing.expect(space.isWritable(base, page_size));
+    try std.testing.expect(space.isWritable(base + 5 * page_size, page_size));
+
+    // A second pass has nothing left to commit.
+    try std.testing.expectEqual(@as(usize, 0), space.commitReserved(base, 6 * page_size, .read_write));
+}
+
 test "system-managed aligned direct allocations support guest-page recycling" {
     const base = system_managed.start;
     const granule = windows_allocation_granularity;
@@ -2000,6 +2019,48 @@ pub const AddressSpace = struct {
             .pooled = reservation.pooled,
             .name = if (reservation.pooled) reservation.name else namedMapping("anon"),
         });
+    }
+
+    /// Commits reservation-only intervals covering [address, address+size).
+    ///
+    /// The guest reserves VA and commits pieces as it needs them. A GPU access
+    /// into the uncommitted remainder must not fail the whole dispatch, so the
+    /// renderer asks for those pages to be committed on demand. Only intervals
+    /// still marked `.reserved` are touched: committed mappings keep their
+    /// backing and holes are skipped. The whole walk runs under one lock.
+    ///
+    /// `.private` is deliberate: these pages belong to the guest's own arena,
+    /// not to the flexible-memory budget the title sees through
+    /// `sceKernelAvailableFlexibleMemorySize`.
+    pub fn commitReserved(self: *AddressSpace, address: u64, size: u64, protection: Protection) usize {
+        if (size == 0) return 0;
+        const end = std.math.add(u64, address, size) catch return 0;
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        var committed: usize = 0;
+        var cursor = address;
+        while (cursor < end) {
+            const index = firstOverlappingMapping(self.mappings.items, cursor);
+            if (index == self.mappings.items.len) break;
+            const mapping = self.mappings.items[index];
+            if (mapping.address > cursor) {
+                cursor = @min(mapping.address, end);
+                continue;
+            }
+            const segment_end = @min(mapping.end(), end);
+            if (mapping.kind == .reserved) {
+                const length = segment_end - cursor;
+                self.mapInReservationLocked(cursor, length, protection, .private, null) catch {
+                    cursor = segment_end;
+                    continue;
+                };
+                committed += @intCast(length / page_size);
+            }
+            cursor = segment_end;
+        }
+        return committed;
     }
 
     pub fn hasPooledMappings(self: *AddressSpace, address: u64, size: u64) bool {
