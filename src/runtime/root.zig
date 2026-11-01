@@ -443,6 +443,15 @@ pub const Runtime = struct {
             try self.runInitializerList(prepared, executable.preinit_functions.items);
             executable.preinitializers_ran = true;
         }
+        // The executable's own constructors are as much a part of process
+        // startup as the modules'. Leaving them to the entry point only works
+        // when the entry is the CRT; titles that jump straight to their own
+        // entry (or run them from a worker) never execute them, which is how a
+        // render context stayed null until a BPE worker dereferenced it.
+        if (!executable.initializers_ran) {
+            try self.runInitializerList(prepared, executable.init_functions.items);
+            executable.initializers_ran = true;
+        }
         for (options.modules) |module| {
             if (module.initializers_ran) continue;
             try self.runInitializerList(prepared, module.init_functions.items);
@@ -945,7 +954,7 @@ test "runtime owns the optional native CPU bridge lifecycle" {
     try testing.expect(!runtime.native_cpu_bridge.isInitialized());
 }
 
-test "process dispatch leaves executable initialization to its CRT entry" {
+test "process dispatch runs executable and module initializers" {
     var runtime = Runtime{};
     try runtime.init(testing.allocator);
     defer runtime.deinit();
@@ -993,18 +1002,18 @@ test "process dispatch leaves executable initialization to its CRT entry" {
     try testing.expectEqual(@as(u64, 0x400), result);
     try testing.expectEqualSlices(
         u64,
-        &.{ 0x101, 0x102, 0x201, 0x400 },
+        &.{ 0x101, 0x102, 0x301, 0x302, 0x201, 0x400 },
         bridge.entries[0..bridge.count],
     );
-    for (bridge.kinds[0..3]) |kind| {
+    for (bridge.kinds[0..5]) |kind| {
         try testing.expectEqual(cpu.EntryKind.module_initializer, kind);
     }
-    try testing.expectEqual(cpu.EntryKind.process_entry, bridge.kinds[3]);
+    try testing.expectEqual(cpu.EntryKind.process_entry, bridge.kinds[5]);
     try testing.expectEqual(@as(u8, 2), bridge.final_argument_count);
     try testing.expectEqual(@as(u64, 0x55), bridge.final_arguments[1]);
     try testing.expectEqual(bridge.final_arguments[0], bridge.final_stack_pointer.?);
     try testing.expect(executable.preinitializers_ran);
-    try testing.expect(!executable.initializers_ran);
+    try testing.expect(executable.initializers_ran);
     try testing.expect(module.initializers_ran);
 
     var encoded: [@sizeOf(process.EntryParams)]u8 = undefined;
