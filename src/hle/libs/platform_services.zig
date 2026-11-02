@@ -10,6 +10,7 @@ const abi = @import("../abi.zig");
 const trace = @import("../trace.zig");
 const errno = @import("../errno.zig");
 const symbols = @import("../symbols.zig");
+const services = @import("services.zig");
 const kernel_runtime = @import("kernel_runtime.zig");
 const kernel_memory = @import("kernel_memory.zig");
 const video_out = @import("../video_out.zig");
@@ -649,6 +650,7 @@ const net_ctl_exports = [_]symbols.Export{
     .{ .name = "sceNetCtlUnregisterCallback", .function = trace.wrap("sceNetCtlUnregisterCallback", &netCtlUnregisterCallback), .expect_id = "Rqm2OnZMCz0" },
     .{ .name = "sceNetCtlGetResult", .function = trace.wrap("sceNetCtlGetResult", &netCtlGetResult), .expect_id = "0cBgduPRR+M" },
     .{ .name = "sceNetCtlGetInfo", .function = trace.wrap("sceNetCtlGetInfo", &netCtlGetInfo), .expect_id = "obuxdTiwkF8" },
+    .{ .name = "sceNetCtlGetIfStat", .function = trace.wrap("sceNetCtlGetIfStat", &services.absent), .expect_id = "teuK4QnJTGg" },
 };
 
 const rtc_exports = [_]symbols.Export{
@@ -702,6 +704,7 @@ test "Unity bootstrap platform services register" {
     try register(&db, std.testing.allocator);
     try std.testing.expect(db.findByName("sceAppContentInitialize", .function) != null);
     try std.testing.expect(db.findByName("sceRtcGetCurrentTick", .function) != null);
+    try std.testing.expect(db.findById("teuK4QnJTGg", .function) != null);
 }
 
 test "RTC calendar and tick conversions preserve subsecond time" {
@@ -831,6 +834,7 @@ test "network control reports a coherent disconnected console" {
     var info: [256]u8 = [_]u8{0xff} ** 256;
     try std.testing.expectEqual(net_ctl_error_not_connected, netCtlGetInfo(14, &info));
     try std.testing.expectEqualSlices(u8, &([_]u8{0} ** 256), &info);
+    try std.testing.expectEqual(errno.KernelError.enosys.raw(), services.absent(0, 0, 0, 0, 0, 0));
 }
 
 test "temporary data mount returns a zero-terminated mount point" {
