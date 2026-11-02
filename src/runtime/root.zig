@@ -9,6 +9,7 @@
 //! interface, and returns fully mapped and relocated modules.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const memory = @import("memory");
 const loader = @import("loader");
 const hle = @import("hle");
@@ -105,6 +106,7 @@ pub const Runtime = struct {
         hle.libs.kernel_event_queue.reset();
         hle.libs.kernel_ioctl.reset();
         hle.libs.network.reset();
+        hle.libs.services.reset();
         hle.libs.system_service.reset();
         hle.libs.user_service.reset();
         hle.libs.pad.reset();
@@ -142,6 +144,7 @@ pub const Runtime = struct {
         hle.libs.kernel_event_queue.reset();
         hle.libs.kernel_ioctl.reset();
         hle.libs.network.reset();
+        hle.libs.services.reset();
         hle.libs.system_service.reset();
         hle.libs.user_service.reset();
         hle.libs.pad.reset();
@@ -683,6 +686,25 @@ fn resolveImport(raw_context: ?*anyopaque, import: *const loader.Import) ?u64 {
 /// table knows. Keep the fallback deliberately narrow and function-only: data
 /// objects and TLS require real storage and must never point at a callable
 /// refusal stub.
+fn logMissingImport(library: []const u8, id: []const u8) void {
+    // Early boot logging can be lost when the process exits through the
+    // fault path, so missing imports go to a stable side file via raw
+    // syscalls instead of stderr.
+    if (builtin.os.tag != .linux) return;
+    const path: [*:0]const u8 = "/dev/shm/hle-missing-imports.log";
+    const fd = std.os.linux.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true }, 0o644);
+    const err = std.os.linux.errno(fd);
+    if (err != .SUCCESS) return;
+    defer _ = std.os.linux.close(@intCast(fd));
+    var buf: [128]u8 = undefined;
+    const line = std.fmt.bufPrint(&buf, "{s} needs {s}\n", .{ library, id }) catch return;
+    var written: usize = 0;
+    while (written < line.len) {
+        const result = std.os.linux.write(@intCast(fd), line[written..].ptr, line.len - written);
+        if (std.os.linux.errno(result) != .SUCCESS or result == 0) return;
+        written += result;
+    }
+}
 fn unsupportedServiceFunction(import: *const loader.Import) ?u64 {
     if (import.symbol_type != .func) return null;
     const library = import.library orelse return null;
@@ -695,6 +717,7 @@ fn unsupportedServiceFunction(import: *const loader.Import) ?u64 {
         return @intFromPtr(&hle.libs.services.offline);
     }
     if (std.mem.eql(u8, library, "libSceJson2")) {
+        logMissingImport(library, import.id);
         return @intFromPtr(hle.trace.wrap("unimplemented libSceJson2", &hle.libs.services.absent));
     }
     return null;

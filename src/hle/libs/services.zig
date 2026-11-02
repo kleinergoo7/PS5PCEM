@@ -27,6 +27,7 @@ const trace = @import("../trace.zig");
 const errno = @import("../errno.zig");
 const symbols = @import("../symbols.zig");
 const kernel_memory = @import("kernel_memory.zig");
+const kernel_threading = @import("kernel_threading.zig");
 
 /// Status a service library returns when it has not been, and cannot be,
 /// brought up.
@@ -316,6 +317,52 @@ var np_requests: NpRequests = .{};
 var np_trophy_next_context = std.atomic.Value(i32).init(1);
 var np_trophy_next_handle = std.atomic.Value(i32).init(1);
 var np_webapi_next_push_handle = std.atomic.Value(i32).init(1);
+
+/// NP state notification. Real firmware delivers the current NP state through
+/// the registered callback when the title pumps sceNpCheckCallback; a title
+/// that never hears back never finishes bringing its online services up.
+/// The offline account stays signed in (same 2 as npGetState reports), so the
+/// one pending notification carries signed-in, then the pump goes quiet.
+const np_state_signed_in: u64 = 2;
+var np_state_mutex: @import("memory").HostMutex = .{};
+var np_state_callback: u64 = 0;
+var np_state_userdata: u64 = 0;
+var np_state_pending: bool = false;
+
+pub fn reset() void {
+    np_state_mutex.lock();
+    defer np_state_mutex.unlock();
+    np_state_callback = 0;
+    np_state_userdata = 0;
+    np_state_pending = false;
+}
+
+pub fn npRegisterStateCallback(callback: u64, userdata: u64, _: u64, _: u64, _: u64, _: u64) callconv(abi.guest) i32 {
+    np_state_mutex.lock();
+    defer np_state_mutex.unlock();
+    np_state_callback = callback;
+    np_state_userdata = userdata;
+    np_state_pending = callback != 0;
+    return errno.ok;
+}
+
+pub fn npCheckCallback(_: u64, _: u64, _: u64, _: u64, _: u64, _: u64) callconv(abi.guest) i32 {
+    np_state_mutex.lock();
+    const callback = np_state_callback;
+    const userdata = np_state_userdata;
+    const pending = np_state_pending;
+    np_state_pending = false;
+    np_state_mutex.unlock();
+    // The pump runs on the title's own polling thread, which is exactly
+    // where firmware invokes the callback. A failed delivery must not fail
+    // the pump itself: the title would stop polling.
+    if (pending and callback != 0) {
+        _ = kernel_threading.callGuestCurrent(callback, &.{ np_state_signed_in, userdata }) catch |err| {
+            std.debug.print("[np] state callback 0x{x} failed: {s}\n", .{ callback, @errorName(err) });
+        };
+    }
+    return errno.ok;
+}
 
 /// NP requests are local bookkeeping objects. Creating one does not contact
 /// PSN, so an offline console still returns a usable request identifier.
@@ -610,6 +657,18 @@ pub fn count() usize {
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
+
+test "offline NP state callback queues one signed-in delivery" {
+    reset();
+    try testing.expectEqual(errno.ok, npRegisterStateCallback(0x1234, 0x5678, 0, 0, 0, 0));
+    // No executor is attached in a unit test, so delivery fails and is
+    // swallowed; the pump still reports ok and goes quiet afterwards.
+    try testing.expectEqual(errno.ok, npCheckCallback(0, 0, 0, 0, 0, 0));
+    try testing.expectEqual(errno.ok, npCheckCallback(0, 0, 0, 0, 0, 0));
+    try testing.expectEqual(errno.ok, npRegisterStateCallback(0, 0x5678, 0, 0, 0, 0));
+    try testing.expectEqual(errno.ok, npCheckCallback(0, 0, 0, 0, 0, 0));
+    reset();
+}
 
 test "an absent service reports absence rather than success" {
     // A title told its request succeeded goes looking for a result nothing
