@@ -761,6 +761,7 @@ fn reportFaultAddressSpace(address_space: *memory.AddressSpace, fault: FaultInfo
     reportFaultBytes(address_space, "rbp", fault.registers.rbp);
     reportFaultBytes(address_space, "rsi", fault.registers.rsi);
     reportFaultBytes(address_space, "rdi", fault.registers.rdi);
+    reportFaultGraph(address_space, fault);
     if (memory.isHostRangeReadable(fault.registers.r13, 4) and
         memory.isHostRangeReadable(fault.registers.r9, 4))
     {
@@ -781,6 +782,65 @@ fn reportFaultBytes(address_space: *memory.AddressSpace, label: []const u8, addr
     @memcpy(&bytes, source[0..bytes.len]);
     const hex = std.fmt.bytesToHex(bytes, .lower);
     std.debug.print("[cpu fault bytes] {s}@0x{x}={s}\n", .{ label, address, &hex });
+}
+
+/// Dumps one level of guest object graph around the fault registers so a
+/// null factory can be traced to its parent. Gated by PS5_FAULT_GRAPH=1;
+/// silent otherwise.
+fn reportFaultGraph(address_space: *memory.AddressSpace, fault: FaultInfo) void {
+    if (std.c.getenv("PS5_FAULT_GRAPH") == null) return;
+    const regs = [_]struct { label: []const u8, address: u64 }{
+        .{ .label = "rbx", .address = fault.registers.rbx },
+        .{ .label = "rax", .address = fault.registers.rax },
+        .{ .label = "rcx", .address = fault.registers.rcx },
+        .{ .label = "rdx", .address = fault.registers.rdx },
+        .{ .label = "rsi", .address = fault.registers.rsi },
+    };
+    for (regs) |reg| {
+        if (reg.address < 0x1_0000) {
+            std.debug.print("[cpu fault graph] {s}=0x{x} unreadable\n", .{ reg.label, reg.address });
+            continue;
+        }
+        var raw: [160]u8 = .{0} ** 160;
+        if (address_space.read(reg.address, &raw)) {
+            // fall through to decode below
+        } else |_| {
+            std.debug.print("[cpu fault graph] {s}=0x{x} unreadable\n", .{ reg.label, reg.address });
+            continue;
+        }
+        const words: [20]u64 = std.mem.bytesAsValue([20]u64, &raw).*;
+        std.debug.print("[cpu fault graph] {s}=0x{x} words={x}-{x}-{x}-{x}-{x}-{x}-{x}-{x}-{x}-{x}-{x}-{x}-{x}-{x}-{x}-{x}-{x}-{x}-{x}-{x}\n", .{
+            reg.label, reg.address, words[0],  words[1],  words[2],  words[3],
+            words[4],  words[5],    words[6],  words[7],  words[8],  words[9],
+            words[10], words[11],   words[12], words[13], words[14], words[15],
+            words[16], words[17],   words[18], words[19],
+        });
+        for (words, 0..) |word, i| {
+            if (word < 0x1_0000) continue;
+            var head: [32]u8 = .{0} ** 32;
+            if (address_space.read(word, &head)) {} else |_| continue;
+            const head_words: [4]u64 = std.mem.bytesAsValue([4]u64, head[0..32]).*;
+            std.debug.print("[cpu fault graph] {s}[{d}]->0x{x} head={x}-{x}-{x}-{x}\n", .{
+                reg.label, i, word, head_words[0], head_words[1], head_words[2], head_words[3],
+            });
+            // If the target looks like a vtable (entries point at readable
+            // code), dump the first bytes of the first methods so the
+            // class can be identified by disassembly.
+            if (i == 1 and std.mem.eql(u8, reg.label, "rbx")) {
+                for (head_words, 0..) |method, j| {
+                    if (method < 0x1_0000) continue;
+                    if (address_space.query(method, false)) |mapping| {
+                        std.debug.print("[cpu fault graph] vtable[{d}]@0x{x} in {s} range=0x{x}-0x{x} r{d}w{d}x{d} name={s}\n", .{
+                            j,                                     method,                                 @tagName(mapping.kind),                   mapping.address,                   mapping.end(),
+                            @intFromBool(mapping.protection.read), @intFromBool(mapping.protection.write), @intFromBool(mapping.protection.execute), std.mem.sliceTo(&mapping.name, 0),
+                        });
+                    } else {
+                        std.debug.print("[cpu fault graph] vtable[{d}]@0x{x} unmapped\n", .{ j, method });
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn resolveStackPointer(request: ExecuteRequest) ?u64 {

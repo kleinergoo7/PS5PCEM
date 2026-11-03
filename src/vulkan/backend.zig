@@ -40296,8 +40296,8 @@ pub const Renderer = struct {
             if (preparation_stats.submitted != 0 or preparation_stats.shared_walks != 0) {
                 const workers = self.resource_preparation.queue.status();
                 std.debug.print(
-                    "[gpu resource workers] flip={d} cumulative_jobs={d} shared_walks={d} shared_loops={d}/{d} cached_walks={d}/{d} cache_kib={d} used={d} fallback={d} worker_ms={d} wait_ms={d} limit={d} threads={d} peak={d} auto={any} changes={d}/{d} job_us={d} queue_us={d}\n",
-                    .{ self.flip_callbacks, preparation_stats.submitted, preparation_stats.shared_walks, preparation_stats.shared_loop_walks, preparation_stats.shared_loop_fallbacks, preparation_stats.cached_walks, preparation_stats.cache_misses, self.resource_preparation.walk_cache.bytes / 1024, preparation_stats.used, preparation_stats.fallback, preparation_stats.worker_ns / std.time.ns_per_ms, preparation_stats.wait_ns / std.time.ns_per_ms, workers.limit, workers.threads, workers.peak_active, workers.adaptation.enabled, workers.adaptation.increases, workers.adaptation.decreases, workers.adaptation.average_job_ns / std.time.ns_per_us, workers.adaptation.average_wait_ns / std.time.ns_per_us },
+                    "[gpu resource workers] flip={d} cumulative_jobs={d} shared_walks={d} shared_loops={d}/{d} cached_walks={d}/{d} cache_kib={d} used={d} fallback={d} worker_ms={d} wait_ms={d} limit={d} threads={d} peak={d} auto={any} changes={d}/{d} job_us={d} queue_us={d} key_miss={d} snapshot_miss={d} miss_detail={d}/{d}/{d}/{d}/{d} miss_words=0x{x} rebound={d}/{d}/{d}/{d}\n",
+                    .{ self.flip_callbacks, preparation_stats.submitted, preparation_stats.shared_walks, preparation_stats.shared_loop_walks, preparation_stats.shared_loop_fallbacks, preparation_stats.cached_walks, preparation_stats.cache_misses, self.resource_preparation.walk_cache.bytes / 1024, preparation_stats.used, preparation_stats.fallback, preparation_stats.worker_ns / std.time.ns_per_ms, preparation_stats.wait_ns / std.time.ns_per_ms, workers.limit, workers.threads, workers.peak_active, workers.adaptation.enabled, workers.adaptation.increases, workers.adaptation.decreases, workers.adaptation.average_job_ns / std.time.ns_per_us, workers.adaptation.average_wait_ns / std.time.ns_per_us, preparation_stats.key_misses, preparation_stats.snapshot_misses, preparation_stats.miss_identity, preparation_stats.miss_sampled, preparation_stats.miss_budget, preparation_stats.miss_user, preparation_stats.miss_other, preparation_stats.miss_word_bits, preparation_stats.rebound_hits, preparation_stats.rebound_no_cover, preparation_stats.rebound_null, preparation_stats.rebound_bytes },
                 );
             }
             const compilers = self.pipeline_compile_queue.status();
@@ -41785,6 +41785,12 @@ pub const Renderer = struct {
                 self.translated_dispatches,
             },
         );
+        std.debug.print("[vulkan dcb] dispatch submit: program=0x{x} groups={d}x{d}x{d}\n", .{
+            program_address,
+            group_count[0],
+            group_count[1],
+            group_count[2],
+        });
         return true;
     }
 };

@@ -250,6 +250,26 @@ pub const Stats = struct {
     wait_ns: u64 = 0,
     cached_walks: u64 = 0,
     cache_misses: u64 = 0,
+    /// Misses split by stage: no entry matched identity and bindings, versus
+    /// a matched entry whose captured guest bytes changed underneath it.
+    key_misses: u64 = 0,
+    snapshot_misses: u64 = 0,
+    /// Key misses split by comparison stage, plus the OR of varying
+    /// non-passthrough user_data word indices behind `miss_user`.
+    miss_identity: u64 = 0,
+    miss_sampled: u64 = 0,
+    miss_budget: u64 = 0,
+    miss_user: u64 = 0,
+    miss_other: u64 = 0,
+    miss_word_bits: u64 = 0,
+    /// Lookups reused by rebinding descriptor addresses to current bindings
+    /// after verifying pointed-to bytes.
+    rebound_hits: u64 = 0,
+    /// Rebound attempts refused: no recorded read at the old address, a null
+    /// transition, or changed bytes at the new address.
+    rebound_no_cover: u64 = 0,
+    rebound_null: u64 = 0,
+    rebound_bytes: u64 = 0,
     shared_loop_walks: u64 = 0,
     shared_loop_fallbacks: u64 = 0,
 };
@@ -258,6 +278,11 @@ pub const Stats = struct {
 /// This does not retain Vulkan resources or assume that a guest pointer names
 /// unchanged memory. Results are copied into independent operation-local leases.
 const WalkCache = struct {
+    const MissStage = enum { none, key, snapshot };
+    /// Which key comparison fails most often. `other` (non-user_data binding
+    /// fields) dominates `user_data` (descriptor words); `miss_words`
+    /// OR-accumulates the differing user_data word indices.
+    const KeyDetail = enum { match, identity, sampled, budget, user_data, other };
     const maximum_entries = 512;
     const maximum_bytes = 128 * 1024 * 1024;
     const Entry = struct {
@@ -310,6 +335,16 @@ const WalkCache = struct {
     bytes: usize = 0,
     sequence: u64 = 0,
     enabled: bool = true,
+    /// Why the latest lookup missed, read by the caller that owns Stats.
+    miss_stage: MissStage = .none,
+    miss_detail: KeyDetail = .identity,
+    miss_words: u64 = 0,
+    /// user_data words rebound to current addresses by the latest lookup.
+    /// Callers extend register rebinding and snapshot reads with this mask.
+    rebound_words: u64 = 0,
+    rebound_snapshot: Snapshot = .{},
+    /// Why the latest rebound attempt failed.
+    rebound_fail: enum { none, cover, null, bytes } = .none,
     entry_limit: usize = 64,
     byte_limit: usize = 32 * 1024 * 1024,
     /// Admit only complete inputs seen twice, including captured bytes.
@@ -341,7 +376,13 @@ const WalkCache = struct {
     }
 
     fn lookup(self: *WalkCache, plan: *const checkpoints.Plan, bindings: *const shaders.StageBindings, reader: shaders.MemoryReader, needs_sampled: bool) ?*const Entry {
-        if (!self.enabled or plan.identity == 0) return null;
+        if (!self.enabled or plan.identity == 0) {
+            self.miss_stage = .key;
+            self.miss_detail = .identity;
+            return null;
+        }
+        self.rebound_words = 0;
+        self.rebound_fail = .none;
         self.updateLimits();
         const passthrough = passthroughWords(plan, bindings);
         const hint = &self.hints[plan.identity % self.hints.len];
@@ -355,13 +396,39 @@ const WalkCache = struct {
         }
         if (selected == null) for (self.entries[0..self.entry_limit], 0..) |maybe, index| {
             const entry = maybe orelse continue;
-            if (!matchesKey(entry, plan, bindings, passthrough, needs_sampled)) continue;
+            if (!matchesKey(entry, plan, bindings, passthrough, needs_sampled)) {
+                // Record the closest miss: an entry for this plan whose
+                // bindings changed names the varying words for the caller.
+                // Entries differing only in descriptor addresses additionally
+                // attempt rebound reuse below.
+                if (entry.plan_identity == plan.identity) {
+                    self.miss_detail = keyDetail(entry, plan, bindings, passthrough, needs_sampled);
+                    if (self.miss_detail == .user_data) {
+                        self.miss_words = bindingsWords(&entry.bindings, bindings, passthrough);
+                        if (self.verifyRebound(entry, bindings, reader)) |mask| {
+                            self.rebound_words = mask;
+                            selected = index;
+                            break;
+                        }
+                    }
+                }
+                continue;
+            }
             selected = index;
             break;
         };
-        const index = selected orelse return null;
+        const index = selected orelse {
+            self.miss_stage = .key;
+            return null;
+        };
         const entry = self.entries[index].?;
-        if (!entry.snapshot.matches(reader)) return null;
+        // Rebound entries already passed matches() against the rewritten
+        // snapshot inside verifyRebound; rechecking original addresses here
+        // would reject every reuse that motivated the rebound.
+        if (self.rebound_words == 0 and !entry.snapshot.matches(reader)) {
+            self.miss_stage = .snapshot;
+            return null;
+        }
         hint.* = @intCast(index);
         self.sequence +%= 1;
         entry.age = self.sequence;
@@ -369,9 +436,105 @@ const WalkCache = struct {
     }
 
     fn matchesKey(entry: *const Entry, plan: *const checkpoints.Plan, bindings: *const shaders.StageBindings, passthrough: u64, needs_sampled: bool) bool {
-        return entry.plan_identity == plan.identity and (!needs_sampled or entry.has_sampled) and
-            (plan.forward_only or entry.exact_loop_budget == @atomicLoad(bool, &exact_scalar_walk_budget, .monotonic)) and
-            sameBindings(&entry.bindings, bindings, passthrough);
+        return keyDetail(entry, plan, bindings, passthrough, needs_sampled) == .match;
+    }
+
+    fn keyDetail(entry: *const Entry, plan: *const checkpoints.Plan, bindings: *const shaders.StageBindings, passthrough: u64, needs_sampled: bool) KeyDetail {
+        if (entry.plan_identity != plan.identity) return .identity;
+        if (needs_sampled and !entry.has_sampled) return .sampled;
+        if (!plan.forward_only and entry.exact_loop_budget != @atomicLoad(bool, &exact_scalar_walk_budget, .monotonic)) return .budget;
+        return bindingsDetail(&entry.bindings, bindings, passthrough);
+    }
+
+    /// Classifies a bindings mismatch. Non-user_data fields dominate: those
+    /// change what the walk means, while user_data words are usually rebound
+    /// descriptor addresses with stable pointed-to bytes.
+    fn bindingsDetail(a: *const shaders.StageBindings, b: *const shaders.StageBindings, passthrough: u64) KeyDetail {
+        inline for (@typeInfo(shaders.StageBindings).@"struct".fields) |field| {
+            if (comptime std.mem.eql(u8, field.name, "user_data")) continue;
+            if (!std.meta.eql(@field(a, field.name), @field(b, field.name))) return .other;
+        }
+        for (a.user_data, b.user_data, 0..) |old, new, word| {
+            if (word >= 64 or passthrough & (@as(u64, 1) << @intCast(word)) != 0) continue;
+            if (old != new) return .user_data;
+        }
+        return .match;
+    }
+
+    /// Bitmask of varying non-passthrough user_data words between two bindings.
+    fn bindingsWords(a: *const shaders.StageBindings, b: *const shaders.StageBindings, passthrough: u64) u64 {
+        var bits: u64 = 0;
+        for (a.user_data, b.user_data, 0..) |old, new, word| {
+            if (word >= 64 or passthrough & (@as(u64, 1) << @intCast(word)) != 0) continue;
+            if (old != new) bits |= @as(u64, 1) << @intCast(word);
+        }
+        return bits;
+    }
+
+    /// Reuse an entry whose bindings differ only in descriptor addresses.
+    /// Every differing even-aligned word pair must name memory the walk
+    /// actually read, holding bytes identical to the recorded ones; null
+    /// transitions are refused outright since they reshape control flow,
+    /// not just bytes. Returns the rebound word mask on success.
+    fn verifyRebound(self: *WalkCache, entry: *const Entry, bindings: *const shaders.StageBindings, reader: shaders.MemoryReader) ?u64 {
+        var mask: u64 = 0;
+        var word: usize = 0;
+        while (word + 1 < entry.bindings.user_data.len and word + 1 < bindings.user_data.len) : (word += 2) {
+            const old = @as(u64, entry.bindings.user_data[word]) | (@as(u64, entry.bindings.user_data[word + 1]) << 32);
+            const new = @as(u64, bindings.user_data[word]) | (@as(u64, bindings.user_data[word + 1]) << 32);
+            if (old == new) continue;
+            if (old == 0 or new == 0) {
+                self.rebound_fail = .null;
+                return null;
+            }
+            var covered = false;
+            for (entry.snapshot.reads[0..entry.snapshot.count]) |*read| {
+                if (read.address != old or read.size == 0) continue;
+                covered = true;
+                var fresh: [64]u8 = undefined;
+                if (read.size > fresh.len) {
+                    self.rebound_fail = .cover;
+                    return null;
+                }
+                reader.read(new, fresh[0..read.size]) catch {
+                    self.rebound_fail = .bytes;
+                    return null;
+                };
+                if (!std.mem.eql(u8, fresh[0..read.size], read.bytes[0..read.size])) {
+                    self.rebound_fail = .bytes;
+                    return null;
+                }
+            }
+            if (!covered) {
+                self.rebound_fail = .cover;
+                return null;
+            }
+            mask |= (@as(u64, 1) << @intCast(word)) | (@as(u64, 1) << @intCast(word + 1));
+        }
+        if (mask == 0) return null;
+        // The rewritten copy must satisfy the same completeness check as an
+        // ordinary hit: every dependency, rebound or not, reads back equal.
+        self.rebound_snapshot.copyFrom(&entry.snapshot);
+        applyReboundReads(&self.rebound_snapshot, &entry.bindings, bindings, mask);
+        if (!self.rebound_snapshot.matches(reader)) return null;
+        return mask;
+    }
+
+    /// Retargets snapshot reads from superseded addresses to current ones.
+    /// Callers invoke this on their own copy after a rebound hit; the cached
+    /// entry keeps canonical addresses for future lookups.
+    fn applyReboundReads(snapshot: *Snapshot, old_bindings: *const shaders.StageBindings, new_bindings: *const shaders.StageBindings, mask: u64) void {
+        var word: usize = 0;
+        while (word + 1 < 64) : (word += 2) {
+            if (mask & ((@as(u64, 1) << @intCast(word)) | (@as(u64, 1) << @intCast(word + 1))) == 0) continue;
+            if (word >= old_bindings.user_data.len or word + 1 >= new_bindings.user_data.len) continue;
+            const old = @as(u64, old_bindings.user_data[word]) | (@as(u64, old_bindings.user_data[word + 1]) << 32);
+            const new = @as(u64, new_bindings.user_data[word]) | (@as(u64, new_bindings.user_data[word + 1]) << 32);
+            if (old == new) continue;
+            for (snapshot.reads[0..snapshot.count]) |*read| {
+                if (read.address == old) read.address = new;
+            }
+        }
     }
 
     fn remember(self: *WalkCache, plan: *const checkpoints.Plan, bindings: *const shaders.StageBindings, snapshot: *const Snapshot, evaluation: *const scalar.Evaluation, sampled: ?[]const scalar.ScalarRegisters, resource: []const scalar.ScalarRegisters) void {
@@ -624,15 +787,41 @@ pub const Pool = struct {
                 @memcpy(resource.snapshots, cached.resource);
                 stage.scalar_result.copyFrom(&cached.evaluation);
                 const passthrough = passthroughWords(plan.?, bindings);
-                rebindCheckpoints(sampled.snapshots, bindings, passthrough);
-                rebindCheckpoints(resource.snapshots, bindings, passthrough);
-                rebindRegisters(&stage.scalar_result.registers, bindings, passthrough);
+                const rebound = self.walk_cache.rebound_words;
+                rebindCheckpoints(sampled.snapshots, bindings, passthrough | rebound);
+                rebindCheckpoints(resource.snapshots, bindings, passthrough | rebound);
+                rebindRegisters(&stage.scalar_result.registers, bindings, passthrough | rebound);
                 stage.snapshot.copyFrom(&cached.snapshot);
+                if (rebound != 0) {
+                    WalkCache.applyReboundReads(&stage.snapshot, &cached.bindings, bindings, rebound);
+                    self.stats.rebound_hits += 1;
+                }
                 self.stats.cached_walks += 1;
                 self.retainShared(stage, bindings, plan.?, resource);
                 return sampled;
             }
             self.stats.cache_misses += 1;
+            if (self.walk_cache.miss_stage == .snapshot) {
+                self.stats.snapshot_misses += 1;
+            } else {
+                self.stats.key_misses += 1;
+                switch (self.walk_cache.miss_detail) {
+                    .match, .identity => self.stats.miss_identity += 1,
+                    .sampled => self.stats.miss_sampled += 1,
+                    .budget => self.stats.miss_budget += 1,
+                    .user_data => {
+                        self.stats.miss_user += 1;
+                        self.stats.miss_word_bits |= self.walk_cache.miss_words;
+                        switch (self.walk_cache.rebound_fail) {
+                            .none => {},
+                            .cover => self.stats.rebound_no_cover += 1,
+                            .null => self.stats.rebound_null += 1,
+                            .bytes => self.stats.rebound_bytes += 1,
+                        }
+                    },
+                    .other => self.stats.miss_other += 1,
+                }
+            }
             stage.snapshot.source = reader;
             // Forward walks fit statically. Completed loops additionally prove
             // their dense visit bound before lending specialization history.
@@ -660,15 +849,41 @@ pub const Pool = struct {
                 @memcpy(resource.snapshots, cached.resource);
                 scalar_result.copyFrom(&cached.evaluation);
                 const passthrough = passthroughWords(plan.?, bindings);
-                rebindCheckpoints(resource.snapshots, bindings, passthrough);
-                rebindRegisters(&scalar_result.registers, bindings, passthrough);
+                const rebound = self.walk_cache.rebound_words;
+                rebindCheckpoints(resource.snapshots, bindings, passthrough | rebound);
+                rebindRegisters(&scalar_result.registers, bindings, passthrough | rebound);
                 stage.scalar_result.copyFrom(scalar_result);
                 stage.snapshot.copyFrom(&cached.snapshot);
+                if (rebound != 0) {
+                    WalkCache.applyReboundReads(&stage.snapshot, &cached.bindings, bindings, rebound);
+                    self.stats.rebound_hits += 1;
+                }
                 self.stats.cached_walks += 1;
                 self.retainShared(stage, bindings, plan.?, resource);
                 return true;
             }
             self.stats.cache_misses += 1;
+            if (self.walk_cache.miss_stage == .snapshot) {
+                self.stats.snapshot_misses += 1;
+            } else {
+                self.stats.key_misses += 1;
+                switch (self.walk_cache.miss_detail) {
+                    .match, .identity => self.stats.miss_identity += 1,
+                    .sampled => self.stats.miss_sampled += 1,
+                    .budget => self.stats.miss_budget += 1,
+                    .user_data => {
+                        self.stats.miss_user += 1;
+                        self.stats.miss_word_bits |= self.walk_cache.miss_words;
+                        switch (self.walk_cache.rebound_fail) {
+                            .none => {},
+                            .cover => self.stats.rebound_no_cover += 1,
+                            .null => self.stats.rebound_null += 1,
+                            .bytes => self.stats.rebound_bytes += 1,
+                        }
+                    },
+                    .other => self.stats.miss_other += 1,
+                }
+            }
             stage.snapshot.source = reader;
             scalar.evaluateDecodedResourceStateAtCheckpointsInto(scalar_result, .{ .context = &stage.snapshot, .read_fn = Snapshot.capture }, bindings, instructions, resource.pcs, resource.snapshots, plan.?.walk());
             if (!self.sharedResultFits(stage, plan.?, bindings, scalar_result)) {

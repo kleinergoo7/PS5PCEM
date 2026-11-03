@@ -1566,16 +1566,16 @@ fn run(init: std.process.Init) !bool {
                     for (graph.nodes.items) |*node| {
                         const image = &node.mapped.?;
                         if (return_address < image.load_bias + 16) continue;
-                        const frame_code = node.image.virtualRange(return_address - image.load_bias - 16, 24) catch continue;
+                        const frame_code = node.image.virtualRange(return_address - image.load_bias - 384, 424) catch continue;
                         try stderr.print("  caller@0x{x} ({s}):", .{ return_address, node.path });
                         for (frame_code) |byte| try stderr.print(" {x:0>2}", .{byte});
                         try stderr.writeByte('\n');
                         var call_index: usize = 0;
-                        while (call_index + 6 <= 16) : (call_index += 1) {
+                        while (call_index + 6 <= 296) : (call_index += 1) {
                             if (frame_code[call_index] != 0xff or frame_code[call_index + 1] != 0x15) continue;
                             const displacement = std.mem.readInt(i32, frame_code[call_index + 2 ..][0..4], .little);
-                            const next_instruction = return_address - 16 + call_index + 6;
-                            const target: u64 = @intCast(@as(i64, @intCast(next_instruction)) + displacement);
+                            const next_instruction = return_address - 384 + call_index + 6;
+                            const target: u64 = @bitCast(@as(i64, @intCast(next_instruction)) + displacement);
                             try reportRelocation(stderr, allocator, node, target);
                         }
                         reported_callers += 1;
@@ -1602,6 +1602,117 @@ fn run(init: std.process.Init) !bool {
             try reportGuestPointer(stderr, &emu.address_space.?, "rsi", fault_registers.rsi);
             try reportGuestPointer(stderr, &emu.address_space.?, "rdi", fault_registers.rdi);
             try reportGuestPointer(stderr, &emu.address_space.?, "rbp", fault_registers.rbp);
+            // Debug reference scan (PS5_FIND_REFS="addr,addr" hex): finds
+            // every RIP-relative load/store touching the listed guest
+            // addresses, to locate the initializer of a zero global.
+            // Writers use op 89, readers 8b/8d/3b/39.
+            if (std.c.getenv("PS5_FIND_REFS")) |refs_ptr| {
+                const refs_text = std.mem.span(refs_ptr);
+                var want: [8]u64 = .{0} ** 8;
+                var want_count: usize = 0;
+                var split = std.mem.splitScalar(u8, refs_text, ',');
+                while (split.next()) |piece| {
+                    if (want_count >= want.len) break;
+                    want[want_count] = std.fmt.parseInt(u64, piece, 16) catch continue;
+                    want_count += 1;
+                }
+                for (graph.nodes.items) |*scan_node| {
+                    const scan_image = &scan_node.mapped.?;
+                    for (scan_node.image.program_headers) |ph| {
+                        if (ph.segmentType() != .load) continue;
+                        if (!ph.segmentFlags().executable) continue;
+                        var seg_off: u64 = 0;
+                        var refs_found: usize = 0;
+                        var chunks_ok: usize = 0;
+                        var chunks_fail: usize = 0;
+                        while (seg_off < ph.filesz and refs_found < 400) {
+                            const chunk_len: u64 = @min(65536, ph.filesz - seg_off);
+                            const seg = scan_node.image.virtualRange(ph.vaddr + seg_off, chunk_len) catch {
+                                chunks_fail += 1;
+                                break;
+                            };
+                            chunks_ok += 1;
+                            var off: usize = 0;
+                            while (off + 7 < seg.len and refs_found < 400) : (off += 1) {
+                                var cursor: usize = off;
+                                var insn_len: u64 = 6;
+                                const first: u8 = seg[cursor];
+                                if (first == 0xe8 and cursor + 5 < seg.len) {
+                                    // Direct near call: resolves the caller
+                                    // graph of factory functions.
+                                    const cdisp: i32 = std.mem.readInt(i32, seg[cursor + 1 ..][0..4], .little);
+                                    const cvaddr: u64 = ph.vaddr + seg_off + @as(u64, @intCast(cursor)) + 5;
+                                    const csigned: i64 = @as(i64, @intCast(scan_image.load_bias)) + @as(i64, @intCast(cvaddr)) + cdisp;
+                                    if (csigned >= 0x1_0000) {
+                                        const ctarget: u64 = @intCast(csigned);
+                                        var cwi: usize = 0;
+                                        while (cwi < want_count) : (cwi += 1) {
+                                            if (ctarget != want[cwi]) continue;
+                                            const cguest: u64 = scan_image.load_bias + ph.vaddr + seg_off + @as(u64, @intCast(cursor));
+                                            try stderr.print("  ref-caller@0x{x} ({s})\n", .{ cguest, scan_node.path });
+                                            refs_found += 1;
+                                        }
+                                    }
+                                    continue;
+                                }
+                                if (first >= 0x40 and first <= 0x4f) {
+                                    cursor += 1;
+                                    insn_len = 7;
+                                }
+                                // Absolute SIB form (mod=00 rm=100): disp32
+                                // follows the SIB byte, e.g. mov [addr],eax.
+                                // Data initializers in non-PIE images use it.
+                                if (cursor + 7 < seg.len) {
+                                    const amodrm: u8 = seg[cursor + 1];
+                                    if ((seg[cursor] == 0x89 or seg[cursor] == 0xc7 or seg[cursor] == 0x8b) and amodrm & 0xc7 == 0x04 and seg[cursor + 2] == 0x25) {
+                                        const adisp: i32 = std.mem.readInt(i32, seg[cursor + 3 ..][0..4], .little);
+                                        const avaddr: u64 = ph.vaddr + seg_off + @as(u64, @intCast(cursor)) + insn_len + 1;
+                                        const asigned: i64 = @as(i64, @intCast(scan_image.load_bias)) + @as(i64, @intCast(avaddr)) + adisp;
+                                        if (asigned >= 0x1_0000) {
+                                            const atarget: u64 = @intCast(asigned);
+                                            var awi: usize = 0;
+                                            while (awi < want_count) : (awi += 1) {
+                                                if (atarget != want[awi]) continue;
+                                                const aguest: u64 = scan_image.load_bias + ph.vaddr + seg_off + @as(u64, @intCast(cursor));
+                                                try stderr.print("  ref-abs@0x{x} op={x:0>2} ({s})\n", .{ aguest, seg[cursor], scan_node.path });
+                                                refs_found += 1;
+                                            }
+                                        }
+                                        continue;
+                                    }
+                                }
+                                if (cursor + 6 >= seg.len) break;
+                                const op: u8 = seg[cursor];
+                                // mov [rip],imm32 needs 4 more bytes.
+                                if (op == 0xc7 and cursor + 10 >= seg.len) break;
+                                const is_ref_op: bool = op == 0x8b or op == 0x89 or op == 0x8d or op == 0x3b or op == 0x39 or op == 0xc7 or op == 0xff;
+                                if (!is_ref_op) continue;
+                                const modrm: u8 = seg[cursor + 1];
+                                if (modrm & 0xc7 != 0x05) continue;
+                                // mov [rip],imm32 is 4 bytes longer.
+                                if (op == 0xc7) insn_len += 4;
+                                const disp: i32 = std.mem.readInt(i32, seg[cursor + 2 ..][0..4], .little);
+                                const vaddr_next: u64 = ph.vaddr + seg_off + @as(u64, @intCast(cursor)) + insn_len;
+                                const signed_target: i64 = @as(i64, @intCast(scan_image.load_bias)) + @as(i64, @intCast(vaddr_next)) + disp;
+                                if (signed_target < 0x1_0000) continue;
+                                const target: u64 = @intCast(signed_target);
+                                var wi: usize = 0;
+                                while (wi < want_count) : (wi += 1) {
+                                    if (target != want[wi]) continue;
+                                    const guest: u64 = scan_image.load_bias + ph.vaddr + seg_off + @as(u64, @intCast(cursor));
+                                    const context_end: usize = @min(cursor + 96, seg.len);
+                                    try stderr.print("  ref-to@0x{x} op={x:0>2} ({s}):", .{ guest, op, scan_node.path });
+                                    for (seg[cursor..context_end]) |byte| try stderr.print(" {x:0>2}", .{byte});
+                                    try stderr.writeByte('\n');
+                                    refs_found += 1;
+                                }
+                            }
+                            seg_off += chunk_len;
+                        }
+                        try stderr.print("  ref-scan {s}: filesz={d} chunks_ok={d} chunks_fail={d} refs={d} want={d}\n", .{ scan_node.path, ph.filesz, chunks_ok, chunks_fail, refs_found, want_count });
+                    }
+                }
+            }
             const code_start = fault.info.instruction_address -| 16;
             var code: [32]u8 = undefined;
             if (emu.address_space.?.read(code_start, &code)) |_| {

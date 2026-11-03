@@ -6979,9 +6979,41 @@ const Builder = struct {
         const vector_type = self.storage_image_vector_types[descriptor_index];
         if (vector_type == 0) return Error.InvalidStorageBinding;
         const image = try self.loadStorageImage(binding);
-        const coordinates = try self.storageImageCoordinates(inst, binding.dimension);
+        // A predicated-off lane can carry arbitrary coordinates into this
+        // fetch. Query the bound view's level-0 extent, fetch at clamped
+        // coordinates, and publish zeros outside it — the same policy as
+        // imageMultiTexelLoad. Without the guard a stray coordinate faults
+        // the device, which no validation layer reports.
+        const bound_zero = try self.constant(.bits32, 0);
+        const coord_x = try self.source(try imageIntegerAddressOperand(inst, 0), .bits32);
+        const coord_y = if (inst.image_dimension == .dim_1d)
+            bound_zero
+        else
+            try self.source(try imageIntegerAddressOperand(inst, 1), .bits32);
+        const bound_extent = self.id();
+        self.uses_image_query = true;
+        try self.emit(&self.body, 103, &.{ try self.ensureBitsVec2(), bound_extent, image, bound_zero }); // OpImageQuerySizeLod
+        const bound_width = self.id();
+        const bound_height = self.id();
+        try self.emit(&self.body, 81, &.{ self.bits_type, bound_width, bound_extent, 0 }); // OpCompositeExtract
+        try self.emit(&self.body, 81, &.{ self.bits_type, bound_height, bound_extent, 1 }); // OpCompositeExtract
+        const width_ok = try self.bvhBinary(176, self.bool_type, coord_x, bound_width); // ULessThan
+        const height_ok = try self.bvhBinary(176, self.bool_type, coord_y, bound_height); // ULessThan
+        const coords_inside = try self.bvhBinary(167, self.bool_type, width_ok, height_ok); // LogicalAnd
+        const safe_x = try self.resinfoSelect(coords_inside, coord_x, bound_zero);
+        const safe_y = try self.resinfoSelect(coords_inside, coord_y, bound_zero);
+        const safe_coordinates = self.id();
+        if (binding.dimension != .two_d) {
+            const safe_z = if (inst.image_address_components >= 3)
+                try self.source(try imageIntegerAddressOperand(inst, 2), .bits32)
+            else
+                bound_zero;
+            try self.emit(&self.body, 80, &.{ self.vector3_bits_type, safe_coordinates, safe_x, safe_y, safe_z }); // OpCompositeConstruct
+        } else {
+            try self.emit(&self.body, 80, &.{ self.vector2_bits_type, safe_coordinates, safe_x, safe_y }); // OpCompositeConstruct
+        }
         const texel = self.id();
-        try self.emit(&self.body, 98, &.{ vector_type, texel, image, coordinates }); // OpImageRead
+        try self.emit(&self.body, 98, &.{ vector_type, texel, image, safe_coordinates }); // OpImageRead
 
         const unpacked = if (binding.format == .r11g11b10_unorm) try self.unpackR11G11B10Unorm(texel) else null;
         const result_type: ValueType = if (unpacked != null) .float32 else value_type;
@@ -6991,7 +7023,7 @@ const Builder = struct {
             const bit = @as(u4, 1) << @intCast(component);
             if (inst.data_mask & bit == 0) continue;
             const selector = binding.dst_select[component];
-            const value = if (selector >= 4) blk: {
+            const raw = if (selector >= 4) blk: {
                 if (unpacked) |values| break :blk values[selector - 4];
                 const extracted = self.id();
                 try self.emit(&self.body, 81, &.{
@@ -7002,10 +7034,22 @@ const Builder = struct {
                 }); // OpCompositeExtract
                 break :blk extracted;
             } else try self.storageImageConstant(result_type, selector);
+            // resinfoSelect fixes a uint32 result. Round float components
+            // through bits so the select's operands always match.
+            const raw_type: ValueType = if (selector >= 4 and unpacked != null) .float32 else if (selector >= 4) value_type else result_type;
+            const guarded = blk: {
+                if (raw_type != .float32) break :blk try self.resinfoSelect(coords_inside, raw, try self.storageImageConstant(raw_type, 0));
+                const as_bits = self.id();
+                try self.emit(&self.body, 124, &.{ self.bits_type, as_bits, raw }); // OpBitcast
+                const picked = try self.resinfoSelect(coords_inside, as_bits, try self.constant(.bits32, 0));
+                const back = self.id();
+                try self.emit(&self.body, 124, &.{ self.typeId(.float32), back, picked }); // OpBitcast
+                break :blk back;
+            };
             try self.imageResultComponent(
                 inst,
                 destination_index,
-                .{ .id = value, .value_type = result_type },
+                .{ .id = guarded, .value_type = result_type },
             );
             destination_index += 1;
         }
@@ -7033,6 +7077,25 @@ const Builder = struct {
         // bound T# is a one-slice 2D view. The descriptor already selects that
         // slice, so its third coordinate is intentionally ignored here.
         const coordinates = try self.storageImageCoordinates(inst, binding.dimension);
+        // Out-of-range coordinates must not reach the device either: query
+        // the bound view's level-0 extent and skip the write outside it, the
+        // store sibling of the imageLoad fetch guard.
+        const store_zero = try self.constant(.bits32, 0);
+        const store_x = try self.source(try imageIntegerAddressOperand(inst, 0), .bits32);
+        const store_y = if (inst.image_dimension == .dim_1d)
+            store_zero
+        else
+            try self.source(try imageIntegerAddressOperand(inst, 1), .bits32);
+        const store_extent = self.id();
+        self.uses_image_query = true;
+        try self.emit(&self.body, 103, &.{ try self.ensureBitsVec2(), store_extent, image, store_zero }); // OpImageQuerySizeLod
+        const store_width = self.id();
+        const store_height = self.id();
+        try self.emit(&self.body, 81, &.{ self.bits_type, store_width, store_extent, 0 }); // OpCompositeExtract
+        try self.emit(&self.body, 81, &.{ self.bits_type, store_height, store_extent, 1 }); // OpCompositeExtract
+        const store_width_ok = try self.bvhBinary(176, self.bool_type, store_x, store_width); // ULessThan
+        const store_height_ok = try self.bvhBinary(176, self.bool_type, store_y, store_height); // ULessThan
+        const store_inside = try self.bvhBinary(167, self.bool_type, store_width_ok, store_height_ok); // LogicalAnd
         var shader_values: [4]u32 = undefined;
         for (&shader_values) |*value| value.* = try self.storageImageConstant(value_type, 0);
         var source_index: u32 = 0;
@@ -7070,18 +7133,18 @@ const Builder = struct {
         // Image side effects obey EXEC just like buffer stores. In graphics
         // a host invocation represents one guest lane, including CMPX and
         // scalar save/restore sequences around a predicated store.
-        if (try self.laneEnabled()) |predicate| {
-            const taken = self.id();
-            const merge = self.id();
-            try self.emit(&self.body, 247, &.{ merge, 0 }); // OpSelectionMerge
-            try self.emit(&self.body, 250, &.{ predicate, taken, merge });
-            try self.emit(&self.body, 248, &.{taken});
-            try self.emit(&self.body, 99, &.{ image, coordinates, texel });
-            try self.emit(&self.body, 249, &.{merge});
-            try self.emit(&self.body, 248, &.{merge});
-        } else {
-            try self.emit(&self.body, 99, &.{ image, coordinates, texel }); // OpImageWrite
-        }
+        // Out-of-range coordinates skip the write as well: a predicated-off
+        // lane can address outside the bound view and fault the device.
+        const store_lane = try self.laneEnabled();
+        const store_predicate = if (store_lane) |lane| try self.bvhBinary(167, self.bool_type, lane, store_inside) else store_inside;
+        const store_taken = self.id();
+        const store_merge = self.id();
+        try self.emit(&self.body, 247, &.{ store_merge, 0 }); // OpSelectionMerge
+        try self.emit(&self.body, 250, &.{ store_predicate, store_taken, store_merge });
+        try self.emit(&self.body, 248, &.{store_taken});
+        try self.emit(&self.body, 99, &.{ image, coordinates, texel });
+        try self.emit(&self.body, 249, &.{store_merge});
+        try self.emit(&self.body, 248, &.{store_merge});
     }
 
     fn imageAtomic(self: *Builder, inst: instruction.Instruction, opcode: u16) Error!void {
@@ -16359,6 +16422,21 @@ test "compute array image load uses a native storage array" {
     try std.testing.expect(!containsOpcode(module.words, 95));
 }
 
+test "compute storage image load clamps coordinates to the queried extent" {
+    const decoder = @import("decoder.zig");
+    const code = [_]u32{ 0xf000_0f08, 0x0000_0004, 0xbf81_0000 };
+    var program = try decoder.decodeProgram(std.testing.allocator, &code);
+    defer program.deinit(std.testing.allocator);
+    var module = try translate(std.testing.allocator, &program, .{
+        .stage = .compute,
+        .storage_images = &.{.{ .resource_sgpr = 0, .descriptor_index = 0, .format = .rgba8_unorm, .dimension = .two_d }},
+    });
+    defer module.deinit(std.testing.allocator);
+    try std.testing.expect(containsOpcode(module.words, 98)); // OpImageRead
+    try std.testing.expect(containsOpcode(module.words, 103)); // OpImageQuerySizeLod
+    try std.testing.expect(containsOpcode(module.words, 169)); // OpSelect clamps coordinates and results
+}
+
 test "compute image load and NSA store use independently typed storage image bindings" {
     const decoder = @import("decoder.zig");
     const code = [_]u32{
@@ -16454,6 +16532,41 @@ test "two-coordinate image store into an array view writes slice zero" {
     try std.testing.expect(containsOpcode(module.words, 23)); // uint3 coordinates
 }
 
+test "compute storage image store skips out-of-range coordinates" {
+    var program = instruction.Program{ .code = &.{}, .instructions = .empty };
+    defer program.deinit(std.testing.allocator);
+    try program.instructions.append(std.testing.allocator, .{
+        .pc = 0,
+        .family = .mimg,
+        .opcode = .image_store,
+        .opcode_id = 8,
+        .dst = .{ .kind = .vgpr, .reg = 8 },
+        .src0 = .{ .kind = .vgpr, .reg = 0 },
+        .src1 = .{ .kind = .sgpr, .reg = 4 },
+        .src_count = 2,
+        .image_dimension = .dim_2d,
+        .image_address_components = 2,
+        .data_mask = 0xf,
+    });
+    try program.instructions.append(std.testing.allocator, .{ .pc = 8, .opcode = .s_endpgm });
+    const images = [_]StorageImageBinding{.{
+        .resource_sgpr = 4,
+        .descriptor_index = 0,
+        .format = .rgba8_unorm,
+        .dimension = .two_d,
+    }};
+    var module = try translate(std.testing.allocator, &program, .{
+        .stage = .compute,
+        .storage_images = &images,
+    });
+    defer module.deinit(std.testing.allocator);
+
+    try std.testing.expect(containsOpcode(module.words, 99)); // OpImageWrite
+    try std.testing.expect(containsOpcode(module.words, 103)); // OpImageQuerySizeLod
+    try std.testing.expect(containsOpcode(module.words, 247)); // OpSelectionMerge guards the write
+    try std.testing.expect(containsOpcode(module.words, 250)); // OpBranchConditional guards the write
+}
+
 test "compute image store accepts a one-slice 2D array opcode" {
     const decoder = @import("decoder.zig");
     const code = [_]u32{
@@ -16498,7 +16611,7 @@ test "compute image store accepts a partial channel mask" {
     defer module.deinit(std.testing.allocator);
 
     try std.testing.expect(containsOpcode(module.words, 99)); // OpImageWrite
-    try std.testing.expectEqual(@as(usize, 4), countOpcode(module.words, 17)); // includes StorageImageExtendedFormats
+    try std.testing.expectEqual(@as(usize, 5), countOpcode(module.words, 17)); // includes StorageImageExtendedFormats and ImageQuery for the store bounds guard
 }
 
 test "compute image store declares an R16 UNORM storage image" {
