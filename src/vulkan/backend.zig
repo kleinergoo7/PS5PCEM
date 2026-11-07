@@ -89,6 +89,11 @@ pub export var avoid_completed_gds_snapshots: bool = true;
 pub export var discard_overwritten_storage_images: bool = true;
 pub export var native_storage_color_initialization: bool = true;
 pub export var cached_guest_fingerprints: bool = true;
+/// Experimental title workaround: render multisample-bound guest targets as
+/// single-sample images. The guest descriptor still names MSAA, but every host
+/// attachment, render pass and pipeline is created at one sample so the target
+/// can be sampled directly instead of requiring a resolve path.
+pub export var disable_multisampling: bool = false;
 pub export var borrow_resource_instructions: bool = true;
 pub export var compact_sampled_key_hash: bool = true;
 pub export var borrow_sampled_view_plans: bool = true;
@@ -3091,6 +3096,7 @@ fn depthCompareOperation(function: u8) u32 {
 /// Guest sample/fragment encodings are log2 of 1/2/4/8. The matching Vulkan
 /// sample-count flag is the same power of two.
 fn rasterSampleCount(samples_log2: u8) ?u32 {
+    if (disable_multisampling and samples_log2 <= 3) return vk.sample_count_1_bit;
     return switch (samples_log2) {
         0 => vk.sample_count_1_bit,
         1 => vk.sample_count_2_bit,
@@ -3136,6 +3142,7 @@ test "depth-only compatibility state retains depth stencil multisampling" {
 fn colorTargetSamplesLog2(descriptor: gpu.resources.ColorTarget) ?u8 {
     if (descriptor.samples_log2 > 3 or descriptor.fragments_log2 > 3) return null;
     if (descriptor.samples_log2 != descriptor.fragments_log2) return null;
+    if (disable_multisampling) return 0;
     return descriptor.fragments_log2;
 }
 
@@ -3194,6 +3201,10 @@ fn hostColorTargetDescriptor(descriptor: gpu.resources.ColorTarget) gpu.resource
 fn guestColorTarget(descriptor_: gpu.resources.ColorTarget) anyerror!GuestColorTarget {
     _ = colorTargetSamplesLog2(descriptor_) orelse return Error.UnsupportedColorTarget;
     var descriptor = hostColorTargetDescriptor(descriptor_);
+    if (disable_multisampling) {
+        descriptor.samples_log2 = 0;
+        descriptor.fragments_log2 = 0;
+    }
     const format = colorTargetFormat(descriptor) orelse return Error.UnsupportedColorTarget;
     // CPU tiling still names one sample per pixel. The host image carries the
     // real sample count; this layout is only identity and 1x staging size.
@@ -4726,6 +4737,9 @@ const CachedStorageImage = struct {
     dcc_write: ?StorageDccWrite = null,
     guest_content_hash_valid: bool = false,
     guest_page_generation: u64 = 0,
+    /// Without page tracking, a large storage backing is verified at most once
+    /// per frame instead of on every rebind.
+    last_guest_check_flip: u64 = 0,
     depth_snapshot: ?struct { image: vk.Image, generation: u64 } = null,
     // CPU texels observed at upload/publication, independent of GPU dirtiness.
     // A deferred readback must not overwrite an allocation the CPU reused.
@@ -18614,7 +18628,7 @@ pub const Renderer = struct {
             .tile_mode = descriptor.tile_mode,
             .base_array_slice = descriptor.base_array_slice,
             .mip_level = descriptor.mip_level,
-            .samples_log2 = descriptor.samples_log2,
+            .samples_log2 = if (disable_multisampling) 0 else descriptor.samples_log2,
             .has_stencil = has_stencil,
             .clear_depth = descriptor.clear_depth,
             .clear_stencil = descriptor.clear_stencil,
@@ -29867,6 +29881,7 @@ pub const Renderer = struct {
         cached.gpu_dirty = false;
         cached.guest_content_hash_valid = false;
         cached.guest_page_generation = 0;
+        cached.last_guest_check_flip = 0;
         cached.guest_texel_hash = null;
         cached.guest_backing_hash = null;
         cached.guest_native_texel_hash = null;
@@ -29893,6 +29908,7 @@ pub const Renderer = struct {
         if (page_generation == 0 and @atomicLoad(bool, &arm_storage_cpu_watches, .monotonic)) {
             if (memory.track_gpu_read) |track| page_generation = track(memory.context, cached.descriptor.address, cached.allocation_bytes);
         }
+        if (page_generation == 0 and cached.last_guest_check_flip == self.flip_callbacks) return false;
         // A full-overwrite baseline owns only this view's texels. Fingerprint
         // those spans directly; unchanged padding is not required and this
         // proof must never rearm a sibling mip's generation.
@@ -29900,6 +29916,7 @@ pub const Renderer = struct {
             if (cached.guest_native_baseline_digest) |baseline| {
                 if (self.storageOverwriteGuestDigest(memory, cached.descriptor.address, cached.guest_native_coverage.?)) |current| {
                     self.storage_native_hash_comparisons +|= 1;
+                    cached.last_guest_check_flip = self.flip_callbacks;
                     if (current != baseline) return true;
                     cached.guest_page_generation = page_generation;
                     cached.guest_backing_hash = null;
@@ -29913,6 +29930,7 @@ pub const Renderer = struct {
         self.frame_profile.storage_guest_hash_bytes +|= cached.allocation_bytes;
         const current_hash = self.fingerprintGuestRange(memory, cached.descriptor.address, cached.allocation_bytes);
         if (current_hash != null and current_hash == cached.guest_backing_hash) {
+            cached.last_guest_check_flip = self.flip_callbacks;
             self.observeStorageBackingGeneration(cache_index, current_hash.?, page_generation);
             return false;
         }
@@ -29921,6 +29939,7 @@ pub const Renderer = struct {
         if (!memory.read(memory.context, cached.descriptor.address, scratch.bytes)) return Error.GuestMemoryReadFailed;
         const backing_hash = gpu.parallel_copy.fingerprint(scratch.bytes);
         if (backing_hash == cached.guest_backing_hash) {
+            cached.last_guest_check_flip = self.flip_callbacks;
             self.observeStorageBackingGeneration(cache_index, backing_hash, page_generation);
             return false;
         }
@@ -35134,12 +35153,21 @@ pub const Renderer = struct {
 
     fn stageSampledImage(
         self: *Renderer,
-        descriptor: gpu.resources.ImageDescriptor,
+        descriptor_: gpu.resources.ImageDescriptor,
         sampler_descriptor: gpu.resources.SamplerDescriptor,
         trace_descriptor_index: u32,
         dimension: rdna2.spirv.SampledImageDimension,
         render_target_write: ?GuestColorTarget,
     ) anyerror!PreparedSampledImage {
+        var descriptor = descriptor_;
+        if (disable_multisampling and descriptor.samplesLog2() != 0) {
+            descriptor.image_type = switch (descriptor.image_type) {
+                .color_2d_msaa => .color_2d,
+                .color_2d_msaa_array => .color_2d_array,
+                else => descriptor.image_type,
+            };
+            descriptor.last_level = 0;
+        }
         if (sampledImageMinimumLod(descriptor, descriptor.viewMipLevels()) > 0 and !self.image_view_min_lod_available)
             return error.ImageViewMinLodUnavailable;
         if (self.sampled_address_census.count() < 32768) {

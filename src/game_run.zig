@@ -927,6 +927,11 @@ fn run(init: std.process.Init) !bool {
         defer allocator.free(text);
         @atomicStore(bool, &vulkan.backend.gpu_timestamp_profiling, std.mem.eql(u8, std.mem.trim(u8, text, " \t\r\n"), "1"), .monotonic);
     } else |_| {}
+    vulkan.backend.disable_multisampling = init.minimal.environ.containsUnempty(
+        allocator,
+        "PS5_DISABLE_MSAA",
+    ) catch false;
+    if (vulkan.backend.disable_multisampling) try out.print("  MSAA disabled for host attachments\n", .{});
     const capture_first_graphics_frame = init.minimal.environ.containsUnempty(allocator, "PS5_CAPTURE_FIRST_FRAME") catch false;
     const trace_graphics_frame: ?u64 = if (init.minimal.environ.getAlloc(allocator, "PS5_TRACE_GRAPHICS_FRAME")) |text| parse: {
         defer allocator.free(text);

@@ -49,7 +49,7 @@ pub const page_size: u64 = 16 * 1024;
 ///
 /// A little under 13.5 GiB, which is what the console leaves to a title after
 /// the system takes its share.
-pub const total_memory_size: u64 = 13824 * 1024 * 1024;
+pub const total_memory_size: u64 = 18432 * 1024 * 1024;
 
 /// Default flexible-memory budget when system content does not override it.
 ///
