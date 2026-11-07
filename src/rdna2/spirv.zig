@@ -14066,7 +14066,13 @@ fn translateInstructions(
         try allocator.alloc(u32, 0);
     defer allocator.free(unobserved_vector_pcs);
     builder.unobserved_vector_pcs = unobserved_vector_pcs;
-    if (builder.converged_workgroup_dispatch or has_calls) {
+    // A vertex shader with many nested selections can currently produce a
+    // selection construct whose edge bypasses its header. SPIR-V validation
+    // rejects that and the vendor driver crashes in vkCreateGraphicsPipelines
+    // instead of returning an error. The dispatcher already models arbitrary
+    // CFG shapes; use it for this narrow, branch-heavy vertex case.
+    const complex_vertex_selections = effective.stage == .vertex and graph.selections.items.len > 4;
+    if (builder.converged_workgroup_dispatch or has_calls or complex_vertex_selections) {
         try translateDispatcher(&builder, instructions, &graph);
     } else if (graph.blocks.items.len == 1) {
         // A single guest wave executes LDS instructions in order. On a

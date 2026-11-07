@@ -89,6 +89,11 @@ pub export var avoid_completed_gds_snapshots: bool = true;
 pub export var discard_overwritten_storage_images: bool = true;
 pub export var native_storage_color_initialization: bool = true;
 pub export var cached_guest_fingerprints: bool = true;
+/// Experimental title workaround: render multisample-bound guest targets as
+/// single-sample images. The guest descriptor still names MSAA, but every host
+/// attachment, render pass and pipeline is created at one sample so the target
+/// can be sampled directly instead of requiring a resolve path.
+pub export var disable_multisampling: bool = false;
 pub export var borrow_resource_instructions: bool = true;
 pub export var compact_sampled_key_hash: bool = true;
 pub export var borrow_sampled_view_plans: bool = true;
@@ -1449,6 +1454,11 @@ const maximum_frame_bytes = 128 * 1024 * 1024;
 /// cap: 4096x4096 RGBA32 across four array layers is 256 MiB. Keep a separate
 /// bound so ordinary frame transfers stay small without rejecting the image.
 const maximum_storage_image_bytes = 512 * 1024 * 1024;
+/// Untracked guest memory has no page generation. Verify large resources with
+/// a full fingerprint at most once per this many frames; each intermediate
+/// lookup still checks the distributed sparse probe below.
+const untracked_fingerprint_full_interval_frames: u64 = 8;
+const untracked_fingerprint_min_bytes: usize = 1024 * 1024;
 // Sampled atlases can exceed a framebuffer's size: a 16K BC7 atlas with
 // its mip chain needs about 341 MiB. Keep a separate bounded upload budget.
 const maximum_sampled_image_bytes = 512 * 1024 * 1024;
@@ -3091,6 +3101,7 @@ fn depthCompareOperation(function: u8) u32 {
 /// Guest sample/fragment encodings are log2 of 1/2/4/8. The matching Vulkan
 /// sample-count flag is the same power of two.
 fn rasterSampleCount(samples_log2: u8) ?u32 {
+    if (disable_multisampling and samples_log2 <= 3) return vk.sample_count_1_bit;
     return switch (samples_log2) {
         0 => vk.sample_count_1_bit,
         1 => vk.sample_count_2_bit,
@@ -3136,6 +3147,7 @@ test "depth-only compatibility state retains depth stencil multisampling" {
 fn colorTargetSamplesLog2(descriptor: gpu.resources.ColorTarget) ?u8 {
     if (descriptor.samples_log2 > 3 or descriptor.fragments_log2 > 3) return null;
     if (descriptor.samples_log2 != descriptor.fragments_log2) return null;
+    if (disable_multisampling) return 0;
     return descriptor.fragments_log2;
 }
 
@@ -3194,6 +3206,10 @@ fn hostColorTargetDescriptor(descriptor: gpu.resources.ColorTarget) gpu.resource
 fn guestColorTarget(descriptor_: gpu.resources.ColorTarget) anyerror!GuestColorTarget {
     _ = colorTargetSamplesLog2(descriptor_) orelse return Error.UnsupportedColorTarget;
     var descriptor = hostColorTargetDescriptor(descriptor_);
+    if (disable_multisampling) {
+        descriptor.samples_log2 = 0;
+        descriptor.fragments_log2 = 0;
+    }
     const format = colorTargetFormat(descriptor) orelse return Error.UnsupportedColorTarget;
     // CPU tiling still names one sample per pixel. The host image carries the
     // real sample count; this layout is only identity and 1x staging size.
@@ -4726,6 +4742,9 @@ const CachedStorageImage = struct {
     dcc_write: ?StorageDccWrite = null,
     guest_content_hash_valid: bool = false,
     guest_page_generation: u64 = 0,
+    /// Without page tracking, a large storage backing is verified at most once
+    /// per frame instead of on every rebind.
+    last_guest_check_flip: u64 = 0,
     depth_snapshot: ?struct { image: vk.Image, generation: u64 } = null,
     // CPU texels observed at upload/publication, independent of GPU dirtiness.
     // A deferred readback must not overwrite an allocation the CPU reused.
@@ -6471,6 +6490,15 @@ const SampledDescriptorScratch = struct {
     bindings: [maximum_sampled_images]u32,
 };
 
+const UntrackedFingerprint = struct {
+    address: u64 = 0,
+    size: usize = 0,
+    full_hash: u64 = 0,
+    probe_hash: u64 = 0,
+    last_full_frame: u64 = 0,
+    valid: bool = false,
+};
+
 pub const Renderer = struct {
     allocator: std.mem.Allocator,
     loader: Loader,
@@ -6729,6 +6757,7 @@ pub const Renderer = struct {
     image_state_optimization_enabled: bool,
     guest_memory: ?GuestMemory = null,
     guest_fingerprint_cache: guest_fingerprints.Cache = .{},
+    untracked_fingerprints: [64]UntrackedFingerprint = @splat(.{}),
     /// Holds a display buffer read straight out of guest memory, for a flip
     /// that names a buffer nothing was rendered into.
     guest_frame_scratch: std.ArrayList(u8) = .empty,
@@ -18614,7 +18643,7 @@ pub const Renderer = struct {
             .tile_mode = descriptor.tile_mode,
             .base_array_slice = descriptor.base_array_slice,
             .mip_level = descriptor.mip_level,
-            .samples_log2 = descriptor.samples_log2,
+            .samples_log2 = if (disable_multisampling) 0 else descriptor.samples_log2,
             .has_stencil = has_stencil,
             .clear_depth = descriptor.clear_depth,
             .clear_stencil = descriptor.clear_stencil,
@@ -29859,6 +29888,7 @@ pub const Renderer = struct {
         cached.gpu_dirty = false;
         cached.guest_content_hash_valid = false;
         cached.guest_page_generation = 0;
+        cached.last_guest_check_flip = 0;
         cached.guest_texel_hash = null;
         cached.guest_backing_hash = null;
         cached.guest_native_texel_hash = null;
@@ -29885,6 +29915,7 @@ pub const Renderer = struct {
         if (page_generation == 0 and @atomicLoad(bool, &arm_storage_cpu_watches, .monotonic)) {
             if (memory.track_gpu_read) |track| page_generation = track(memory.context, cached.descriptor.address, cached.allocation_bytes);
         }
+        if (page_generation == 0 and cached.last_guest_check_flip == self.flip_callbacks) return false;
         // A full-overwrite baseline owns only this view's texels. Fingerprint
         // those spans directly; unchanged padding is not required and this
         // proof must never rearm a sibling mip's generation.
@@ -29892,6 +29923,7 @@ pub const Renderer = struct {
             if (cached.guest_native_baseline_digest) |baseline| {
                 if (self.storageOverwriteGuestDigest(memory, cached.descriptor.address, cached.guest_native_coverage.?)) |current| {
                     self.storage_native_hash_comparisons +|= 1;
+                    cached.last_guest_check_flip = self.flip_callbacks;
                     if (current != baseline) return true;
                     cached.guest_page_generation = page_generation;
                     cached.guest_backing_hash = null;
@@ -29905,6 +29937,7 @@ pub const Renderer = struct {
         self.frame_profile.storage_guest_hash_bytes +|= cached.allocation_bytes;
         const current_hash = self.fingerprintGuestRange(memory, cached.descriptor.address, cached.allocation_bytes);
         if (current_hash != null and current_hash == cached.guest_backing_hash) {
+            cached.last_guest_check_flip = self.flip_callbacks;
             self.observeStorageBackingGeneration(cache_index, current_hash.?, page_generation);
             return false;
         }
@@ -29913,6 +29946,7 @@ pub const Renderer = struct {
         if (!memory.read(memory.context, cached.descriptor.address, scratch.bytes)) return Error.GuestMemoryReadFailed;
         const backing_hash = gpu.parallel_copy.fingerprint(scratch.bytes);
         if (backing_hash == cached.guest_backing_hash) {
+            cached.last_guest_check_flip = self.flip_callbacks;
             self.observeStorageBackingGeneration(cache_index, backing_hash, page_generation);
             return false;
         }
@@ -30036,9 +30070,14 @@ pub const Renderer = struct {
         };
         if (memory.fingerprint == null) return false;
         const has_page_tracking = memory.track_gpu_read != null or memory.gpu_generation != null;
-        if (!has_page_tracking and size > 32 * 1024 * 1024 and
-            snapshot.last_checked_flip == self.flip_callbacks)
-        {
+        // Without page tracking the hash is the only proof. Once a backing
+        // has been checked during the current flip, repeated draws into the
+        // same target need not rehash the whole range; a guest write between
+        // draws changes the generation when tracking is available. Large
+        // untracked targets already used this shortcut; apply it to every
+        // untracked color backing so menu frames with thousands of draws do
+        // not spend their time hashing the same 15 MiB framebuffer.
+        if (!has_page_tracking and snapshot.last_checked_flip == self.flip_callbacks) {
             return false;
         }
         const observed = if (memory.track_gpu_read) |track|
@@ -30056,8 +30095,31 @@ pub const Renderer = struct {
 
     fn fingerprintGuestRange(self: *Renderer, memory: GuestMemory, address: u64, size: usize) ?u64 {
         const fingerprint = memory.fingerprint orelse return null;
-        if (@atomicLoad(bool, &cached_guest_fingerprints, .monotonic))
-            return self.guest_fingerprint_cache.read(memory.context, address, size, fingerprint, memory.gpu_generation);
+        if (@atomicLoad(bool, &cached_guest_fingerprints, .monotonic)) {
+            const generation = if (memory.gpu_generation) |query| query(memory.context, address, size) else 0;
+            if (generation != 0)
+                return self.guest_fingerprint_cache.read(memory.context, address, size, fingerprint, memory.gpu_generation);
+            if (size < untracked_fingerprint_min_bytes)
+                return fingerprint(memory.context, address, size);
+            const slot = &self.untracked_fingerprints[@as(usize, @truncate(address ^ size)) & (self.untracked_fingerprints.len - 1)];
+            const probe = hashGuestMemoryRange(memory, address, size, false);
+            if (slot.valid and slot.address == address and slot.size == size and
+                slot.probe_hash == probe and
+                self.flip_callbacks -| slot.last_full_frame < untracked_fingerprint_full_interval_frames)
+            {
+                return slot.full_hash;
+            }
+            const full = fingerprint(memory.context, address, size) orelse return null;
+            slot.* = .{
+                .address = address,
+                .size = size,
+                .full_hash = full,
+                .probe_hash = probe,
+                .last_full_frame = self.flip_callbacks,
+                .valid = true,
+            };
+            return full;
+        }
         return fingerprint(memory.context, address, size);
     }
 
@@ -35126,12 +35188,21 @@ pub const Renderer = struct {
 
     fn stageSampledImage(
         self: *Renderer,
-        descriptor: gpu.resources.ImageDescriptor,
+        descriptor_: gpu.resources.ImageDescriptor,
         sampler_descriptor: gpu.resources.SamplerDescriptor,
         trace_descriptor_index: u32,
         dimension: rdna2.spirv.SampledImageDimension,
         render_target_write: ?GuestColorTarget,
     ) anyerror!PreparedSampledImage {
+        var descriptor = descriptor_;
+        if (disable_multisampling and descriptor.samplesLog2() != 0) {
+            descriptor.image_type = switch (descriptor.image_type) {
+                .color_2d_msaa => .color_2d,
+                .color_2d_msaa_array => .color_2d_array,
+                else => descriptor.image_type,
+            };
+            descriptor.last_level = 0;
+        }
         if (sampledImageMinimumLod(descriptor, descriptor.viewMipLevels()) > 0 and !self.image_view_min_lod_available)
             return error.ImageViewMinLodUnavailable;
         if (self.sampled_address_census.count() < 32768) {
@@ -35386,7 +35457,7 @@ pub const Renderer = struct {
                 item.last_level != descriptor.last_level or
                 item.mip_levels != (if (mip_plan) |plan| plan.level_count else 1) or
                 item.state_hash != state_hash or
-                item.source_generation != early_source_generation or
+                (item.source_generation != early_source_generation and early_page_generation != 0) or
                 item.content_hash != early_content_hash)
             {
                 continue;
@@ -35541,7 +35612,7 @@ pub const Renderer = struct {
                 item.last_level == descriptor.last_level and
                 item.mip_levels == (if (mip_plan) |plan| plan.level_count else 1) and
                 item.state_hash == state_hash and
-                item.source_generation == source_generation and
+                (item.source_generation == source_generation or page_generation == 0) and
                 item.content_hash == content_hash)
             {
                 cache_hit_idx = idx;
