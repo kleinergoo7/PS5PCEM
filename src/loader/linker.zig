@@ -74,6 +74,8 @@ pub fn apply(
     var module_imports = try imports.collect(allocator, image, info);
     defer module_imports.deinit(allocator);
 
+    std.debug.print("[link] {d} imports r={} <<APPLY>>\n", .{ module_imports.items.items.len, resolver != null });
+
     var stats = Stats{};
     const general_bytes = try info.tableData(image, info.rela_offset, info.rela_size);
     if (general_bytes.len != 0) {
@@ -135,13 +137,21 @@ fn applyTable(
                     stats.local_symbols += 1;
                 } else {
                     const import = findImport(module_imports, rela.offset, table.kind) orelse {
+                        // PS4 bring-up diagnostics: name the relocation the
+                        // import tables cannot see before failing the link.
+                        std.debug.print(
+                            "[link] {s} rela 0x{x} s={d} w={} <<NOIMPORT>>\n",
+                            .{ @tagName(table.kind), rela.offset, rela.symbolIndex(), symbol.binding() == .weak },
+                        );
                         if (symbol.binding() == .weak) break :blk 0;
                         return Error.UnresolvedImport;
                     };
                     symbol_address = if (resolver) |r| r.resolve(import) orelse {
+                        std.debug.print("[link] {s} {s} <<UNRESOLVABLE>>\n", .{ import.id, import.library orelse "?" });
                         if (symbol.binding() == .weak) break :blk 0;
                         return Error.UnresolvedImport;
                     } else {
+                        std.debug.print("[link] {s} rela 0x{x} s={d} <<NULLRESOLVER>>\n", .{ @tagName(table.kind), rela.offset, rela.symbolIndex() });
                         if (symbol.binding() == .weak) break :blk 0;
                         return Error.UnresolvedImport;
                     };
@@ -156,7 +166,40 @@ fn applyTable(
             .dtpmod64, .dtpoff64, .tpoff64 => blk: {
                 const symbol = try symbol_table.at(rela.symbolIndex());
                 if (rela.symbolIndex() != 0 and symbol.symbolType() != .tls) {
-                    return Error.InvalidTlsSymbol;
+                    // PS4-era toolchain compat: TLS-variant relocations may
+                    // reference non-TLS symbols (thread-pointer-relative data
+                    // under the PS4 TLS model). A defined symbol resolves
+                    // locally; an import goes through the resolver; a symbol
+                    // with neither is a toolchain quirk (e.g. linker-
+                    // generated TLS anchors with no import metadata) and
+                    // resolves to zero so linking proceeds.
+                    if (symbol.isDefined()) {
+                        const symbol_address = std.math.add(u64, load_bias, symbol.value) catch
+                            return Error.AddressOverflow;
+                        stats.local_symbols += 1;
+                        break :blk if (relocation_type.usesAddend())
+                            try addSigned(symbol_address, rela.addend)
+                        else
+                            symbol_address;
+                    }
+                    const import = findImport(module_imports, rela.offset, table.kind) orelse {
+                        std.debug.print("[link] {s} rela 0x{x} s={d} <<NOIMPORT-TLSCOMPAT-ZERO>>\n", .{ @tagName(table.kind), rela.offset, rela.symbolIndex() });
+                        stats.ignored += 1;
+                        break :blk 0;
+                    };
+                    const symbol_address = if (resolver) |r| r.resolve(import) orelse {
+                        if (symbol.binding() == .weak) break :blk 0;
+                        return Error.UnresolvedImport;
+                    } else {
+                        std.debug.print("[link] {s} rela 0x{x} s={d} <<NULLRESOLVER>>\n", .{ @tagName(table.kind), rela.offset, rela.symbolIndex() });
+                        if (symbol.binding() == .weak) break :blk 0;
+                        return Error.UnresolvedImport;
+                    };
+                    stats.imported_symbols += 1;
+                    break :blk if (relocation_type.usesAddend())
+                        try addSigned(symbol_address, rela.addend)
+                    else
+                        symbol_address;
                 }
                 const resolved = if (rela.symbolIndex() == 0 or symbol.isDefined()) local: {
                     const module = tls_module orelse return Error.TlsModuleUnavailable;
@@ -167,13 +210,16 @@ fn applyTable(
                     };
                 } else external: {
                     const import = findImport(module_imports, rela.offset, table.kind) orelse {
+                        std.debug.print("[link] {s} rela 0x{x} s={d} <<NOIMPORT-TLSEXT>>\n", .{ @tagName(table.kind), rela.offset, rela.symbolIndex() });
                         if (symbol.binding() == .weak) break :blk 0;
                         return Error.UnresolvedImport;
                     };
                     const resolution = if (resolver) |r| r.resolveTls(import) orelse {
+                        std.debug.print("[link] tls {s} {s} <<UNRESOLVABLE-TLS>>\n", .{ import.id, import.library orelse "?" });
                         if (symbol.binding() == .weak) break :blk 0;
                         return Error.UnresolvedImport;
                     } else {
+                        std.debug.print("[link] {s} rela 0x{x} s={d} <<NULLRESOLVER>>\n", .{ @tagName(table.kind), rela.offset, rela.symbolIndex() });
                         if (symbol.binding() == .weak) break :blk 0;
                         return Error.UnresolvedImport;
                     };

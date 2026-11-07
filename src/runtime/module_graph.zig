@@ -790,6 +790,7 @@ fn linkNode(
     diagnostics: ?Diagnostics,
 ) !void {
     const node = &graph.nodes.items[index];
+    std.debug.print("[link] node {s} <<NODE>>\n", .{node.path});
     if (diagnostics) |sink| try reportUnresolved(graph.allocator, node, resolver, sink);
     node.mapped = try loader.linkImage(
         &node.prepared.?,
