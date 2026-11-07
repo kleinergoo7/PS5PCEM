@@ -51,27 +51,27 @@ pub const exports = [_]symbols.Export{
     .{
         .name = "sceGnmSubmitAndFlipCommandBuffers",
         .function = trace.wrap("sceGnmSubmitAndFlipCommandBuffers", &sceGnmSubmitAndFlipCommandBuffers),
-        .expect_id = "AAAAAAAAAAAAAAAA",
+        .expect_id = null,
     },
     .{
         .name = "sceGnmValidateCommandBuffer",
         .function = trace.wrap("sceGnmValidateCommandBuffer", &sceGnmValidateCommandBuffer),
-        .expect_id = "AAAAAAAAAAAAAAAB",
+        .expect_id = null,
     },
     .{
         .name = "sceGnmMapComputeQueue",
         .function = trace.wrap("sceGnmMapComputeQueue", &sceGnmMapComputeQueue),
-        .expect_id = "AAAAAAAAAAAAAAAC",
+        .expect_id = null,
     },
     .{
         .name = "sceGnmValidateDrawState",
         .function = trace.wrap("sceGnmValidateDrawState", &sceGnmValidateDrawState),
-        .expect_id = "AAAAAAAAAAAAAAAD",
+        .expect_id = null,
     },
     .{
         .name = "sceGnmGetCaptureStatus",
         .function = trace.wrap("sceGnmGetCaptureStatus", &sceGnmGetCaptureStatus),
-        .expect_id = "AAAAAAAAAAAAAAAE",
+        .expect_id = null,
     },
 };
 

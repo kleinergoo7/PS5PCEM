@@ -19,7 +19,7 @@ pub fn badgeFor(mode: detector.Mode) []const u8 {
         .ps4_gnm => "PS4 · GNM",
         .ps5_native => "",
         .unknown => "unverified",
-    }
+    };
 }
 
 /// Launch profile: what the runner needs beyond the executable path.
