@@ -19,6 +19,14 @@ pub const gnm_packets = @import("gnm_packets.zig");
 pub const image_layout = @import("image_layout.zig");
 pub const compat_hle = @import("compat_hle.zig");
 pub const runtime = @import("runtime.zig");
+pub const tessellation = @import("tessellation.zig");
+pub const gpu_translate = @import("gpu_translate.zig");
+pub const patches = @import("patches.zig");
+pub const trophy = @import("trophy.zig");
+pub const video_out = @import("video_out.zig");
+pub const driver_packets = @import("driver_packets.zig");
+pub const launch = @import("launch.zig");
+pub const bridge = @import("bridge.zig");
 
 pub const Mode = detector.Mode;
 pub const Session = runtime.Session;
@@ -37,4 +45,12 @@ test {
     _ = image_layout;
     _ = compat_hle;
     _ = runtime;
+    _ = tessellation;
+    _ = gpu_translate;
+    _ = patches;
+    _ = trophy;
+    _ = video_out;
+    _ = driver_packets;
+    _ = launch;
+    _ = bridge;
 }

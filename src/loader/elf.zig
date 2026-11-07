@@ -50,22 +50,31 @@ pub const ObjectType = enum(u16) {
     exec = 2,
     dyn = 3,
     core = 4,
-    /// A dynamically linked main executable.
+    /// A dynamically linked main executable (PS5 toolchain).
     sce_dynexec = 0xfe10,
-    /// A shared library.
+    /// A shared library (PS5 toolchain).
     sce_dynamic = 0xfe18,
+    /// A dynamically linked main executable (PS4 toolchain).
+    sce_dynexec_ps4 = 0xfe00,
+    /// A shared library (PS4 toolchain).
+    sce_dynamic_ps4 = 0xfe01,
     _,
 
     /// Whether this loader can handle the object.
     pub fn isSupported(self: ObjectType) bool {
         return switch (self) {
-            .sce_dynexec, .sce_dynamic => true,
+            .sce_dynexec, .sce_dynamic, .sce_dynexec_ps4, .sce_dynamic_ps4 => true,
             else => false,
         };
     }
 
     pub fn isExecutable(self: ObjectType) bool {
-        return self == .sce_dynexec;
+        return self == .sce_dynexec or self == .sce_dynexec_ps4;
+    }
+
+    /// True for PS4-era objects needing the GNM compatibility path.
+    pub fn isPs4(self: ObjectType) bool {
+        return self == .sce_dynexec_ps4 or self == .sce_dynamic_ps4;
     }
 };
 
