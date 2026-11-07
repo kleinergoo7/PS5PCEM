@@ -1317,6 +1317,20 @@ const WindowsX64Machine = struct {
         );
     }
 
+    // Hex snapshot of guest code at a fault address for bring-up logs.
+    // Blank when unreadable; otherwise 32 hex chars, no separators.
+    fn cpuFaultBytes(addr: u64) [32]u8 {
+        var out: [32]u8 = [_]u8{' '} ** 32;
+        if (!memory.isHostRangeReadable(addr, 16)) return out;
+        const src: [*]const u8 = @ptrFromInt(addr);
+        const digits = "0123456789abcdef";
+        for (0..16) |i| {
+            out[i * 2] = digits[src[i] >> 4];
+            out[i * 2 + 1] = digits[src[i] & 0xf];
+        }
+        return out;
+    }
+
     fn handleGuestException(
         exception: *std.os.windows.EXCEPTION_POINTERS,
     ) callconv(.winapi) c_long {
@@ -1784,7 +1798,7 @@ const WindowsX64Machine = struct {
                         return_address = stack[1];
                     }
                     std.debug.print(
-                        "[cpu] recovered null-memory store @rip=0x{x} addr=0x{x} caller=0x{x} frame=0x{x} rax=0x{x} rcx=0x{x} rdx=0x{x} rsi=0x{x} rdi=0x{x} r14=0x{x} r15=0x{x} (#{d})\n",
+                        "[cpu] recovered null-memory store @rip=0x{x} addr=0x{x} caller=0x{x} frame=0x{x} rax=0x{x} rcx=0x{x} rdx=0x{x} rsi=0x{x} rdi=0x{x} r14=0x{x} r15=0x{x} code={s} (#{d})\n",
                         .{
                             fault_rip,
                             record.ExceptionInformation[1],
@@ -1797,6 +1811,7 @@ const WindowsX64Machine = struct {
                             context.Rdi,
                             context.R14,
                             context.R15,
+                            cpuFaultBytes(fault_rip),
                             count,
                         },
                     );

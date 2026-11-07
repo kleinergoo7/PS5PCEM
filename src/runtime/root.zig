@@ -639,7 +639,19 @@ fn preferHleImportId(id: []const u8) bool {
         // Owner-aware guards avoid a same-thread bootstrap recursion deadlock.
     or std.mem.eql(u8, id, "3GPpjQdAMTw") // __cxa_guard_acquire
     or std.mem.eql(u8, id, "9rAeANT2tyE") // __cxa_guard_release
-    or std.mem.eql(u8, id, "2emaaluWzUw"); // __cxa_guard_abort
+    or std.mem.eql(u8, id, "2emaaluWzUw") // __cxa_guard_abort
+        // PS4 titles ship their own libc whose dlmalloc arena is never
+        // initialized under emulation (no libc init_array runs). Route the
+        // app allocator family to the emulated flexible-memory heap so
+        // malloc/calloc/realloc/free stay on one consistent heap. No other
+        // HLE claims these NIDs, so PS5 titles are unaffected.
+    or std.mem.eql(u8, id, "gQX+4GDQjpM") // malloc
+    or std.mem.eql(u8, id, "2X5agFjKxMc") // calloc
+    or std.mem.eql(u8, id, "Ujf3KzMvRmI") // memalign
+    or std.mem.eql(u8, id, "tIhsqj0qsFE") // free
+    or std.mem.eql(u8, id, "Y7aJ1uydPMo") // realloc
+    or std.mem.eql(u8, id, "OJjm-QOIHlI") // sceLibcMspaceMalloc
+    or std.mem.eql(u8, id, "Vla-Z+eXlxo"); // sceLibcMspaceFree
 }
 
 fn resolveHleExact(context: *const ResolverContext, import: *const loader.Import, symbol_type: hle.SymbolType) ?u64 {

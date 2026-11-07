@@ -339,7 +339,6 @@ const funcs = [_]FuncEntry{
     .{ .lib = "libc", .nid = "WkkeywLJcgU" },
     .{ .lib = "libc", .nid = "XKRegsFpEpk" },
     .{ .lib = "libc", .nid = "XwLA5cTHjt4" },
-    .{ .lib = "libc", .nid = "Y7aJ1uydPMo" },
     .{ .lib = "libc", .nid = "YDnLaav6W6Q" },
     .{ .lib = "libc", .nid = "YNzNkJzYqEg" },
     .{ .lib = "libc", .nid = "YQ0navp+YIc" },

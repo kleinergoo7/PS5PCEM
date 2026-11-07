@@ -61,8 +61,13 @@ fn growLocked() bool {
     if (chunk_count >= max_chunks) return false;
     var addr: u64 = 0;
     var cname = [_:0]u8{ 'p', 's', '4', 'h', 'e', 'a', 'p', 0 };
-    const rc = kernel_memory.sceKernelMapNamedFlexibleMemory(&addr, chunk_len, 3, 0x1000, &cname);
-    if (rc != errno.ok or addr == 0) return false;
+    // Flags 0: plain auto-placed anonymous mapping (the SCE flag set has
+    // no POSIX MAP_ANONYMOUS bit; 0x1000 is rejected with EINVAL).
+    const rc = kernel_memory.sceKernelMapNamedFlexibleMemory(&addr, chunk_len, 3, 0, &cname);
+    if (rc != errno.ok or addr == 0) {
+        std.debug.print("[ps4heap] arena map failed rc={d} addr=0x{x}\n", .{ rc, addr });
+        return false;
+    }
     chunks[chunk_count] = addr;
     chunk_count += 1;
     // Whole chunk starts as one free block, inserted sorted.
@@ -217,6 +222,33 @@ fn ps4MspaceFree(_: u64, ptr: u64) callconv(abi.guest) void {
     freeImpl(ptr);
 }
 
+fn reallocImpl(old_ptr: u64, size: u64) u64 {
+    if (old_ptr == 0) return mallocImpl(size);
+    if (size == 0) {
+        freeImpl(old_ptr);
+        return mallocImpl(1);
+    }
+    heapLock();
+    defer heapUnlock();
+    if (old_ptr < header_size) return 0;
+    const h = readHeader(old_ptr - header_size);
+    if (h.magic != heap_magic or h.size < min_block or h.size > chunk_len) return 0;
+    const old_user = h.size - header_size;
+    if (size <= old_user) return old_ptr;
+    const new_ptr = allocLocked(size, 16);
+    if (new_ptr == 0) return 0;
+    const copy_len = @min(old_user, size);
+    const dst: [*]u8 = @ptrFromInt(new_ptr);
+    const src: [*]const u8 = @ptrFromInt(old_ptr);
+    @memcpy(dst[0..copy_len], src[0..copy_len]);
+    freeLocked(old_ptr);
+    return new_ptr;
+}
+
+fn ps4Realloc(old_ptr: u64, size: u64) callconv(abi.guest) u64 {
+    return reallocImpl(old_ptr, size);
+}
+
 pub const exports = [_]symbols.Export{
     .{ .name = "malloc", .function = trace.wrap("ps4-malloc", &ps4Malloc), .id_override = "gQX+4GDQjpM" },
     .{ .name = "calloc", .function = trace.wrap("ps4-calloc", &ps4Calloc), .id_override = "2X5agFjKxMc" },
@@ -224,6 +256,7 @@ pub const exports = [_]symbols.Export{
     .{ .name = "free", .function = trace.wrap("ps4-free", &ps4Free), .id_override = "tIhsqj0qsFE" },
     .{ .name = "sceLibcMspaceMalloc", .function = trace.wrap("ps4-mspace-malloc", &ps4MspaceMalloc), .id_override = "OJjm-QOIHlI" },
     .{ .name = "sceLibcMspaceFree", .function = trace.wrap("ps4-mspace-free", &ps4MspaceFree), .id_override = "Vla-Z+eXlxo" },
+    .{ .name = "realloc", .function = trace.wrap("ps4-realloc", &ps4Realloc), .id_override = "Y7aJ1uydPMo" },
 };
 
 pub const library = symbols.Library{ .name = "libc", .version = 1 };
