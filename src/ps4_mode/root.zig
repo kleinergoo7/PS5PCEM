@@ -27,6 +27,10 @@ pub const video_out = @import("video_out.zig");
 pub const driver_packets = @import("driver_packets.zig");
 pub const launch = @import("launch.zig");
 pub const bridge = @import("bridge.zig");
+pub const gcn_lower = @import("gcn_lower.zig");
+pub const audio_np = @import("audio_np.zig");
+pub const submit = @import("submit.zig");
+pub const game_hook = @import("game_hook.zig");
 
 pub const Mode = detector.Mode;
 pub const Session = runtime.Session;
@@ -53,4 +57,8 @@ test {
     _ = driver_packets;
     _ = launch;
     _ = bridge;
+    _ = gcn_lower;
+    _ = audio_np;
+    _ = submit;
+    _ = game_hook;
 }

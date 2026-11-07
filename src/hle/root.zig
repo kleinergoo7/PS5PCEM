@@ -160,6 +160,7 @@ test {
     _ = libs.system_service;
     _ = libs.ult;
     _ = libs.user_service;
+    _ = @import("libs/gnm_service_compat.zig");
 }
 
 // ---------------------------------------------------------------------------
