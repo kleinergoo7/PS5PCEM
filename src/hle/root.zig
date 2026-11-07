@@ -40,6 +40,7 @@ pub const libs = struct {
     pub const agc = @import("libs/agc.zig");
     pub const agc_submit = @import("libs/agc_submit.zig");
     pub const gnm_compat = @import("libs/gnm_compat.zig");
+    pub const ps4_heap = @import("libs/ps4_heap.zig");
     pub const ps4_title_stubs = @import("libs/ps4_title_stubs.zig");
     pub const kernel_aio = @import("libs/kernel_aio.zig");
     pub const kernel_mapper = @import("libs/kernel_mapper.zig");
@@ -107,6 +108,7 @@ pub fn registerAll(db: *Database, gpa: @import("std").mem.Allocator) symbols.Err
     try libs.system_service.register(db, gpa);
     try libs.ult.register(db, gpa);
     try libs.user_service.register(db, gpa);
+    try libs.ps4_heap.register(db, gpa);
     try libs.ps4_title_stubs.register(db, gpa);
 }
 

@@ -783,6 +783,7 @@ fn linkAll(
     try linkNode(graph, graph.root_index, resolver, diagnostics);
 }
 
+
 fn linkNode(
     graph: *ModuleGraph,
     index: usize,
