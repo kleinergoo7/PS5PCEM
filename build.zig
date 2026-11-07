@@ -161,6 +161,17 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // Experimental PS4 (GNM/GCN) compatibility mode. Dependency-free (std
+    // only) by design: detection, param.sfo parsing, shader-header decode,
+    // packet translation, tiling math, the HLE compat table and the session
+    // live here so they compile and test in isolation. See src/ps4_mode/ and
+    // docs/ps4-mode.md for the integration points into loader/hle/gpu.
+    const ps4_mode = b.addModule("ps4_mode", .{
+        .root_source_file = b.path("src/ps4_mode/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     // Firmware emulation: identifier derivation, the symbol registry, and the
     // guest-facing libraries. Thread bootstrap consumes immutable TLS
     // templates from the loader without introducing a dependency back into it.
@@ -890,6 +901,7 @@ pub fn build(b: *std.Build) void {
         memory,
         mod,
         gpu,
+        ps4_mode,
         vulkan,
         d3d12,
         window,
@@ -944,4 +956,6 @@ pub fn build(b: *std.Build) void {
     b.step("test-vulkan", "Run Vulkan backend tests").dependOn(&b.addRunArtifact(vulkan_tests).step);
     const d3d12_tests = b.addTest(.{ .root_module = d3d12 });
     b.step("test-d3d12", "Run portable Direct3D 12 boundary tests").dependOn(&b.addRunArtifact(d3d12_tests).step);
+    const ps4_mode_tests = b.addTest(.{ .root_module = ps4_mode });
+    b.step("test-ps4mode", "Run PS4 (GNM/GCN) compatibility mode tests").dependOn(&b.addRunArtifact(ps4_mode_tests).step);
 }
