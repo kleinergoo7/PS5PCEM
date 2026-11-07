@@ -165,6 +165,9 @@ fn applyTable(
             },
             .dtpmod64, .dtpoff64, .tpoff64 => blk: {
                 const symbol = try symbol_table.at(rela.symbolIndex());
+                if (symbol.symbolType() != .tls) {
+                    std.debug.print("[link] TLSKIND {s} rela 0x{x} sym={d} stype={s} add=0x{x} def={} bind={s} <<TLSKIND>>\n", .{ @tagName(relocation_type), rela.offset, rela.symbolIndex(), @tagName(symbol.symbolType()), rela.addend, symbol.isDefined(), @tagName(symbol.binding()) });
+                }
                 if (rela.symbolIndex() != 0 and symbol.symbolType() != .tls) {
                     // PS4-era toolchain compat: TLS-variant relocations may
                     // reference non-TLS symbols (thread-pointer-relative data
@@ -183,6 +186,18 @@ fn applyTable(
                             symbol_address;
                     }
                     const import = findImport(module_imports, rela.offset, table.kind) orelse {
+                        // DTPMOD64 against a local section symbol asks for
+                        // the TLS module ID of THIS module (all 17 observed
+                        // sites: dtpmod64, sym 1, STT_SECTION, LOCAL). Emit
+                        // our own id so __tls_get_addr-style sequences index
+                        // the right DTV slot instead of module 0.
+                        if (relocation_type == .dtpmod64 and symbol.symbolType() == .section and symbol.binding() == .local) {
+                            if (tls_module) |tm| {
+                                std.debug.print("[link] {s} rela 0x{x} s={d} tm={d} <<DTPMOD-SELF>>\n", .{ @tagName(table.kind), rela.offset, rela.symbolIndex(), tm.id });
+                                stats.local_symbols += 1;
+                                break :blk tm.id;
+                            }
+                        }
                         std.debug.print("[link] {s} rela 0x{x} s={d} <<NOIMPORT-TLSCOMPAT-ZERO>>\n", .{ @tagName(table.kind), rela.offset, rela.symbolIndex() });
                         stats.ignored += 1;
                         break :blk 0;
@@ -475,4 +490,53 @@ test "TLS relocations encode local and imported Variant II values" {
     try testing.expectEqual(@as(usize, 5), stats.tls);
     try testing.expectEqual(@as(usize, 3), stats.local_symbols);
     try testing.expectEqual(@as(usize, 2), stats.imported_symbols);
+}
+
+test "dtpmod64 against a local section symbol emits our TLS module id" {
+    // PS4-era toolchain compat (DRIVECLUB bring-up): general-dynamic TLS
+    // slots reference STT_SECTION/LOCAL symbols with no import metadata.
+    // They ask for the defining module's DTV id, which for a local section
+    // symbol is always this module — never zero.
+    var address_space = try memory.AddressSpace.init(testing.allocator);
+    defer address_space.deinit();
+    const load_bias = memory.system_managed.start;
+    try address_space.mapFixed(load_bias, memory.page_size, .read_write, .module, null);
+
+    const symbol_entries = [_]symbols.Sym{
+        .{ .name = 0, .info = 0, .other = 0, .shndx = 0, .value = 0, .size = 0 },
+        .{ .name = 0, .info = 0x03, .other = 0, .shndx = 0, .value = 0, .size = 0 },
+    };
+    const relocation_entries = [_]relocations.Rela{
+        .{
+            .offset = 0,
+            .info = (@as(u64, 1) << 32) | @intFromEnum(relocations.Type.dtpmod64),
+            .addend = 0,
+        },
+    };
+
+    var module_imports = imports.Imports{};
+    defer module_imports.deinit(testing.allocator);
+
+    var stats = Stats{};
+    try applyTable(
+        &address_space,
+        .{ .entries = &relocation_entries, .kind = .general },
+        .{ .entries = &symbol_entries },
+        &module_imports,
+        load_bias,
+        null,
+        tls.Module{
+            .id = 7,
+            .memory_size = 0x80,
+            .alignment = 0x10,
+            .alignment_bias = 0,
+            .static_offset = 0x80,
+        },
+        &stats,
+    );
+
+    var output: [8]u8 = undefined;
+    try address_space.read(load_bias, &output);
+    try testing.expectEqual(@as(u64, 7), std.mem.readInt(u64, output[0..8], .little));
+    try testing.expectEqual(@as(usize, 1), stats.local_symbols);
 }

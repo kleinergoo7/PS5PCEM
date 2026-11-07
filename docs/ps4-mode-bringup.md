@@ -70,3 +70,62 @@ zig build install
   /home/reng/disk/roms/ps4/CUSA00003/eboot.bin 2>&1 | cat > boot.log
 ./zig-out/bin/module-info <eboot> [--names names.txt] [--bytes VA LEN]
 ```
+
+## Session: 2026-11-07 (root-cause hunt, this=0xd8)
+
+### Verified facts
+
+- **Fault reproduced exactly**: same rip (`libc.prx+0x30018`), same regs
+  (`rbx=0xd8 rdi=0xf8`), 2 firmware calls (cxa pair), heap never called
+  (0 `ps4heap` lines with instrumentation present in the binary).
+- **DTPMOD-SELF fix is NOT the crash cause** (negative result): all 17
+  `dtpmod64`-vs-section sites now emit real ids (eboot tm=2, libc tm=3,
+  logged as `<<DTPMOD-SELF>>`), fault byte-identical afterwards. Correct
+  fix regardless (module 0 was wrong), but the hunt continues elsewhere.
+- **Null-object chain reconstructed from the recovery log** (previously
+  unexamined; present in every run): stores to `0x70/0x78/0x88/0x90/0x98/
+  0xa0` with `rdi=0x70` (all dropped by null-store emulation), one load
+  from `0xd0`, `r15=0xd8` throughout. Shape: NULL base → `+0x70` object
+  (fields built, silently dropped) → `+0x68` subobject (`r15=0xd8`) →
+  `memset(0xd8+0x20)` = first real deref = the crash.
+- **Bias varies per segment, proven twice**: vaddr `0x8242f6` ↔ file
+  `0x7ef566` (bias `0x34d90`) vs vaddr `0x823bd0` ↔ file `0x82ee40`
+  (bias `-0xb270`). An entire disassembly walk was invalidated by this.
+  Only `module-info --bytes` (loader-authoritative) is trustworthy.
+- **Log fd race, proven**: concurrent threads sharing one redirected fd
+  eat each other's bytes (`[link] no resolver for g…` → `eneral rela…`).
+  Always `2>&1 | cat` (atomic pipe writes).
+- **F@0x824270 entry verified** (authoritative bytes): `rbx=rdi`
+  confirmed; `r15d=esi&7` dispatch; stack-canary via global `0x166e250`.
+  `--rip-xrefs` has false positives from zero padding (fields `0x82426b/c`
+  are nop-fill rel32 0). Its caller is still unknown.
+- **Bootstrap context**: nearby strings `x_events.prelobby`,
+  `eSlotAlertFetchEGSData` — the game is initializing its event-stream
+  subsystem (online content; NP/Http all stubbed) when it dies.
+- **Recovery-log reporting conventions** (cpu/root.zig): `rip` = raw fault
+  context; `caller`/`frame` = `stack[1]`/`stack[0]`; null-base redirect
+  only fires for base reg `== 0` (our crash base `rbx=0xd8` bypasses it);
+  null stores are emulated-as-dropped, which is why the `0x70`-object
+  build leaves no trace except these lines.
+
+### Test status
+
+- `ps4_mode`: 20/20 green (`zig build test-ps4mode`).
+- `loader`: 64/64 green incl. new regression test
+  (`dtpmod64 against a local section symbol emits our TLS module id`,
+  id 7 → writes 7).
+- Full `zig build test`: 1999/2027 pass, 1 fail — the failure set is
+  flaky parallel-execution noise (fixed guest-VA mappings colliding
+  across concurrently running test binaries): **every** failing binary
+  passes in isolation (exit 0), including loader/cpu/d3d12/gpu suites.
+  Pre-existing infra behavior, unrelated to this change.
+
+### Next step (narrow)
+
+Find F@`0x824270`'s caller and the NULL source feeding `rdi`. rbx is
+`rdi` at entry (verified) and nothing reassigns it before the faulting
+ lea — so the caller passed `0xd8` (or a NULL its `+0xd8` LEA produced;
+  check both). Candidate order per brief: (a) unrelocated data slot feeding
+  the caller — RELATIVE/GLOB_DAT coverage vs PS4 tables; (b) per-segment
+  bias in whatever produced the caller's pointer; (c) init order vs TLS;
+  (d) firmware-filled pointer — DISFAVORED (zero firmware calls observed).
