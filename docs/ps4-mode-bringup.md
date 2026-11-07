@@ -129,3 +129,61 @@ Find F@`0x824270`'s caller and the NULL source feeding `rdi`. rbx is
   the caller — RELATIVE/GLOB_DAT coverage vs PS4 tables; (b) per-segment
   bias in whatever produced the caller's pointer; (c) init order vs TLS;
   (d) firmware-filled pointer — DISFAVORED (zero firmware calls observed).
+
+## Session: 2026-11-07 (root cause FOUND + fixed; new blocker)
+
+### Root cause of this=0xd8 — PROVEN end to end (GDB at every level)
+
+1. Static init → grandcaller (abs `0x6B83Ax`) → **guard** (abs `0x82ADE0`,
+   verified `rdi=0x5a0`, ret `0x6b83af`) with hook slot
+   (abs `0x278C4C0`) reading **0** (BSS, no relocation targets it).
+2. Hook NULL → default path (verified hit at guard+`0x2c`) → PLT186
+   (abs `0x127FBC0`, verified target) → eboot GOT → **libc.prx PLT**
+   (abs `0x8001EB850`) → ITS GOT (`0x800286190`) → libc malloc
+   (abs `0x8001EBC20`) → internal allocator (`0x8001EC500`).
+   (Resolution order puts guest libc.prx exports ahead of HLE.)
+3. libc malloc is dlmalloc-style over a **static default mspace**
+   (abs `0x80028B788`) that is all zeros: magic check passes vacuously,
+   flags (`+0x370`) lack bit `0x10` → smallbin path over empty bins →
+   returns NULL. NOT an init-ordering accident in our loader: libc.prx
+   genuinely declares **zero initializers** (empty INIT_ARRAY,
+   `DT_INIT_ARRAY=0xbecc0/DT_INIT_ARRAYSZ=0`), and a hardware watchpoint
+   on the flags field **never fires** — nothing ever initializes it.
+   It needs firmware-free pure-guest state that simply isn't there.
+4. `r14=NULL` → `init(NULL)` → caller (abs `0x823B90`, verified
+   `rdi=0x0`) → `[0]=r12` dropped (recovery #1) → `r13=0x70`,
+   `r15=0xd8` (pure LEA) → ctor (abs `0x82B160`, verified disassembly:
+   installs vtable `0x1635470`, twiddles flags) stores dropped (#3–#8)
+   → `memset(0xd8+0x20=0xf8)` hard-faults (`rep stos` unrecoverable).
+
+### Fix (verified working)
+
+- `preferHleImportId` now routes 7 allocator NIDs (malloc, calloc,
+  memalign, free, realloc, mspaceMalloc, mspaceFree) to the emulated
+  heap ahead of guest exports. No other HLE claims these NIDs, so PS5
+  titles are unaffected (previously unresolvable there).
+- `ps4_heap`: added `realloc`; arena mapping needs flags=`0`
+  (`0x1000` is rejected with `EINVAL=0x80020016`, measured).
+- Measured: `malloc(0x5a0)=0x200000010`, `malloc(0x8)=0x2000005c0`;
+  boot passes the old fault into module loading (`LoadStartModule`
+  works) and the bootstrap-heap phase.
+
+### New blocker (unproven cause)
+
+`std::bad_alloc` thrown during bootstrap (after `Unheaped allocation -
+Using BootstrapHeap` + libtbb load), then a host crash (core dump).
+Candidates: stubbed file I/O starving bootstrap (milestone 2), or the
+next allocator gap (operator new resolves to libc.prx guest; its NIDs
+didn't match Itanium candidates — needs more `--names` work).
+Next: catch the throw site (guest `__cxa_throw`) and identify the
+failing request before building file I/O.
+
+### Method notes
+
+- GDB beats static RE here: `nm` finds Zig host symbols
+  (`libs.cxx_abi.cxaGuardAcquire`) as post-mapping anchors; guest
+  absolute breakpoints work after mapping; `-ex` MUST precede `--args`.
+- Absence-of-call is provable: unconditional logging in our heap
+  (zero hits = never called) + trace ring totals (`of 2`).
+- The `code=` field added to null-store recovery lines (cpu/root.zig)
+  resolves addressing disputes empirically: pattern-search the bytes.
