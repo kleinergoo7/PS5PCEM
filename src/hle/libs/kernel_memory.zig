@@ -884,7 +884,7 @@ fn mapDirectMemory(
             return KernelError.einval.raw();
         }
         if (has_memory_pool_reservations and address_space.hasPooledMappings(requested_address, len)) return KernelError.eacces.raw();
-        const occupied = address_space.isMapped(requested_address, len);
+        const occupied = address_space.overlaps(requested_address, len);
         if (occupied and (!explicit_fixed or map_flags & map_no_overwrite != 0)) {
             return KernelError.enomem.raw();
         }
@@ -916,8 +916,21 @@ fn mapDirectMemory(
                 else => return mapAddressSpaceError(err),
             }
 
-            address_space.unmap(requested_address, len) catch |err|
-                return mapAddressSpaceError(err);
+            var cursor = requested_address;
+            const clear_end = requested_address + len;
+            while (cursor < clear_end) {
+                const q = address_space.query(cursor, true) orelse break;
+                if (q.address >= clear_end) break;
+                const is = @max(cursor, q.address);
+                const ie = @min(clear_end, q.end());
+                if (ie <= is) {
+                    cursor = q.end();
+                    continue;
+                }
+                address_space.unmap(is, ie - is) catch |err|
+                    return mapAddressSpaceError(err);
+                cursor = ie;
+            }
         }
         address_space.mapFixed(
             requested_address,
@@ -1771,6 +1784,15 @@ fn sceKernelVirtualQuery(
     defer pool_lock.unlock();
     const address_space = guest_address_space orelse return KernelError.enosys.raw();
     const mapping = address_space.query(address, flags == 1) orelse
+        return KernelError.eacces.raw();
+    // Pure reservations commit nothing. Stack guard pages are committed
+    // in host address-space bookkeeping but carry no CPU access; DRIVECLUB's
+    // EvoStack watchdog enumerates VirtualQuery results and registered our
+    // main-thread guard, then faulted reading it. Hide both from the guest
+    // query surface so enumeration skips them; internal mapper/pool paths
+    // query the address space directly and are unaffected.
+    if (mapping.kind == .reserved and !mapping.pooled) return KernelError.eacces.raw();
+    if (mapping.kind == .stack and mapping.protection_bits & (prot_cpu_read | prot_cpu_write | prot_cpu_execute) == 0)
         return KernelError.eacces.raw();
 
     info.* = .{};
@@ -3756,19 +3778,57 @@ test "a query reports what a range is and whether it is committed" {
     try testing.expect(info.state & state_direct == 0);
 
     // A reservation claims addresses and nothing else: no type, not committed.
+    // It is deliberately invisible to VirtualQuery: advertising it lets
+    // titles register and probe the unmapped gap (DRIVECLUB's EvoStack
+    // watchdog watched our main-thread guard reservation and faulted
+    // reading it), while enumeration walks past the refusal the same way
+    // they walk past unmapped holes.
     const reserved_base = base + 0x10_0000;
     try address_space.reserveFixed(reserved_base, page_size);
     try testing.expectEqual(
-        errno.ok,
+        KernelError.eacces.raw(),
         sceKernelVirtualQuery(reserved_base, 0, &info, @sizeOf(VirtualQueryInfo)),
     );
-    try testing.expectEqual(@as(u32, 0), info.state);
-    try testing.expectEqual(reserved_base, info.start);
-    try testing.expectEqual(reserved_base + page_size, info.end);
+    try testing.expectEqual(
+        KernelError.eacces.raw(),
+        sceKernelVirtualQuery(reserved_base, 1, &info, @sizeOf(VirtualQueryInfo)),
+    );
 
     try testing.expect(isGuestStackRange(base, 8));
     try testing.expect(!isGuestStackRange(reserved_base, 8));
     try testing.expect(!isGuestStackRange(0, 8));
+}
+
+test "virtual query hides no-access stack guard pages" {
+    // DRIVECLUB's EvoStack watchdog enumerated VirtualQuery, registered the
+    // main-thread guard page (kind=stack, no CPU access), then faulted
+    // reading it. The guard must not be reported; the writable stack is.
+    var address_space = try memory.AddressSpace.initWithDirectMemory(
+        testing.allocator,
+        memory.page_size,
+    );
+    defer address_space.deinit();
+
+    init(testing.allocator);
+    defer deinit();
+    attachAddressSpace(&address_space);
+
+    const guard = memory.system_managed.start;
+    try address_space.mapFixed(guard, 2 * page_size, memory.Protection.read_write, .stack, null);
+    try address_space.protect(guard, page_size, memory.Protection.none);
+
+    var info = VirtualQueryInfo{};
+    try testing.expectEqual(
+        KernelError.eacces.raw(),
+        sceKernelVirtualQuery(guard, 0, &info, @sizeOf(VirtualQueryInfo)),
+    );
+    try testing.expectEqual(
+        errno.ok,
+        sceKernelVirtualQuery(guard + page_size, 0, &info, @sizeOf(VirtualQueryInfo)),
+    );
+    try testing.expect(info.state & state_stack != 0);
+    try testing.expect(info.state & state_committed != 0);
+    try testing.expect(info.protection != 0);
 }
 
 test "flexible memory maps, queries, protects, unmaps, and reuses ranges" {

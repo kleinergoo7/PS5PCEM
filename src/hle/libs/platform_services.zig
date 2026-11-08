@@ -124,8 +124,13 @@ fn netCtlGetResult(_: i32, output: ?*i32) callconv(abi.guest) i32 {
 
 fn netCtlGetInfo(_: i32, output: ?*[256]u8) callconv(abi.guest) i32 {
     const info = output orelse return net_ctl_error_invalid_address;
+    // Report "disconnected / empty" info with success. Returning NOT_CONNECTED
+    // left a zeroed buffer plus an error that titles may ignore, then read
+    // NULL pointer fields out of the zeroed info (seen: strcpy(NULL src) in
+    // DRIVECLUB online init). Zeroed = link down / empty strings / 0, which is
+    // safe for offline emulation.
     @memset(info, 0);
-    return net_ctl_error_not_connected;
+    return errno.ok;
 }
 
 fn rtcGetCurrentTick(output: ?*u64) callconv(abi.guest) i32 {
@@ -832,7 +837,9 @@ test "network control reports a coherent disconnected console" {
     try std.testing.expectEqual(errno.ok, netCtlGetState(&state));
     try std.testing.expectEqual(@as(i32, 0), state);
     var info: [256]u8 = [_]u8{0xff} ** 256;
-    try std.testing.expectEqual(net_ctl_error_not_connected, netCtlGetInfo(14, &info));
+    // Return success with zeroed info (disconnected/empty) so titles that
+    // ignore the return still read safe values, not NULL pointers.
+    try std.testing.expectEqual(errno.ok, netCtlGetInfo(14, &info));
     try std.testing.expectEqualSlices(u8, &([_]u8{0} ** 256), &info);
 }
 

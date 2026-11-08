@@ -1176,6 +1176,12 @@ pub const AddressSpace = struct {
         return self.coversLocked(address, size, null);
     }
 
+    pub fn overlaps(self: *AddressSpace, address: u64, size: u64) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.overlapsLocked(address, size);
+    }
+
     /// Identifies one allocation even after protection or metadata splits.
     /// Zero declines a proof for holes, reservations and multiple allocations.
     pub fn mappingIdentity(self: *AddressSpace, address: u64, size: usize) u64 {
@@ -1864,7 +1870,17 @@ pub const AddressSpace = struct {
             return Error.AddressUnavailable;
         }
         if (self.overlapsLocked(address, size)) {
-            std.debug.print("[memory] fixed map overlaps addr=0x{x} size=0x{x} kind={s}\n", .{ address, size, @tagName(kind) });
+            var conflict_addr: u64 = 0;
+            var conflict_end: u64 = 0;
+            var conflict_kind: MappingKind = .reserved;
+            for (self.mappings.items) |m| {
+                if (m.end() <= address or m.address >= address + size) continue;
+                conflict_addr = m.address;
+                conflict_end = m.end();
+                conflict_kind = m.kind;
+                break;
+            }
+            std.debug.print("[memory] fixed map overlaps addr=0x{x} size=0x{x} kind={s} (conflict 0x{x}-0x{x} {s})\n", .{ address, size, @tagName(kind), conflict_addr, conflict_end, @tagName(conflict_kind) });
             return Error.AddressUnavailable;
         }
         try self.mappings.ensureUnusedCapacity(self.allocator, 1);
