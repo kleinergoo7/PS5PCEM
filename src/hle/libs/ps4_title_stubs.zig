@@ -116,7 +116,6 @@ const funcs = [_]FuncEntry{
     .{ .lib = "libSceNpManager", .nid = "a8R9-75u4iM" },
     .{ .lib = "libSceNpManager", .nid = "ilwLM4zOmu4" },
     .{ .lib = "libSceNpManager", .nid = "mjjTXh+NHWY" },
-    .{ .lib = "libSceNpManager", .nid = "p-o74CnoNzY" },
     .{ .lib = "libSceNpManager", .nid = "r6MyYJkryz8" },
     .{ .lib = "libSceNpManager", .nid = "s4UEa5iBJdc" },
     .{ .lib = "libSceNpParty", .nid = "3e4k2mzLkmc" },

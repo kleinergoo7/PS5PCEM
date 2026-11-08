@@ -260,6 +260,7 @@ pub const npmanager_exports = [_]symbols.Export{
     .{ .name = "sceNpDeleteRequest", .function = trace.wrap("sceNpDeleteRequest", &services.npDeleteRequest), .expect_id = "S7QTn72PrDw" },
     .{ .name = "sceNpGetUserIdByAccountId", .function = trace.wrap("sceNpGetUserIdByAccountId", &services.offline), .expect_id = "VgYczPGB5ss" },
     .{ .name = "sceNpGetOnlineId", .function = trace.wrap("sceNpGetOnlineId", &services.npGetOnlineId), .expect_id = "XDncXQIJUSk" },
+    .{ .name = "sceNpGetNpId", .function = trace.wrap("sceNpGetNpId", &services.npGetNpId), .expect_id = "p-o74CnoNzY" },
     // Registration itself is local and succeeds on an offline console. The
     // next pump delivers the signed-in state already reported by sceNpGetState.
     .{ .name = "sceNpRegisterStateCallbackA", .function = trace.wrap("sceNpRegisterStateCallbackA", &services.npRegisterStateCallback), .expect_id = "qQJfO8HAiaY" },

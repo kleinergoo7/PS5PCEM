@@ -107,6 +107,21 @@ pub fn npGetOnlineId(user_id: i32, output: ?*[20]u8) callconv(abi.guest) i32 {
     return errno.ok;
 }
 
+/// Returns a stable offline `SceNpId` (handle/online-id + opt + reserved, 36 bytes).
+/// Must fill the output: a status-0 stub that leaves `handle.data` uninitialized
+/// makes titles strcpy/compare garbage (observed as NULL-source copies into
+/// online_heap during PS4 bring-up).
+pub fn npGetNpId(user_id: i32, output: ?*[36]u8) callconv(abi.guest) i32 {
+    if (user_id == -1) return errno.KernelError.einval.raw();
+    const np_id = output orelse return errno.KernelError.einval.raw();
+    if (!kernel_memory.isGuestRangeAccessible(@intFromPtr(np_id), 36)) {
+        return errno.KernelError.einval.raw();
+    }
+    @memset(np_id, 0);
+    @memcpy(np_id[0..7], "PS5PCEM"); // handle.data (SceNpOnlineId.data)
+    return errno.ok;
+}
+
 const game_update_error_not_initialized: i32 = @bitCast(@as(u32, 0x8041_2801));
 const game_update_error_invalid_argument: i32 = @bitCast(@as(u32, 0x8041_2803));
 const disc_map_error_invalid_argument: i32 = @bitCast(@as(u32, 0x8093_0002));
