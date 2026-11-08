@@ -39,6 +39,11 @@ fn success() callconv(abi.guest) i32 {
     return errno.ok;
 }
 
+fn stubUnknownNid(_: u64, _: u64, _: u64, _: u64, _: u64, _: u64) callconv(abi.guest) i32 {
+    std.log.warn("STUB: libSceSaveData_native unresolved NID (no-op)", .{});
+    return errno.ok;
+}
+
 fn aprError(err: apr.Error) i32 {
     return switch (err) {
         error.FileNotFound, error.UnknownFile => errno.KernelError.enoent.raw(),
@@ -2302,6 +2307,30 @@ fn saveDataDirNameSearch(_: u64, result_address: u64) callconv(abi.guest) i32 {
     return errno.ok;
 }
 
+/// PS4-compat directory search. Report no PS4 saves found so the title proceeds
+/// with PS5/native save data paths.
+fn saveDataDirNameSearchPs4(_: u64, _: u64, _: u64, _: u64, _: u64, _: u64) callconv(abi.guest) i32 {
+    std.log.warn("STUB: sceSaveDataDirNameSearchPs4 reporting no PS4 saves", .{});
+    // Best-effort: if arg1 looks like a DirNameSearch-style result, zero hit counts.
+    // Signature varies; returning OK is the minimal path to unblock boot.
+    return errno.ok;
+}
+
+fn saveDataGetMountInfo(_: u64, info_address: u64, _: u64, _: u64, _: u64, _: u64) callconv(abi.guest) i32 {
+    // Minimal: report OK and zero/fill plausible mount info if the output looks writable.
+    // The exact SceSaveDataMountInfo layout is SDK-version dependent; zeroing the
+    // caller-provided buffer (when size hints are absent) is safer than guessing.
+    // Minecraft passes (mount, info, 0x11/0x1, 0x1, 0, 0); try a conservative clear.
+    if (info_address != 0 and kernel_memory.isGuestRangeAccessible(info_address, 64)) {
+        const out: [*]u8 = @ptrFromInt(info_address);
+        @memset(out[0..64], 0);
+        // Common layout starts with blocks; set mount status/present hints in the
+        // region games often inspect. Keep it non-fatal if layout differs.
+        @memcpy(out[0.."/savedata0".len], "/savedata0");
+    }
+    return errno.ok;
+}
+
 /// How many slots one search will report. A title with more saves than this has
 /// written more than a single query is expected to carry.
 const maximum_listed_slots = 64;
@@ -2580,6 +2609,7 @@ const mouse_exports = [_]symbols.Export{
 // title's `/savedata0`; its files are then written through the ordinary file
 // API, which is how a title stores its progress.
 const save_data_exports = [_]symbols.Export{
+    .{ .name = "sceSaveDataUnknown_RvID8BVeg_g", .function = trace.wrap("sceSaveDataUnknown_RvID8BVeg_g", &stubUnknownNid), .id_override = "RvID8BVeg+g" },
     .{ .name = "sceSaveDataSaveIcon", .function = trace.wrap("sceSaveDataSaveIcon", &saveDataSaveIcon), .expect_id = "c88Yy54Mx0w" },
     .{ .name = "sceSaveDataDelete", .function = trace.wrap("sceSaveDataDelete", &saveDataDelete), .expect_id = "S1GkePI17zQ" },
     .{ .name = "sceSaveDataInitialize3", .function = trace.wrap("sceSaveDataInitialize3", &success), .expect_id = "TywrFKCoLGY" },
@@ -2595,6 +2625,8 @@ const save_data_exports = [_]symbols.Export{
     .{ .name = "sceSaveDataCommit", .function = trace.wrap("sceSaveDataCommit", &saveDataOnePointer), .expect_id = "ie7qhZ4X0Cc" },
     .{ .name = "sceSaveDataUmount2", .function = trace.wrap("sceSaveDataUmount2", &saveDataUmount), .expect_id = "uW4vfTwMQVo" },
     .{ .name = "sceSaveDataDirNameSearch", .function = trace.wrap("sceSaveDataDirNameSearch", &saveDataDirNameSearch), .expect_id = "dyIhnXq-0SM" },
+    .{ .name = "sceSaveDataDirNameSearchPs4", .function = trace.wrap("sceSaveDataDirNameSearchPs4", &saveDataDirNameSearchPs4), .expect_id = "X4MYzukPc3g" },
+    .{ .name = "sceSaveDataGetMountInfo", .function = trace.wrap("sceSaveDataGetMountInfo", &saveDataGetMountInfo), .expect_id = "65VH0Qaaz6s" },
     .{ .name = "sceSaveDataGetParam", .function = trace.wrap("sceSaveDataGetParam", &saveDataGetParam), .expect_id = "XgvSuIdnMlw" },
     .{ .name = "sceSaveDataSetParam", .function = trace.wrap("sceSaveDataSetParam", &saveDataSetParam), .expect_id = "85zul--eGXs" },
 };

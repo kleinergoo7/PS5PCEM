@@ -1940,7 +1940,7 @@ fn reserveVirtualRange(out_address: ?*u64, len: u64, flags: i32, alignment: u64,
     const effective_alignment = @max(alignment, page_size);
     if (!std.math.isPowerOfTwo(effective_alignment)) return KernelError.einval.raw();
     const map_flags: u32 = @bitCast(flags);
-    const supported_flags = @as(u32, @intCast(map_fixed)) | map_no_overwrite;
+    const supported_flags = @as(u32, @intCast(map_fixed)) | map_no_overwrite | map_no_coalesce;
     if (map_flags & ~supported_flags != 0) return KernelError.einval.raw();
 
     pool_lock.lock();

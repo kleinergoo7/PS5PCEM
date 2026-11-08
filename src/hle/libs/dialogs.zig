@@ -255,6 +255,10 @@ fn signinDialogUpdateStatus() callconv(abi.guest) i32 {
     return signin_dialog_status.load(.acquire);
 }
 
+fn signinDialogGetStatus() callconv(abi.guest) i32 {
+    return signin_dialog_status.load(.acquire);
+}
+
 fn signinDialogClose() callconv(abi.guest) i32 {
     if (signin_dialog_status.load(.acquire) == status_none) {
         return @bitCast(@as(u32, 0x8135_0001));
@@ -304,6 +308,7 @@ const login_dialog_exports = [_]symbols.Export{
 
 const signin_dialog_exports = [_]symbols.Export{
     .{ .name = "sceSigninDialogUpdateStatus", .function = trace.wrap("sceSigninDialogUpdateStatus", &signinDialogUpdateStatus), .expect_id = "Bw31liTFT3A" },
+    .{ .name = "sceSigninDialogGetStatus", .function = trace.wrap("sceSigninDialogGetStatus", &signinDialogGetStatus), .expect_id = "2m077aeC+PA" },
     .{ .name = "sceSigninDialogInitialize", .function = trace.wrap("sceSigninDialogInitialize", &signinDialogInitialize), .expect_id = "mlYGfmqE3fQ" },
     .{ .name = "sceSigninDialogOpen", .function = trace.wrap("sceSigninDialogOpen", &signinDialogOpen), .expect_id = "JlpJVoRWv7U" },
     .{ .name = "sceSigninDialogTerminate", .function = trace.wrap("sceSigninDialogTerminate", &signinDialogTerminate), .expect_id = "LXlmS6PvJdU" },

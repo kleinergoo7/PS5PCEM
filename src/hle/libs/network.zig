@@ -793,6 +793,11 @@ fn http2DeleteRequest(id: i32) callconv(abi.guest) i32 {
     return if (releaseHandle(id, .http2_request)) errno.ok else http2_error_invalid_id;
 }
 
+fn http2StubUnknown(_: u64, _: u64, _: u64, _: u64, _: u64, _: u64) callconv(abi.guest) i32 {
+    std.log.warn("STUB: libSceHttp2 unresolved NID (offline no-op)", .{});
+    return errno.ok;
+}
+
 const http2_exports = [_]symbols.Export{
     .{ .name = "sceHttp2Init", .function = trace.wrap("sceHttp2Init", &http2Init), .expect_id = "3JCe3lCbQ8A" },
     .{ .name = "sceHttp2Term", .function = trace.wrap("sceHttp2Term", &http2Term), .expect_id = "YiBUtz-pGkc" },
@@ -828,6 +833,12 @@ const http2_exports = [_]symbols.Export{
     .{ .name = "sceHttp2SetInflateGZIPEnabled", .function = trace.wrap("sceHttp2SetInflateGZIPEnabled", &http2RequestOption), .expect_id = "uRosf8GQbHQ" },
     .{ .name = "sceHttp2RemoveRequestHeader", .function = trace.wrap("sceHttp2RemoveRequestHeader", &http2RequestOnlyOption), .expect_id = "jHdP0CS4ZlA" },
     .{ .name = "sceHttp2GetMemoryPoolStats", .function = trace.wrap("sceHttp2GetMemoryPoolStats", &services.absent), .expect_id = "otUQuZa-mv0" },
+    // Unresolved NIDs seen in Minecraft (PPSA17221); names not in public NID DBs.
+    // Stubbed offline/no-op with STUB logging so the import links and behavior can be refined.
+    .{ .name = "sceHttp2Unknown_0wUiGX74GQ", .function = trace.wrap("sceHttp2Unknown_0wUiGX74GQ", &http2StubUnknown), .id_override = "-0wUiGX74GQ" },
+    .{ .name = "sceHttp2Unknown_ksn0O9Iilb0", .function = trace.wrap("sceHttp2Unknown_ksn0O9Iilb0", &http2StubUnknown), .id_override = "ksn0O9Iilb0" },
+    .{ .name = "sceHttp2Unknown_WYszaHaIkWs", .function = trace.wrap("sceHttp2Unknown_WYszaHaIkWs", &http2StubUnknown), .id_override = "WYszaHaIkWs" },
+    .{ .name = "sceHttp2Unknown_BlZ8niq3nHU", .function = trace.wrap("sceHttp2Unknown_BlZ8niq3nHU", &http2StubUnknown), .id_override = "BlZ8niq3nHU" },
 };
 
 // libSceNpWebApi2 -----------------------------------------------------------
@@ -937,8 +948,15 @@ const web_api_exports = [_]symbols.Export{
     .{ .name = "sceNpWebApi2GetHttpResponseHeaderValue", .function = trace.wrap("sceNpWebApi2GetHttpResponseHeaderValue", &webApiHeaderValue), .expect_id = "hksbskNToEA" },
 };
 
+var in6addr_any_storage: [16]u8 align(16) = [_]u8{0} ** 16;
+var in6addr_loopback_storage: [16]u8 align(16) = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 };
+
 pub fn register(db: *symbols.Database, gpa: std.mem.Allocator) symbols.Error!void {
-    try db.addLibrary(gpa, .{ .name = "libSceNet", .version = 1 }, .{ .name = "libSceNet" }, &net_exports);
+    const net_lib = symbols.Library{ .name = "libSceNet", .version = 1 };
+    const net_mod = symbols.Module{ .name = "libSceNet" };
+    try db.addLibrary(gpa, net_lib, net_mod, &net_exports);
+    try db.addObject(gpa, net_lib, net_mod, "in6addr_any", @intFromPtr(&in6addr_any_storage), "ZRAJo-A-ukc");
+    try db.addObject(gpa, net_lib, net_mod, "in6addr_loopback", @intFromPtr(&in6addr_loopback_storage), "XCuA-GqjA-k");
     try db.addLibrary(gpa, .{ .name = "libSceSsl", .version = 1 }, .{ .name = "libSceSsl" }, &ssl_exports);
     try db.addLibrary(gpa, .{ .name = "libSceHttp", .version = 1 }, .{ .name = "libSceHttp" }, &http_exports);
     try db.addLibrary(gpa, .{ .name = "libSceHttp2", .version = 1 }, .{ .name = "libSceHttp2" }, &http2_exports);

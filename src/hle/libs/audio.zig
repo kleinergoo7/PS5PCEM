@@ -2831,12 +2831,14 @@ const ngs2_exports = [_]symbols.Export{
 // Speech synthesis has no host backend; every entry reports the service
 // absent so titles link and continue without spoken output.
 const tts2_exports = [_]symbols.Export{
-    .{ .name = "sceTextToSpeech2Initialize", .function = trace.wrap("sceTextToSpeech2Initialize", &services.absent), .expect_id = "UOjiprYwVNw" },
-    .{ .name = "sceTextToSpeech2Terminate", .function = trace.wrap("sceTextToSpeech2Terminate", &services.absent), .expect_id = "SoWHuVW0gpU" },
-    .{ .name = "sceTextToSpeech2Open", .function = trace.wrap("sceTextToSpeech2Open", &services.absent), .expect_id = "X0HZNbSiqyg" },
-    .{ .name = "sceTextToSpeech2Close", .function = trace.wrap("sceTextToSpeech2Close", &services.absent), .expect_id = "t4e879M-cSw" },
-    .{ .name = "sceTextToSpeech2Speak", .function = trace.wrap("sceTextToSpeech2Speak", &services.absent), .expect_id = "8ntsRd07EQA" },
-    .{ .name = "sceTextToSpeech2GetSpeechStatus", .function = trace.wrap("sceTextToSpeech2GetSpeechStatus", &services.absent), .expect_id = "08JSg9p6bgQ" },
+    .{ .name = "sceTextToSpeech2Initialize", .function = trace.wrap("sceTextToSpeech2Initialize", &services.accept), .expect_id = "UOjiprYwVNw" },
+    .{ .name = "sceTextToSpeech2Terminate", .function = trace.wrap("sceTextToSpeech2Terminate", &services.accept), .expect_id = "SoWHuVW0gpU" },
+    .{ .name = "sceTextToSpeech2Open", .function = trace.wrap("sceTextToSpeech2Open", &services.accept), .expect_id = "X0HZNbSiqyg" },
+    .{ .name = "sceTextToSpeech2Close", .function = trace.wrap("sceTextToSpeech2Close", &services.accept), .expect_id = "t4e879M-cSw" },
+    .{ .name = "sceTextToSpeech2Speak", .function = trace.wrap("sceTextToSpeech2Speak", &services.accept), .expect_id = "8ntsRd07EQA" },
+    .{ .name = "sceTextToSpeech2GetSpeechStatus", .function = trace.wrap("sceTextToSpeech2GetSpeechStatus", &services.accept), .expect_id = "08JSg9p6bgQ" },
+    // Unresolved NID seen in Minecraft (PPSA17221); name not in public NID DBs.
+    .{ .name = "sceTextToSpeech2Unknown_2jiIxUmcsGo", .function = trace.wrap("sceTextToSpeech2Unknown_2jiIxUmcsGo", &services.accept), .id_override = "2jiIxUmcsGo" },
 };
 
 // libSceAudiodec ---------------------------------------------------------
