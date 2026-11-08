@@ -1865,6 +1865,45 @@ fn npGetReachabilityState(user_id: i32, output: ?*u32) callconv(abi.guest) i32 {
     return errno.ok;
 }
 
+// NP getters that take OrbisNpOnlineId* (not user_id). Offline bring-up: fill
+// safe defaults and return OK so callers that ignore/accept status still see
+// valid, NUL-terminated fields (mirrors the sceNpGetNpId unfilled-output fix).
+fn npGetAccountIdByOnlineId(_: ?*const anyopaque, output: ?*u64) callconv(abi.guest) i32 {
+    const account_id = output orelse return invalid_argument;
+    account_id.* = 1;
+    return errno.ok;
+}
+
+fn npGetAccountCountryByOnlineId(_: ?*const anyopaque, output: ?*[4]u8) callconv(abi.guest) i32 {
+    const country = output orelse return invalid_argument;
+    country.* = .{ 'U', 'S', 0, 0 };
+    return errno.ok;
+}
+
+fn npGetAccountDateOfBirthByOnlineId(_: ?*const anyopaque, output: ?*[4]u8) callconv(abi.guest) i32 {
+    // OrbisNpDate { u16 year, u8 month, u8 day }
+    const dob = output orelse return invalid_argument;
+    dob.* = .{ 0xC6, 0x07, 1, 1 }; // 1990-01-01 (little-endian year)
+    return errno.ok;
+}
+
+fn npGetAccountLanguageByOnlineId(_: i32, _: ?*const anyopaque, output: ?*[16]u8) callconv(abi.guest) i32 {
+    // (req_id, online_id*, OrbisNpLanguageCode*). Bring-up: fill output, return OK.
+    const lang = output orelse return invalid_argument;
+    @memset(lang, 0);
+    @memcpy(lang[0..2], "en");
+    return errno.ok;
+}
+
+fn npGetParentalControlInfoByOnlineId(_: i32, _: ?*const anyopaque, age: ?*i8, info: ?*[3]u8) callconv(abi.guest) i32 {
+    // (req_id, online_id*, s8* age, OrbisNpParentalControlInfo* = 3 bools). Bring-up: no restrictions.
+    const age_out = age orelse return invalid_argument;
+    const info_out = info orelse return invalid_argument;
+    age_out.* = 18;
+    @memset(info_out, 0);
+    return errno.ok;
+}
+
 fn npSetNpTitleId(title_id: ?*const anyopaque, secret: ?*const anyopaque) callconv(abi.guest) i32 {
     // Offline registration is a no-op: no PSN session exists to attach the id to.
     if (title_id == null or secret == null) return invalid_argument;
@@ -2548,7 +2587,12 @@ const app_content_exports = [_]symbols.Export{
 
 const np_manager_exports = [_]symbols.Export{
     .{ .name = "sceNpGetAccountIdA", .function = trace.wrap("sceNpGetAccountIdA", &npGetAccountId), .expect_id = "rbknaUjpqWo" },
+    .{ .name = "sceNpGetAccountId", .function = trace.wrap("sceNpGetAccountId", &npGetAccountIdByOnlineId), .expect_id = "a8R9-75u4iM" },
     .{ .name = "sceNpGetAccountCountryA", .function = trace.wrap("sceNpGetAccountCountryA", &npGetAccountCountry), .expect_id = "JT+t00a3TxA" },
+    .{ .name = "sceNpGetAccountCountry", .function = trace.wrap("sceNpGetAccountCountry", &npGetAccountCountryByOnlineId), .expect_id = "Ghz9iWDUtC4" },
+    .{ .name = "sceNpGetAccountDateOfBirth", .function = trace.wrap("sceNpGetAccountDateOfBirth", &npGetAccountDateOfBirthByOnlineId), .expect_id = "8VBTeRf1ZwI" },
+    .{ .name = "sceNpGetAccountLanguage", .function = trace.wrap("sceNpGetAccountLanguage", &npGetAccountLanguageByOnlineId), .expect_id = "KZ1Mj9yEGYc" },
+    .{ .name = "sceNpGetParentalControlInfo", .function = trace.wrap("sceNpGetParentalControlInfo", &npGetParentalControlInfoByOnlineId), .expect_id = "ilwLM4zOmu4" },
     .{ .name = "sceNpGetState", .function = trace.wrap("sceNpGetState", &npGetState), .expect_id = "eQH7nWPcAgc" },
     .{ .name = "sceNpGetNpReachabilityState", .function = trace.wrap("sceNpGetNpReachabilityState", &npGetReachabilityState), .expect_id = "e-ZuhGEoeC4" },
     .{ .name = "sceNpSetNpTitleId", .function = trace.wrap("sceNpSetNpTitleId", &npSetNpTitleId), .expect_id = "Ec63y59l9tw" },
