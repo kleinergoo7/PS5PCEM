@@ -158,7 +158,7 @@ pub fn main(init: std.process.Init) !void {
             }
             bytes_address = std.fmt.parseInt(u64, args[index + 1], 0) catch return error.InvalidUsage;
             bytes_count = std.fmt.parseInt(usize, args[index + 2], 0) catch return error.InvalidUsage;
-            if (bytes_count == 0 or bytes_count > 4096) return error.InvalidUsage;
+            if (bytes_count == 0 or bytes_count > 0x40000) return error.InvalidUsage;
             index += 2;
         } else if (std.mem.eql(u8, args[index], "--rip-xrefs")) {
             if (index + 1 >= args.len) {
@@ -417,14 +417,24 @@ pub fn main(init: std.process.Init) !void {
                 else
                     target - rela.offset <= 0x40;
                 if (!near_target and addend_address != target) continue;
+                const sym_idx = rela.symbolIndex();
+                var sym_name: []const u8 = "<none>";
+                if (sym_idx < symbol_table.entries.len) {
+                    const sym = symbol_table.entries[sym_idx];
+                    if (sym.name < strings.len) {
+                        const tail = strings[sym.name..];
+                        if (std.mem.indexOfScalar(u8, tail, 0)) |end| sym_name = tail[0..end];
+                    }
+                }
                 try out.print(
-                    "  {s}[{d}] offset=0x{x} type={s} symbol={d} addend={d} (0x{x}) relation={s}\n",
+                    "  {s}[{d}] offset=0x{x} type={s} symbol={d} ({s}) addend={d} (0x{x}) relation={s}\n",
                     .{
                         @tagName(table_data.kind),
                         rela_index,
                         rela.offset,
                         @tagName(rela.relocationType()),
-                        rela.symbolIndex(),
+                        sym_idx,
+                        sym_name,
                         rela.addend,
                         @as(u64, @bitCast(rela.addend)),
                         if (rela.offset == target)
