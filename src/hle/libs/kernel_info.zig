@@ -174,12 +174,16 @@ fn getOperationMode(mode: ?*i32, submode: ?*i32) callconv(abi.guest) i32 {
     return errno.ok;
 }
 
-fn getCompiledSdkVersion() callconv(abi.guest) u32 {
-    return sdk_version;
+fn getCompiledSdkVersion(out: ?*u32) callconv(abi.guest) i32 {
+    const ptr = out orelse return KernelError.einval.raw();
+    ptr.* = sdk_version;
+    return errno.ok;
 }
 
-fn getSystemSwVersion() callconv(abi.guest) u32 {
-    return sdk_version;
+fn getSystemSwVersion(out: ?*u64) callconv(abi.guest) i32 {
+    const ptr = out orelse return KernelError.einval.raw();
+    ptr.* = sdk_version;
+    return errno.ok;
 }
 
 fn getPid() callconv(abi.guest) i32 {
