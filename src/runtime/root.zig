@@ -651,7 +651,20 @@ fn preferHleImportId(id: []const u8) bool {
     or std.mem.eql(u8, id, "tIhsqj0qsFE") // free
     or std.mem.eql(u8, id, "Y7aJ1uydPMo") // realloc
     or std.mem.eql(u8, id, "OJjm-QOIHlI") // sceLibcMspaceMalloc
-    or std.mem.eql(u8, id, "Vla-Z+eXlxo"); // sceLibcMspaceFree
+    or std.mem.eql(u8, id, "Vla-Z+eXlxo") // sceLibcMspaceFree
+    or std.mem.eql(u8, id, "fJnpuVVBbKk") // operator new
+    or std.mem.eql(u8, id, "hdm0YfMa7TQ") // operator new[]
+    or std.mem.eql(u8, id, "z+P+xCnWLBk") // operator delete
+    or std.mem.eql(u8, id, "MLWl90SFWNE") // operator delete[]
+    or std.mem.eql(u8, id, "ryUxD-60bKM") // operator new nothrow
+    or std.mem.eql(u8, id, "Jh5qUcwiSEk") // operator new[] nothrow
+        // Bring-up mitigation (DRIVECLUB): strcpy(NULL src) crashed in
+        // online/file-system init; route to a defensive HLE wrapper that
+        // substitutes "" and logs, so the NULL-provider can be fixed.
+    or std.mem.eql(u8, id, "kiZSXIWd9vg") // strcpy
+        // Bring-up mitigation (DRIVECLUB): memset(NULL,0,0xc0000) during
+        // threaded init; defensive wrapper logs and skips the NULL dest.
+    or std.mem.eql(u8, id, "8zTFvBIAIN8"); // memset
 }
 
 fn resolveHleExact(context: *const ResolverContext, import: *const loader.Import, symbol_type: hle.SymbolType) ?u64 {

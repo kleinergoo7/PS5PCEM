@@ -249,6 +249,67 @@ fn ps4Realloc(old_ptr: u64, size: u64) callconv(abi.guest) u64 {
     return reallocImpl(old_ptr, size);
 }
 
+// C++ operators route to the same heap. Throwing new keeps standard
+// semantics for free: our allocator only fails past the arena budget, in
+// which case returning null lets the caller's own check (or libc++abi's
+// new handler path) raise bad_alloc exactly as on hardware.
+fn ps4New(size: u64) callconv(abi.guest) u64 {
+    return mallocImpl(size);
+}
+
+fn ps4NewArray(size: u64) callconv(abi.guest) u64 {
+    return mallocImpl(size);
+}
+
+fn ps4Delete(ptr: u64) callconv(abi.guest) void {
+    freeImpl(ptr);
+}
+
+fn ps4DeleteArray(ptr: u64) callconv(abi.guest) void {
+    freeImpl(ptr);
+}
+
+// BRING-UP MITIGATION (DRIVECLUB CUSA00003): guest init calls
+// strcpy(online_heap_dst, NULL) when an upstream service/stub leaves a name
+// pointer NULL (observed: libc.prx kiZSXIWd9vg+0x47, dst=0x2016000061,
+// src=0). Real libc would fault; treat NULL src as "" so boot can progress
+// while the NULL provider is fixed. Logged so it stays visible.
+fn ps4Strcpy(dst: u64, src: u64) callconv(abi.guest) u64 {
+    if (dst == 0) return 0;
+    const out: [*]u8 = @ptrFromInt(dst);
+    if (src == 0) {
+        std.log.warn("[ps4heap] strcpy(dst=0x{x}, NULL): substituting empty string (bring-up mitigation)", .{dst});
+        out[0] = 0;
+        return dst;
+    }
+    const in: [*]const u8 = @ptrFromInt(src);
+    var i: usize = 0;
+    while (true) : (i += 1) {
+        out[i] = in[i];
+        if (in[i] == 0) break;
+        if (i > 0x10_0000) { // safety cap; real strings won't hit this
+            out[i] = 0;
+            std.log.warn("[ps4heap] strcpy capped at 1MiB src=0x{x}", .{src});
+            break;
+        }
+    }
+    return dst;
+}
+
+// BRING-UP MITIGATION (DRIVECLUB CUSA00003): memset(NULL, c, 0xc0000) observed
+// during threaded init (libc.prx 8zTFvBIAIN8+0x48) after online/file_system/
+// ram_file_system heap setup — a NULL buffer pointer zeroed unguarded.
+// Log args and skip so the NULL provider can be identified and fixed.
+fn ps4Memset(dst: u64, val: u64, len: u64) callconv(abi.guest) u64 {
+    if (dst == 0) {
+        std.log.warn("[ps4heap] memset(NULL, val=0x{x}, len=0x{x}): skipping (bring-up mitigation)", .{ val, len });
+        return 0;
+    }
+    const n: usize = @intCast(len);
+    @memset(@as([*]u8, @ptrFromInt(dst))[0..n], @truncate(val));
+    return dst;
+}
+
 pub const exports = [_]symbols.Export{
     .{ .name = "malloc", .function = trace.wrap("ps4-malloc", &ps4Malloc), .id_override = "gQX+4GDQjpM" },
     .{ .name = "calloc", .function = trace.wrap("ps4-calloc", &ps4Calloc), .id_override = "2X5agFjKxMc" },
@@ -257,6 +318,14 @@ pub const exports = [_]symbols.Export{
     .{ .name = "sceLibcMspaceMalloc", .function = trace.wrap("ps4-mspace-malloc", &ps4MspaceMalloc), .id_override = "OJjm-QOIHlI" },
     .{ .name = "sceLibcMspaceFree", .function = trace.wrap("ps4-mspace-free", &ps4MspaceFree), .id_override = "Vla-Z+eXlxo" },
     .{ .name = "realloc", .function = trace.wrap("ps4-realloc", &ps4Realloc), .id_override = "Y7aJ1uydPMo" },
+    .{ .name = "operator new", .function = trace.wrap("ps4-new", &ps4New), .id_override = "fJnpuVVBbKk" },
+    .{ .name = "operator new[]", .function = trace.wrap("ps4-new-array", &ps4NewArray), .id_override = "hdm0YfMa7TQ" },
+    .{ .name = "operator delete", .function = trace.wrap("ps4-delete", &ps4Delete), .id_override = "z+P+xCnWLBk" },
+    .{ .name = "operator delete[]", .function = trace.wrap("ps4-delete-array", &ps4DeleteArray), .id_override = "MLWl90SFWNE" },
+    .{ .name = "operator new nothrow", .function = trace.wrap("ps4-new-nothrow", &ps4New), .id_override = "ryUxD-60bKM" },
+    .{ .name = "operator new[] nothrow", .function = trace.wrap("ps4-new-array-nothrow", &ps4NewArray), .id_override = "Jh5qUcwiSEk" },
+    .{ .name = "strcpy", .function = trace.wrap("ps4-strcpy", &ps4Strcpy), .id_override = "kiZSXIWd9vg" },
+    .{ .name = "memset", .function = trace.wrap("ps4-memset", &ps4Memset), .id_override = "8zTFvBIAIN8" },
 };
 
 pub const library = symbols.Library{ .name = "libc", .version = 1 };
