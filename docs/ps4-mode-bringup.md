@@ -187,3 +187,59 @@ failing request before building file I/O.
   (zero hits = never called) + trace ring totals (`of 2`).
 - The `code=` field added to null-store recovery lines (cpu/root.zig)
   resolves addressing disputes empirically: pattern-search the bytes.
+
+## Session: 2026-11-07b (kleinergoo7, `ps4-mode`) — VQ guard, MAP_FIXED overwrite, global.rpk
+
+Commits: `2d82d1a` (operator new/delete + strcpy/memset mitigations), `807e6b3`
+(VQ guard hide, MAP_FIXED overwrite, NetCtl info). `ps4_mode` 20/20, build clean.
+
+### Fixed: `sceKernelVirtualQuery` exposed no-access stack guard (GDB-proven)
+Main-thread stack `allocateGuestStack` maps `0x104000` stack(prot none, hint
+`0x7e0000000`) + protects upper 1MB RW ⇒ guard `0x7e0024000-0x7e0028000` (16KB,
+CPU prot 0). `sceKernelVirtualQuery` reported it `state=0x14` stack|committed,
+prot 0. EvoStack writer `eboot 0x6baa6b/6f` registered it; scanner `0x6bad43`
+faulted reading it. **Fix:** hide from guest `sceKernelVirtualQuery` (internal
+`AddressSpace`/mapper/pool unaffected) bare reservations (`reserved && !pooled`)
+and no-access stack guards (`kind==stack && !(CPU R|W|X)`) → `EACCES`. Regression
+test added. Fault gone.
+
+### Fixed (root cause): 6MB direct-memory `MAP_FIXED` overwrite
+Fixed 6MB `direct_memory` map @ VA `0x1000000000` (flags `MAP_FIXED 0x10`)
+overlapped existing 128KB `direct_memory` `0x1000000000-0x1000020000`.
+- HLE `mapDirectMemory` used `isMapped()` = `coversLocked` (full coverage):
+  128KB of 6MB ⇒ `occ=false` (measured `fixed=true dev=false occ=false`), so the
+  overwrite path was skipped → `mapFixedLocked` hit overlap.
+- Whole-range `unmap(req,len)` requires full coverage ⇒ `RangeNotMapped` on a
+  partial overlap.
+**Fix:** `occupied = AddressSpace.overlaps(...)`; on overwrite clear overlapping
+intersections via `query(cursor,true)+unmap(is,ie-is)`, then remap. `memory/root`:
+added `overlaps()` + conflict-detail overlap log. **Measured:** `cleared, remap`
+succeeds; `memset(NULL,0x600000)` mitigation no longer fires (valid 6MB buffer).
+
+### NetCtl
+`sceNetCtlGetInfo` now returns `ok` with zeroed/disconnected info (not
+`NOT_CONNECTED` error) so titles ignoring the return read safe values. Test updated.
+`strcpy(NULL src)` mitigation still fires (provider elsewhere).
+
+### Current blocker: `global.rpk` never registers (hard-required)
+- **Fault:** `access_violation(read) rip=0x5cbd63 eboot.bin+0x58bd63 target=0x0`,
+  `r12="global.rpk"` (`0x2007100150`). **eboot runtime bias `0x40000`** (runtime
+  `0x5cbd63` ↔ vaddr `0x58bd63`; always use `module-info --bytes` vaddr).
+- **Accessor vaddr `0x58bd50`:** ready flag (RIP-rel, ~`0x1951b78`) set →
+  `mov (%rdi),%rdi` loads slot = NULL → `mov (%rdi),%rax` faults on vtable read.
+  Ready but slot NULL ⇒ `global.rpk` not registered.
+- **Diag (temp, reverted):** returning 0 from accessor → `GuestFault execute`
+  `rip=0x7e0122c50` on stack data (`rsp=0x7e0122c28`, stack range) ⇒ downstream
+  control-flow corruption. **`global.rpk` is hard-required.**
+- **No archive I/O:** `global.rpk` is virtual inside `game000-013.dat` (opaque;
+  no extracted copy). **0** kernel/POSIX open/read/stat/pread/fstat/getdents
+  traced. Guest `libSceFios2.prx` loaded (`0x80002c000`) but makes 0 kernel file
+  I/O. eboot’s 13 `libSceFios2` imports (init `MrRFrdgpsx8`; `strcpy` slot vaddr
+  `0x166e788`/PLT `0x123e7a0`) — probe-route to HLE stubs ⇒ **0 hits** (eboot
+  didn’t call). eboot never opens `game*.dat` / never registers global.rpk.
+- **Inference (unproven):** eboot resource/init bails before archive
+  registration/mount (gated on init state; `strcpy(NULL)` provider unresolved:
+  `dst=0x2016000061` online heap, `rbx=0x2016000010`, `r12=f0020002c0` file_system
+  heap). Fix init providers / NP-user-NetCtl-appcontent-save state, confirm
+  `/app0` VFS serves `game000.dat`, map FIOS2 mount/archive NIDs, or (last resort,
+  scoped) serve `global.rpk` after identifying `game*.dat` format.
