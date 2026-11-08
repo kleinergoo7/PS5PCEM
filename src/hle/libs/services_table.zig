@@ -433,6 +433,7 @@ pub const savedatadialog_native_exports = [_]symbols.Export{
 };
 
 pub const savedata_native_exports = [_]symbols.Export{
+    .{ .name = "sceSaveDataUnknown_RvID8BVeg_g", .function = trace.wrap("sceSaveDataUnknown_RvID8BVeg_g", &services.accept), .id_override = "RvID8BVeg+g" },
     .{ .name = "sceSaveDataDelete", .function = trace.wrap("sceSaveDataDelete", &services.absent), .expect_id = "S1GkePI17zQ" },
     .{ .name = "sceSaveDataGetMountInfo", .function = trace.wrap("sceSaveDataGetMountInfo", &services.absent), .expect_id = "65VH0Qaaz6s" },
     .{ .name = "sceSaveDataSaveIcon", .function = trace.wrap("sceSaveDataSaveIcon", &services.absent), .expect_id = "c88Yy54Mx0w" },
@@ -678,6 +679,12 @@ const disc_map_exports = [_]symbols.Export{
 const content_export_exports = [_]symbols.Export{
     .{ .name = "sceContentExportInit2", .function = trace.wrap("sceContentExportInit2", &services.accept), .expect_id = "0GnN4QCgIfs" },
 };
+
+/// Process write throttling (PPSA17221/Minecraft imports it). Minimal correct
+/// behavior: accept configuration and do nothing; host I/O is not throttled.
+const kernel_write_throttling_exports = [_]symbols.Export{
+    .{ .name = "sceKernelWriteThrottlingUnknown_YFC3dBBipj8", .function = trace.wrap("sceKernelWriteThrottlingUnknown_YFC3dBBipj8", &services.accept), .id_override = "YFC3dBBipj8" },
+};
 pub const Table = struct { library: []const u8, module: []const u8, exports: []const symbols.Export };
 
 pub const all = [_]Table{
@@ -731,5 +738,6 @@ pub const all = [_]Table{
     .{ .library = "libSceShare", .module = "libSceShare", .exports = &share_extra_exports },
     .{ .library = "libSceDiscMap", .module = "libSceDiscMap", .exports = &disc_map_exports },
     .{ .library = "libSceContentExport", .module = "libSceContentExport", .exports = &content_export_exports },
+    .{ .library = "libkernel_write_throttling", .module = "libkernel", .exports = &kernel_write_throttling_exports },
     .{ .library = "libScePsml", .module = "libScePsml", .exports = &psml.exports },
 };
