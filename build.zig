@@ -161,6 +161,14 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // Vendored PS4 PKG core (pinned pkg2zar commit, GPL-3.0). Kept as a plain
+    // module: its upstream build.zig needs Zig 0.17, this repo builds on 0.16.
+    const p2z = b.addModule("p2z", .{
+        .root_source_file = b.path("vendor/pkg2zar/core/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     // Experimental PS4 (GNM/GCN) compatibility mode. Dependency-free (std
     // only) by design: detection, param.sfo parsing, shader-header decode,
     // packet translation, tiling math, the HLE compat table and the session
@@ -932,6 +940,15 @@ pub fn build(b: *std.Build) void {
     }
 
     const test_filter = b.option([]const u8, "test-filter", "Run only tests whose names contain this text");
+    const p2z_smoke_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/p2z_smoke.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "p2z", .module = p2z }},
+        }),
+    });
+    b.step("test-p2z", "Run vendored PS4 PKG core smoke test").dependOn(&b.addRunArtifact(p2z_smoke_tests).step);
     const zarchive_tests = b.addTest(.{ .root_module = zarchive });
     b.step("test-zarchive", "Run ZArchive reader and extraction tests").dependOn(&b.addRunArtifact(zarchive_tests).step);
     const runtime_tests = b.addTest(.{
