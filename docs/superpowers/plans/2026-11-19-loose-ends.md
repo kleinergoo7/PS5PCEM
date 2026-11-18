@@ -23,8 +23,8 @@
 ## Review Focus
 
 - `npbind.dat` final 4 bytes must match the authoritative decryptor on **both** sample ROMs — pinned by Task 5's two CLI diffs.
-- Batch-map with `start=0, offset=0x10000, length=0x20000` must succeed instead of returning `0x8002000d` — pinned by Task 6 against the named `kernel_memory` test.
-- The unmap following that batch map must succeed instead of `0x80020016` — pinned by the same Task 6 test.
+- `sceKernelVirtualQuery` on a pure non-pooled reservation must report EACCES; the `0x8002000d` / `0x80020016` lines were from passing tests, not failures — the stale expectation is corrected at `src/hle/libs/kernel_memory.zig:3929-3933` to expect `KernelError.eacces.raw()`, pinned by Task 6 against the named `kernel_memory` test via `zig build test-hle`.
+- The pad port test must be deterministic across hosts; a live DS4 `ABS_X` axis could read `129` — pinned by Task 7 against the named `pad` test via `zig build test-hle`, using a test-only scripted-input helper in `src/input/root.zig` consumed by `src/hle/libs/pad.zig` to feed a fixed value.
 - Primary-user pad port must be `128`, not `129` — pinned by Task 7 against the named `pad` test.
 - A full build must leave ps5pcem cache under 5 GB — pinned by Task 4's script check and Task 8's final measurement.
 
@@ -44,16 +44,16 @@
 - [ ] **Step 2:** Regenerate a reference extraction with `/tmp/opencode/squashfs-root/AppRun` for both ROMs in `/home/reng/Downloads/ps4roms/` into `/tmp/opencode/ref-a` and `/tmp/opencode/ref-b`, and dump the last 16 bytes of each `sce_sys/npbind.dat`.
 - [ ] **Step 3:** Write the verdict file; do not edit any source. Return the verdict text in the final message.
 
-### Task 2: Root-cause the kernel_memory batch-map failure
+### Task 2: Root-cause the two HLE test failures
 
-**Files (read only):** `src/hle/libs/kernel_memory.zig`, especially the test at `:3834` and the batch-map/unmap implementations.
+**Files (read only):** `src/hle/libs/kernel_memory.zig` (test around `:3929`) and `src/hle/libs/pad.zig` (test at `:547`).
 
 **Interfaces:**
 - Consumes: nothing.
-- Produces: verdict file `.superpowers/sdd/2026-11-19-loose-ends/kernel-memory-verdict.md` naming the exact function and condition that returns `0x8002000d` / `0x80020016` for the failing test.
+- Produces: verdict file `.superpowers/sdd/2026-11-19-loose-ends/kernel-memory-verdict.md` naming the stale `sceKernelVirtualQuery` expectation for a pure non-pooled reservation and the host-dependent pad `ABS_X` assertion.
 
 - [ ] **Step 1:** Run `ZIG_GLOBAL_CACHE_DIR=/tmp/opencode/zig-global-cache-0.16 /home/reng/tools/zig-x86_64-linux-0.16.0/zig build test-hle` and capture the full failure block.
-- [ ] **Step 2:** Trace the failing operations (`map_direct start=0 offset=0x10000 length=0x20000 prot=3 flags=0`, then `unmap start=0x1000000000 length=1 flags=0x10`) to the validating code; identify the exact rejected condition.
+- [ ] **Step 2:** Inspect the `sceKernelVirtualQuery` test for a pure non-pooled reservation and identify the stale error expectation that should be `KernelError.eacces.raw()`; separately, inspect the pad test's live DS4 `ABS_X` axis assertion that reads `129` on some hosts instead of `128`.
 - [ ] **Step 3:** Write the verdict file; do not edit source. Return it in the final message.
 
 ### Task 3: Root-cause the pad port off-by-one
@@ -100,15 +100,15 @@ Stage 2 briefs are written by the coordinator from the matching Stage 1 verdict.
 - [ ] **Step 3:** Rebuild with Zig 0.16 and re-extract both ROMs; run the throwaway check; expect PASS on both.
 - [ ] **Step 4:** Commit only the two listed files: `git commit -m "vendor: correct NP entry tail decryption"`.
 
-### Task 6: Fix kernel_memory batch map
+### Task 6: Fix the stale `sceKernelVirtualQuery` expectation
 
 **Files:** Modify only `src/hle/libs/kernel_memory.zig`.
 
 **Interfaces:** Consumes Task 2's verdict.
 
-- [ ] **Step 1:** Run `zig build test-hle` and confirm the named test fails with `0x8002000d` / `0x80020016`.
-- [ ] **Step 2:** Apply the minimal root-cause fix named in Task 2's verdict.
-- [ ] **Step 3:** Run `zig build test-hle`; expect both failures gone and no new failures.
+- [ ] **Step 1:** Run `zig build test-hle` and confirm the named `kernel_memory` test fails on the `sceKernelVirtualQuery` expectation for a pure non-pooled reservation.
+- [ ] **Step 2:** Apply the minimal root-cause fix named in Task 2's verdict: expect `KernelError.eacces.raw()` at `src/hle/libs/kernel_memory.zig:3929-3933`.
+- [ ] **Step 3:** Run `zig build test-hle`; expect that test green and no new failures. The other real failure is the host-dependent pad `ABS_X` test (a live DS4 axis read `129` instead of `128`), pinned by Task 7 via a test-only scripted-input helper in `src/input/root.zig` consumed by `src/hle/libs/pad.zig`.
 - [ ] **Step 4:** Commit only that file: `git commit -m "fix(hle): accept batch map with zero base and offset"`.
 
 ### Task 7: Fix pad primary-user port
