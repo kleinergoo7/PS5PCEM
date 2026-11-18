@@ -16,6 +16,9 @@ zig build                      # build zig-out/bin/rdna2-disasm
 zig build run -- shader.bin    # build and run
 ```
 
+Use `scripts/build-capped.sh <args>` instead of `zig build` to run any of these
+with both cache directories under `/tmp` and automatically trimmed below 1 GB.
+
 Cross-compilation needs no additional toolchain — Zig ships its own:
 
 ```sh
