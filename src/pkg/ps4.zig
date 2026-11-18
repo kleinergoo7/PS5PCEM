@@ -28,6 +28,10 @@ fn probeReason(err: anyerror) []const u8 {
     return p2z.probe.reasonName(@errorCast(err));
 }
 
+fn hasTitleId(info: p2z.probe.Info) bool {
+    return info.title_id != null;
+}
+
 fn preflightIdentity(ident: p2z.plan.Identity, buf: []u8) ?[]const u8 {
     const failure = p2z.plan.preflight(ident, null) orelse return null;
     // bufPrint degrades to a short generic string if the path is unusually long.
@@ -36,10 +40,14 @@ fn preflightIdentity(ident: p2z.plan.Identity, buf: []u8) ?[]const u8 {
 
 pub fn extract(io: std.Io, arena: std.mem.Allocator, input: []const u8, dest: []const u8) !Stats {
     // The probe is the only cheap check that param.sfo is actually present.
-    _ = p2z.probe.run(io, arena, input) catch |err| {
+    const info = p2z.probe.run(io, arena, input) catch |err| {
         std.debug.print("cannot read PS4 package: {s}\n", .{probeReason(err)});
         return error.InvalidPs4Package;
     };
+    if (!hasTitleId(info)) {
+        std.debug.print("cannot read PS4 package: no sce_sys/param.sfo title id\n", .{});
+        return error.InvalidPs4Package;
+    }
 
     const opened = p2z.source.Source.open(io, arena, &.{input}) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -103,6 +111,13 @@ test "isPs4Package rejects a missing PFS image" {
     var raw = ps4Header();
     std.mem.writeInt(u64, raw[0x410..0x418], 0, .big);
     try std.testing.expect(!isPs4Package(&raw, 447479808));
+}
+
+test "probe info without a title id is rejected" {
+    const empty: p2z.probe.Info = .{};
+    try std.testing.expect(!hasTitleId(empty));
+    const titled: p2z.probe.Info = .{ .title_id = "CUSA34845" };
+    try std.testing.expect(hasTitleId(titled));
 }
 
 test "isPs4Package recognises a PS4 package header" {
