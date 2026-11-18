@@ -1,10 +1,10 @@
 #!/bin/sh
-# Build with Zig caches confined to /tmp and trimmed under a 1 GB cap.
+# Build with Zig caches confined to /tmp and trimmed under a 5 GB cap.
 set -eu
 
 export ZIG_GLOBAL_CACHE_DIR=/tmp/opencode/zig-capped-global
 local_cache=/tmp/opencode/zig-capped-local
-cap_kb=1000000
+cap_kb=5000000
 
 cache_total_kb() {
     du -sk "$ZIG_GLOBAL_CACHE_DIR" "$local_cache" 2>/dev/null | awk '{ s += $1 } END { print s + 0 }'

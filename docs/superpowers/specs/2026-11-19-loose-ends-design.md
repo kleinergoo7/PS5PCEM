@@ -2,6 +2,10 @@
 
 Date: 2026-11-19
 
+Update (same day): the hard cache cap was changed by the user from 1 GB to
+**5 GB**. The live enforcement value is in `scripts/build-capped.sh`; the
+1 GB figures below are the original approved plan's values, kept as history.
+
 ## Intent
 
 Close the three items left after PS4 PKG extraction shipped: the 4-byte
