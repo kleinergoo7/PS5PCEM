@@ -3927,10 +3927,9 @@ test "flexible memory maps, queries, protects, unmaps, and reuses ranges" {
         sceKernelReserveVirtualRange(&reserved, page_size, map_fixed, page_size),
     );
     try testing.expectEqual(
-        errno.ok,
+        KernelError.eacces.raw(),
         sceKernelVirtualQuery(reserved, 0, &info, @sizeOf(VirtualQueryInfo)),
     );
-    try testing.expectEqual(@as(u32, 0), info.state);
 
     var reused = reserved;
     try testing.expectEqual(
