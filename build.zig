@@ -958,13 +958,29 @@ pub fn build(b: *std.Build) void {
             .imports = &.{.{ .name = "p2z", .module = p2z }},
         }),
     });
-    b.step("test-p2z", "Run vendored PS4 PKG core smoke test").dependOn(&b.addRunArtifact(p2z_smoke_tests).step);
+    // Zig only collects tests inside a module's own root tree, so the NP SHA-1
+    // invariant test in the vendored test_pkg.zig is invisible to p2z_smoke.
+    // Root a test at that file directly; its synthetic fixtures call zstd and
+    // libc, so link those into the test binary.
+    const vendored_p2z_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("vendor/pkg2zar/core/src/test_pkg.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    vendored_p2z_tests.root_module.linkSystemLibrary("zstd", .{});
+    const test_p2z_step = b.step("test-p2z", "Run vendored PS4 PKG core tests");
+    test_p2z_step.dependOn(&b.addRunArtifact(p2z_smoke_tests).step);
+    test_p2z_step.dependOn(&b.addRunArtifact(vendored_p2z_tests).step);
     const ps4pkg_tests = b.addTest(.{
         .root_module = ps4pkg,
         .filters = if (test_filter) |filter| &.{filter} else &.{},
     });
     b.step("test-ps4", "Run PS4 PKG detection and extraction tests").dependOn(&b.addRunArtifact(ps4pkg_tests).step);
     test_step.dependOn(&b.addRunArtifact(p2z_smoke_tests).step);
+    test_step.dependOn(&b.addRunArtifact(vendored_p2z_tests).step);
     test_step.dependOn(&b.addRunArtifact(ps4pkg_tests).step);
     const zarchive_tests = b.addTest(.{ .root_module = zarchive });
     b.step("test-zarchive", "Run ZArchive reader and extraction tests").dependOn(&b.addRunArtifact(zarchive_tests).step);
