@@ -5,12 +5,19 @@ set -eu
 export ZIG_GLOBAL_CACHE_DIR=/tmp/opencode/zig-capped-global
 local_cache=/tmp/opencode/zig-capped-local
 cap_kb=5000000
+zig=${ZIG:-/home/reng/tools/zig-x86_64-linux-0.16.0/zig}
+
+version=$("$zig" version)
+case "$version" in
+    0.16.*) ;;
+    *) echo "expected Zig 0.16.x, got: $version" >&2; exit 1 ;;
+esac
 
 cache_total_kb() {
     du -sk "$ZIG_GLOBAL_CACHE_DIR" "$local_cache" 2>/dev/null | awk '{ s += $1 } END { print s + 0 }'
 }
 
-/home/reng/tools/zig-x86_64-linux-0.16.0/zig build --cache-dir /tmp/opencode/zig-capped-local "$@"
+"$zig" build --cache-dir "$local_cache" "$@"
 
 total_kb=$(cache_total_kb)
 echo "cache total: ${total_kb} KB"
