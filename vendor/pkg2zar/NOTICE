@@ -24,3 +24,9 @@ The ZArchive (.zar) writer, once it lands, will be a port of ZArchive by Exzap (
 Qt 6 is used under the GPLv3 option and is linked dynamically.
 
 Vendored from kleinergoo7/pkg2zar commit 26abc7504b401e7aaff4caf222d0e85ce999ba4d; core only, built with Zig 0.16.0.
+
+Local divergence: in Source.sceEntryData, NP entry decryption reads the full 16-byte-aligned
+cipher block from the PKG (including its stored padding bytes) instead of zero-padding the
+final block. Upstream zero-pads only the stored bytes, which yields a wrong final block: AES-CBC
+diffusion mixes the padding into every decrypted byte of that block. The full-block read is
+confirmed by the SHA-1 self-check embedded in npbind.dat (its last 20 bytes hash the first 512).
