@@ -711,7 +711,11 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/pkgextractor.zig"),
             .target = target,
             .optimize = optimize,
-            .imports = &.{ .{ .name = "pkg", .module = pkg }, .{ .name = "zarchive", .module = zarchive } },
+            .imports = &.{
+                .{ .name = "pkg", .module = pkg },
+                .{ .name = "ps4pkg", .module = ps4pkg },
+                .{ .name = "zarchive", .module = zarchive },
+            },
         }),
     });
     const install_pkgextractor = b.addInstallArtifact(pkgextractor, .{});
@@ -960,6 +964,8 @@ pub fn build(b: *std.Build) void {
         .filters = if (test_filter) |filter| &.{filter} else &.{},
     });
     b.step("test-ps4", "Run PS4 PKG detection and extraction tests").dependOn(&b.addRunArtifact(ps4pkg_tests).step);
+    test_step.dependOn(&b.addRunArtifact(p2z_smoke_tests).step);
+    test_step.dependOn(&b.addRunArtifact(ps4pkg_tests).step);
     const zarchive_tests = b.addTest(.{ .root_module = zarchive });
     b.step("test-zarchive", "Run ZArchive reader and extraction tests").dependOn(&b.addRunArtifact(zarchive_tests).step);
     const runtime_tests = b.addTest(.{

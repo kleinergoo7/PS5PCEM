@@ -14,7 +14,33 @@ pub fn isPs4Package(header: []const u8, file_size: u64) bool {
 
 pub const Stats = struct { files: usize, dirs: usize, bytes: u64 };
 
+fn extractReason(err: anyerror) []const u8 {
+    return switch (err) {
+        error.OutputExists, error.BackupExists, error.Cancelled, error.CreateFailed,
+        error.WriteFailed, error.VerifyFailed, error.RenameFailed, error.ReadFailed,
+        error.OutOfMemory,
+        => p2z.extractor.reasonName(@errorCast(err)),
+        else => @errorName(err),
+    };
+}
+
+fn probeReason(err: anyerror) []const u8 {
+    return p2z.probe.reasonName(@errorCast(err));
+}
+
+fn preflightIdentity(ident: p2z.plan.Identity, buf: []u8) ?[]const u8 {
+    const failure = p2z.plan.preflight(ident, null) orelse return null;
+    // bufPrint degrades to a short generic string if the path is unusually long.
+    return p2z.plan.describe(failure, buf);
+}
+
 pub fn extract(io: std.Io, arena: std.mem.Allocator, input: []const u8, dest: []const u8) !Stats {
+    // The probe is the only cheap check that param.sfo is actually present.
+    _ = p2z.probe.run(io, arena, input) catch |err| {
+        std.debug.print("cannot read PS4 package: {s}\n", .{probeReason(err)});
+        return error.InvalidPs4Package;
+    };
+
     const opened = p2z.source.Source.open(io, arena, &.{input}) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
     };
@@ -26,10 +52,21 @@ pub fn extract(io: std.Io, arena: std.mem.Allocator, input: []const u8, dest: []
         },
         .ok => |source| {
             defer source.close();
+            var pbuf: [512]u8 = undefined;
+            if (preflightIdentity(p2z.plan.Identity.fromSource(&source), &pbuf)) |reason| {
+                std.debug.print("unsupported PS4 package: {s}\n", .{reason});
+                return error.UnsupportedPs4Package;
+            }
             var sources = [_]p2z.source.Source{source};
-            const plan = try p2z.plan.build(arena, &sources);
+            const plan = p2z.plan.build(arena, &sources) catch |err| {
+                std.debug.print("cannot plan PS4 extraction: {s}\n", .{@errorName(err)});
+                return err;
+            };
             var cancel = std.atomic.Value(bool).init(false);
-            const stats = try p2z.extractor.run(arena, io, &sources, &plan, .{ .output = dest, .cancel = &cancel });
+            const stats = p2z.extractor.run(arena, io, &sources, &plan, .{ .output = dest, .cancel = &cancel }) catch |err| {
+                std.debug.print("cannot extract PS4 package: {s}\n", .{extractReason(err)});
+                return err;
+            };
             return .{ .files = stats.files, .dirs = stats.dirs, .bytes = stats.bytes };
         },
     }
@@ -71,4 +108,37 @@ test "isPs4Package rejects a missing PFS image" {
 test "isPs4Package recognises a PS4 package header" {
     const raw = ps4Header();
     try std.testing.expect(isPs4Package(&raw, 447479808));
+}
+
+test "extractReason names an existing output directory" {
+    try std.testing.expectEqualStrings("output folder already exists", extractReason(error.OutputExists));
+}
+
+test "probeReason names a missing param.sfo" {
+    try std.testing.expectEqualStrings("pkg has no sce_sys/param.sfo entry", probeReason(error.MissingParamSfo));
+}
+
+test "preflightIdentity refuses a delta patch" {
+    const ident = p2z.plan.Identity{
+        .content_id = "UP4127-CUSA34845_00-ONESHOTWMEUS0000",
+        .content_flags = p2z.pkg.content_flag_delta_patch,
+        .content_type = p2z.plan.game_content_type,
+        .pfs_image_count = 1,
+        .path = "delta.pkg",
+    };
+    var buf: [512]u8 = undefined;
+    const reason = preflightIdentity(ident, &buf) orelse return error.TestExpectedRefusal;
+    try std.testing.expect(std.mem.indexOf(u8, reason, "delta") != null);
+}
+
+test "preflightIdentity accepts a normal game" {
+    const ident = p2z.plan.Identity{
+        .content_id = "UP4127-CUSA34845_00-ONESHOTWMEUS0000",
+        .content_flags = 0,
+        .content_type = p2z.plan.game_content_type,
+        .pfs_image_count = 1,
+        .path = "game.pkg",
+    };
+    var buf: [512]u8 = undefined;
+    try std.testing.expect(preflightIdentity(ident, &buf) == null);
 }
