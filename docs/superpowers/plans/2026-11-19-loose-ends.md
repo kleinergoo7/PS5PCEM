@@ -4,6 +4,8 @@
 
 **Goal:** Fix the `npbind.dat` tail, both HLE test failures, and the cache cap using many small subagent tasks.
 
+> Update (2026-11-19): user raised the hard Zig cache cap from 1 GB to 5 GB; values below reflect the current cap.
+
 **Architecture:** Three independent problem domains (npbind, kernel_memory, pad) each get a read-only investigator, then a single-file fix agent in its own git worktree. A fourth agent handles the cache script. The coordinator integrates and verifies. Spec is the authority; Stage 2 briefs are written from Stage 1 verdicts.
 
 **Tech Stack:** Zig 0.16.0 (`/home/reng/tools/zig-x86_64-linux-0.16.0/zig`), bash, existing superpowers subagent harness.
@@ -13,7 +15,7 @@
 ## Global Constraints
 
 - Zig **0.16.0** only; build with `ZIG_GLOBAL_CACHE_DIR=/tmp/opencode/zig-global-cache-0.16`.
-- ps5pcem cache stays **under 1 GB** (1,000,000 KB).
+- ps5pcem cache stays **under 5 GB** (5,000,000 KB).
 - No new runtime dependency; no changes outside each task's listed files.
 - Fix agents work in separate worktrees under `/home/reng/projects/ps5_zig_emu/.worktrees/`; never edit another domain's files.
 - Read-only investigators must not modify the working tree, index, HEAD, or any source file.
@@ -24,7 +26,7 @@
 - Batch-map with `start=0, offset=0x10000, length=0x20000` must succeed instead of returning `0x8002000d` — pinned by Task 6 against the named `kernel_memory` test.
 - The unmap following that batch map must succeed instead of `0x80020016` — pinned by the same Task 6 test.
 - Primary-user pad port must be `128`, not `129` — pinned by Task 7 against the named `pad` test.
-- A full build must leave ps5pcem cache under 1 GB — pinned by Task 4's script check and Task 8's final measurement.
+- A full build must leave ps5pcem cache under 5 GB — pinned by Task 4's script check and Task 8's final measurement.
 
 ---
 
@@ -77,8 +79,8 @@
 - Produces: executable script taking the same arguments as `zig build`.
 
 - [ ] **Step 1:** Write `scripts/build-capped.sh` that sets `ZIG_GLOBAL_CACHE_DIR=/tmp/opencode/zig-capped-global`, passes `--cache-dir /tmp/opencode/zig-capped-local` plus all `"$@"` to `/home/reng/tools/zig-x86_64-linux-0.16.0/zig build`, then sums both dirs with `du -sk`.
-- [ ] **Step 2:** If the sum exceeds `1000000` KB, delete the local cache dir, print `cache trimmed`, and re-check that the remaining total is under the cap. Exit non-zero if still over.
-- [ ] **Step 3:** Verify: `scripts/build-capped.sh test-ps4` prints a total under `1000000` KB and exits 0.
+- [ ] **Step 2:** If the sum exceeds `5000000` KB, delete the local cache dir, print `cache trimmed`, and re-check that the remaining total is under the cap. Exit non-zero if still over.
+- [ ] **Step 3:** Verify: `scripts/build-capped.sh test-ps4` prints a total under `5000000` KB and exits 0.
 - [ ] **Step 4:** Commit only `scripts/build-capped.sh` and `docs/getting-started.md`: `git commit -m "build: add cache-capped build wrapper"`.
 
 ---
@@ -131,5 +133,5 @@ Stage 2 briefs are written by the coordinator from the matching Stage 1 verdict.
 - [ ] **Step 1:** Merge each fix worktree in turn; resolve nothing silently — report any conflict to the user.
 - [ ] **Step 2:** Run `zig build test` with Zig 0.16; expect all suites green.
 - [ ] **Step 3:** Re-extract both ROMs with the integrated binary and compare full manifests against the fresh reference extractions from Task 1; expect zero differences including `npbind.dat`.
-- [ ] **Step 4:** Measure cache; expect under 1,000,000 KB.
+- [ ] **Step 4:** Measure cache; expect under 5,000,000 KB.
 - [ ] **Step 5:** Dispatch one fresh reviewer on the merged range; fix Critical/Important findings with a RED→GREEN pass, record minors.
