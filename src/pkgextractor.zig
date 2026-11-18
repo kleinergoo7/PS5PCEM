@@ -147,7 +147,10 @@ pub fn main(init: std.process.Init) !void {
         try stderr.flush();
         return err;
     };
-    defer file.close(io);
+    var file_open = true;
+    defer {
+        if (file_open) file.close(io);
+    }
 
     const file_size = file.length(io) catch |err| {
         try stderr.print("cannot stat {s}: {s}\n", .{ input, @errorName(err) });
@@ -155,16 +158,18 @@ pub fn main(init: std.process.Init) !void {
         return err;
     };
 
-    var header: [0x440]u8 = undefined;
+    var header: [0x440]u8 = @splat(0);
     _ = file.readPositionalAll(io, &header, 0) catch |err| {
         try stderr.print("cannot read {s}: {s}\n", .{ input, @errorName(err) });
         try stderr.flush();
         return err;
     };
 
-    // The read-only handle stays open across the PS4 extraction; it is closed
-    // by the defer above, so do not close it twice here.
+    // ps4pkg.extract opens the file itself; close our handle first and mark it
+    // closed so the defer above does not double-close.
     if (ps4pkg.isPs4Package(&header, file_size)) {
+        file.close(io);
+        file_open = false;
         const stats = try ps4pkg.extract(io, arena, input, dest_path);
         std.debug.print("extracted {d} file(s), {d} bytes to {s}\n", .{ stats.files, stats.bytes, dest_path });
         return;
