@@ -25,6 +25,9 @@ pub const Options = struct {
     app_ver: []const u8 = "01.00",
     /// Extra bytes in eboot.bin, so a base and an update differ in content, not just flags.
     eboot_fill: usize = 0,
+    /// Add a synthetic encrypted npbind.dat (id 0x403) whose final AES block carries real
+    /// padding bytes; its embedded SHA-1 pins the full-block decryption path.
+    npbind: bool = false,
 };
 
 const header_size = pkg.header_size;
@@ -46,6 +49,9 @@ const block_count = 9;
 const map_offset = block_count * block;
 const image_size = pfsc_offset + map_offset + 0x1000;
 const package_size = pfs_offset + image_size;
+// Synthetic npbind.dat (entry 0x403): 512 content bytes + a 20-byte SHA-1 of them.
+const npbind_size = 532;
+const npbind_offset = 0x4000;
 
 // Fixed key material: the generator picks it, so no retail value is involved.
 const dk3: [32]u8 = @splat(0x11);
@@ -68,13 +74,20 @@ pub fn build(arena: std.mem.Allocator, options: Options) ![]u8 {
     const data = try arena.alloc(u8, package_size);
     @memset(data, 0);
 
-    writeHeader(data, sfo.len, options);
+    const count: u32 = if (options.npbind) entry_count + 1 else entry_count;
+    writeHeader(data, sfo.len, options, count);
     writeEntry(data, 0, .{ .id = pkg.entry_id_entry_keys, .offset = keyset_offset, .size = keyset_size });
     writeEntry(data, 1, .{ .id = pkg.entry_id_image_key, .offset = image_key_offset, .size = image_key_size });
     writeEntry(data, 2, .{ .id = pkg.entry_id_entry_names, .offset = names_offset, .size = entry_names.len });
     writeEntry(data, 3, .{ .id = pkg.entry_id_param_sfo, .offset = sfo_offset, .size = @intCast(sfo.len), .filename_offset = 1 });
     @memcpy(data[sfo_offset..][0..sfo.len], sfo);
     @memcpy(data[names_offset..][0..entry_names.len], entry_names);
+
+    if (options.npbind) {
+        writeEntry(data, entry_count, .{ .id = 0x403, .offset = npbind_offset, .size = npbind_size });
+        const cipher = try npbindCipher();
+        @memcpy(data[npbind_offset..][0..cipher.len], &cipher);
+    }
 
     const image = data[pfs_offset..][0..image_size];
     buildImage(image, options.eboot_fill);
@@ -113,11 +126,11 @@ pub fn build(arena: std.mem.Allocator, options: Options) ![]u8 {
     return data;
 }
 
-fn writeHeader(data: []u8, sfo_len: usize, options: Options) void {
+fn writeHeader(data: []u8, sfo_len: usize, options: Options, count: u32) void {
     @memcpy(data[0..4], &pkg.magic);
     @memcpy(data[pkg.content_id_offset..][0..pkg.content_id_len], options.content_id);
-    writeU32be(data, pkg.file_count_offset, 4);
-    writeU32be(data, pkg.entry_count_offset, entry_count);
+    writeU32be(data, pkg.file_count_offset, count);
+    writeU32be(data, pkg.entry_count_offset, count);
     writeU32be(data, pkg.table_offset_offset, table_offset);
     writeU64be(data, pkg.body_offset_offset, body_offset);
     writeU64be(data, pkg.body_size_offset, pfs_offset - body_offset);
@@ -295,6 +308,30 @@ fn aesCbcEncrypt(key: [16]u8, iv: [16]u8, src: []const u8, dst: []u8) void {
         @memcpy(dst[i..][0..16], &c);
         prev = c;
     }
+}
+
+/// Builds a synthetic npbind.dat plaintext (512 content bytes + its 20-byte SHA-1) and
+/// AES-CBC encrypts it with the same row-derived key `source.sceEntryData` uses. The 12
+/// padding bytes of the final aligned block are real, non-zero bytes: if a reader zero-pads
+/// that block instead, AES diffusion scrambles the digest bytes that live in it.
+fn npbindCipher() ![544]u8 {
+    const padded_len = (npbind_size + 15) & ~@as(usize, 15);
+    var plain: [padded_len]u8 = undefined;
+    for (0..512) |i| plain[i] = @intCast((i * 7 + 3) & 0xFF);
+    var digest: [20]u8 = undefined;
+    std.crypto.hash.Sha1.hash(plain[0..512], &digest, .{});
+    @memcpy(plain[512..npbind_size], &digest);
+    for (plain[npbind_size..]) |*b| b.* = 0xA5;
+
+    const row = entryRow(.{ .id = 0x403, .offset = npbind_offset, .size = npbind_size });
+    var hashed: [64]u8 = undefined;
+    @memcpy(hashed[0..32], &row);
+    @memcpy(hashed[32..], &dk3);
+    const iv_key = crypto.sha256(&hashed);
+
+    var cipher: [padded_len]u8 = undefined;
+    aesCbcEncrypt(iv_key[16..32].*, iv_key[0..16].*, &plain, &cipher);
+    return cipher;
 }
 
 fn xtsEncrypt(data_key: [16]u8, tweak_key: [16]u8, sector: u64, src: []const u8, dst: []u8) void {
@@ -497,4 +534,40 @@ test "synthetic pkg probes and merges as a patch" {
     try std.testing.expect(plan_mod.preflight(.fromSource(&sources[0]), .fromSource(&sources[1])) == null);
     const merged = try plan_mod.build(arena, &sources);
     try std.testing.expectEqual(@as(usize, 8), merged.file_count);
+}
+
+test "synthetic npbind.dat keeps its SHA-1 tail through NP entry decryption" {
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const path = try writePackage(arena, "p2z-synthetic-npbind.pkg", .{ .npbind = true });
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const opened = try source.Source.open(io, arena, &.{path});
+    const src = switch (opened) {
+        .ok => |s| s,
+        .fail => |failure| {
+            std.debug.print("synthetic pkg rejected: {t}\n", .{failure});
+            return error.SyntheticPkgRejected;
+        },
+    };
+    defer src.close();
+
+    var np: ?pkg.Entry = null;
+    for (src.entries) |entry| {
+        if (entry.id == 0x403) np = entry;
+    }
+    const entry = np orelse return error.MissingNpbindEntry;
+    try std.testing.expectEqual(@as(u32, npbind_size), entry.size);
+
+    const plain = try src.sceEntryData(entry);
+    try std.testing.expectEqual(@as(usize, npbind_size), plain.len);
+
+    // npbind.dat's invariant: the trailing 20 bytes are SHA-1 of the leading 512. The last
+    // four digest bytes sit in the final AES block, so zero-padding that block corrupts them.
+    var digest: [20]u8 = undefined;
+    std.crypto.hash.Sha1.hash(plain[0..512], &digest, .{});
+    try std.testing.expectEqualSlices(u8, &digest, plain[512..]);
 }
