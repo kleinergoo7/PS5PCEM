@@ -54,14 +54,15 @@ pub fn extract(io: std.Io, arena: std.mem.Allocator, input: []const u8, dest: []
     };
     switch (opened) {
         .fail => |fail| {
-            var buf: [512]u8 = undefined;
-            std.debug.print("cannot read PS4 package: {s}\n", .{p2z.source.describe(fail, &buf)});
+            // Failure paths come from `input`; size the buffer to the path plus fixed text.
+            const buf = try arena.alloc(u8, input.len + 256);
+            std.debug.print("cannot read PS4 package: {s}\n", .{p2z.source.describe(fail, buf)});
             return error.InvalidPs4Package;
         },
         .ok => |source| {
             defer source.close();
-            var pbuf: [512]u8 = undefined;
-            if (preflightIdentity(p2z.plan.Identity.fromSource(&source), &pbuf)) |reason| {
+            const pbuf = try arena.alloc(u8, input.len + 256);
+            if (preflightIdentity(p2z.plan.Identity.fromSource(&source), pbuf)) |reason| {
                 std.debug.print("unsupported PS4 package: {s}\n", .{reason});
                 return error.UnsupportedPs4Package;
             }
