@@ -168,6 +168,12 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const ps4pkg = b.addModule("ps4pkg", .{
+        .root_source_file = b.path("src/pkg/ps4.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "p2z", .module = p2z }},
+    });
 
     // Experimental PS4 (GNM/GCN) compatibility mode. Dependency-free (std
     // only) by design: detection, param.sfo parsing, shader-header decode,
@@ -949,6 +955,11 @@ pub fn build(b: *std.Build) void {
         }),
     });
     b.step("test-p2z", "Run vendored PS4 PKG core smoke test").dependOn(&b.addRunArtifact(p2z_smoke_tests).step);
+    const ps4pkg_tests = b.addTest(.{
+        .root_module = ps4pkg,
+        .filters = if (test_filter) |filter| &.{filter} else &.{},
+    });
+    b.step("test-ps4", "Run PS4 PKG detection and extraction tests").dependOn(&b.addRunArtifact(ps4pkg_tests).step);
     const zarchive_tests = b.addTest(.{ .root_module = zarchive });
     b.step("test-zarchive", "Run ZArchive reader and extraction tests").dependOn(&b.addRunArtifact(zarchive_tests).step);
     const runtime_tests = b.addTest(.{
