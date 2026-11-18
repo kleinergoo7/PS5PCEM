@@ -219,6 +219,12 @@ pub fn reset() void {
     cached_controller_index = null;
 }
 
+/// Test-only: pin input to the neutral scripted profile so HLE tests do not
+/// depend on whatever physical controller is attached to the test host.
+pub fn useScriptedInputForTests() void {
+    if (builtin.is_test) cached_mode = .scripted;
+}
+
 /// libScePad's motion controls, applied to the attached pad's sensors.
 pub fn resetOrientation() void {
     hid.resetOrientation();

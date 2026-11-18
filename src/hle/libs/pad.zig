@@ -546,6 +546,8 @@ pub fn register(db: *symbols.Database, gpa: std.mem.Allocator) symbols.Error!voi
 
 test "pad opens for the primary user and reports neutral connected data" {
     reset();
+    defer host_input.reset();
+    host_input.useScriptedInputForTests();
     try std.testing.expectEqual(errno.ok, padInit());
     const handle = padOpen(user_service.primary_user_id, 0, 0, null);
     try std.testing.expectEqual(primary_handle, handle);
