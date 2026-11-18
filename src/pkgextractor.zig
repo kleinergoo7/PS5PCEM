@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Artur Strazewicz
 
-//! Extracts PS5 debug packages (FPKG / `\x7FFIH`) and ZArchive game dumps.
+//! Extracts PS4 fake-signed PKGs, PS5 debug packages (FPKG / `\x7FFIH`) and
+//! ZArchive game dumps.
 //!
 //! Usage:
 //!   pkgextractor <game.pkg|game.zar> [-o <output-dir>]
 //!
-//! Unencrypted CNT entries (param.json, icons, PlayGo tables, trophies) are
+//! PS4 packages are decrypted and unpacked into a runnable game tree. For PS5,
+//! unencrypted CNT entries (param.json, icons, PlayGo tables, trophies) are
 //! written under `sce_sys/`. Debug / passcode packages also unpack
 //! uncompressed SELF modules from the nested `pfs_image.dat` (`eboot.bin`
 //! and `sce_module/*.prx`) plus the inner uroot file payloads. Retail
@@ -14,15 +16,16 @@
 
 const std = @import("std");
 const pkg = @import("pkg");
+const ps4pkg = @import("ps4pkg");
 const zarchive = @import("zarchive");
 
 const usage =
     \\pkgextractor <game.pkg|game.zar> [-o <output-dir>]
     \\
-    \\Reads a PS5 debug package (FIH FPKG) and writes unencrypted metadata
-    \\into output-dir/sce_sys plus inner application files (eboot.bin,
-    \\sce_module/*.prx, keystone, and uroot payloads) from the nested PFS.
-    \\Retail packages cannot be extracted.
+    \\Reads a PS4 PKG and writes a decrypted, runnable game tree, or a PS5 debug
+    \\package (FIH FPKG) and writes unencrypted metadata into output-dir/sce_sys
+    \\plus inner application files (eboot.bin, sce_module/*.prx, keystone, and
+    \\uroot payloads) from the nested PFS. Retail packages cannot be extracted.
     \\ZAR archives are streamed into a new output directory (no overwrite).
     \\
 ;
@@ -152,12 +155,20 @@ pub fn main(init: std.process.Init) !void {
         return err;
     };
 
-    var header: [0x100]u8 = undefined;
+    var header: [0x440]u8 = undefined;
     _ = file.readPositionalAll(io, &header, 0) catch |err| {
         try stderr.print("cannot read {s}: {s}\n", .{ input, @errorName(err) });
         try stderr.flush();
         return err;
     };
+
+    // The read-only handle stays open across the PS4 extraction; it is closed
+    // by the defer above, so do not close it twice here.
+    if (ps4pkg.isPs4Package(&header, file_size)) {
+        const stats = try ps4pkg.extract(io, arena, input, dest_path);
+        std.debug.print("extracted {d} file(s), {d} bytes to {s}\n", .{ stats.files, stats.bytes, dest_path });
+        return;
+    }
 
     const kind = pkg.detectKind(&header) orelse {
         try stderr.writeAll("not a PS5 package (expected FIH or CNT magic)\n");

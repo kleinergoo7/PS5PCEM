@@ -53,6 +53,9 @@ the publishing script requires all six packages and matching SHA-256 entries.
 
 ### Extracting game content
 
+`pkgextractor` also handles PS4 fake-signed PKGs, writing a decrypted, runnable
+game tree (retail PSN packages cannot be decrypted).
+
 Both launchers have separate **Extract PKG** and **Extract ZAR** buttons in the
 library. Each opens a file chooser for that format and runs `pkgextractor` with
 live progress and a copyable log. Successful extraction selects the output
