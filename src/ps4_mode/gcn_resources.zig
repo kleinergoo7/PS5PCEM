@@ -23,6 +23,7 @@ const opcode_shift: u5 = 8;
 const opcode_set_context_reg: u8 = 0x69;
 const opcode_set_sh_reg: u8 = 0x76;
 const opcode_set_uconfig_reg: u8 = 0x79;
+const opcode_draw_index_auto: u8 = 0x2d;
 
 /// USER_DATA is a row of 16 SGPRs per stage. Bases match gpu.ShaderStage.
 pub const user_data_words: usize = 16;
@@ -141,35 +142,74 @@ pub const Resources = struct {
     }
 };
 
-/// PS4-only submit-boundary capture. The GNM driver calls `publish` with the
-/// raw DCB at submit; the PS4 draw reads `captured` to bind T#/S#/V# resources.
-/// A mutex and value copy keep this safe for the multi-threaded command queue.
-var captured_lock: std.atomic.Mutex = .unlocked;
-var captured_resources: Resources = .{};
-var captured_valid: bool = false;
+/// The VS/PS program pair a submit binds. Defined here (rather than in a later
+/// task) so every consumer shares one definition.
+pub const ProgramPair = struct { vertex: u64 = 0, pixel: u64 = 0 };
 
-/// Publish the resources decoded from one submitted DCB. PS4 submit boundary.
-pub fn publish(res: Resources) void {
+pub const max_draws_per_capture: usize = 8;
+pub const max_capture_queue: usize = 8;
+
+/// Ordered snapshots of `Resources`, one per DRAW_INDEX_AUTO in a DCB. A DCB
+/// with no draw packets keeps its whole-stream result in `draws[0]`.
+pub const Capture = struct {
+    draws: [max_draws_per_capture]Resources = undefined,
+    count: usize = 0,
+};
+
+/// PS4-only submit-boundary capture. `publish` appends a DCB's ordered draw
+/// snapshots to a FIFO; `nextDrawResources` drains them in submit/draw order.
+/// A mutex and value copies keep this safe for the multi-threaded command queue.
+var captured_lock: std.atomic.Mutex = .unlocked;
+var capture_queue: [max_capture_queue]Capture = undefined;
+var capture_head: usize = 0;
+var capture_len: usize = 0;
+var capture_draw_cursor: usize = 0;
+
+/// Publish one submitted DCB's ordered per-draw snapshots. PS4 submit boundary.
+pub fn publish(cap: Capture) void {
     while (!captured_lock.tryLock()) std.atomic.spinLoopHint();
     defer captured_lock.unlock();
-    captured_resources = res;
-    captured_valid = true;
+    if (capture_len == capture_queue.len) {
+        // Ring full: drop the oldest capture and its draw cursor.
+        capture_head = (capture_head + 1) % capture_queue.len;
+        capture_len -= 1;
+        capture_draw_cursor = 0;
+    }
+    const tail = (capture_head + capture_len) % capture_queue.len;
+    capture_queue[tail] = cap;
+    capture_len += 1;
 }
 
-/// Latest captured resources, or null before the first PS4 submission.
-pub fn captured() ?Resources {
+/// Consume the next draw snapshot in submit/draw order. Exhausted captures are
+/// dropped while a newer one exists; a final capture with more draws than
+/// snapshots clamps to its last snapshot. Null means nothing was published.
+pub fn nextDrawResources() ?Resources {
     while (!captured_lock.tryLock()) std.atomic.spinLoopHint();
     defer captured_lock.unlock();
-    if (!captured_valid) return null;
-    return captured_resources;
+    if (capture_len == 0) return null;
+    while (capture_len > 1 and capture_draw_cursor >= capture_queue[capture_head].count) {
+        capture_head = (capture_head + 1) % capture_queue.len;
+        capture_len -= 1;
+        capture_draw_cursor = 0;
+    }
+    const current = &capture_queue[capture_head];
+    if (current.count == 0) return null;
+    if (capture_draw_cursor < current.count) {
+        const out = current.draws[capture_draw_cursor];
+        capture_draw_cursor += 1;
+        return out;
+    }
+    return current.draws[current.count - 1];
 }
 
 /// Clear captured state (PS4 session reset / tests).
 pub fn resetCapture() void {
     while (!captured_lock.tryLock()) std.atomic.spinLoopHint();
     defer captured_lock.unlock();
-    captured_resources = .{};
-    captured_valid = false;
+    capture_queue = undefined;
+    capture_head = 0;
+    capture_len = 0;
+    capture_draw_cursor = 0;
 }
 
 /// GCN T# tiling_index → the only four layouts image_layout.zig models.
@@ -310,10 +350,21 @@ fn stageForRegister(register: u32) ?Stage {
     return null;
 }
 
-/// Walk a GCN DCB and capture shader resource state. `words` is the raw guest
-/// stream (sanitized or not — SET_SH_REG packets are in range for both).
-pub fn capture(words: []const u32) Resources {
+/// Copy the running `Resources` into a draw snapshot, up to capacity.
+fn snapshotDraw(cap: *Capture, res: *const Resources) void {
+    if (cap.count >= cap.draws.len) return;
+    cap.draws[cap.count] = res.*;
+    cap.count += 1;
+}
+
+/// Walk a GCN DCB and capture ordered per-draw shader resource snapshots.
+/// `words` is the raw guest stream (sanitized or not — SET_SH_REG packets are
+/// in range for both). The running `Resources` is copied at each
+/// DRAW_INDEX_AUTO; a DCB with no draws keeps its whole-stream result in
+/// `draws[0]`.
+pub fn capture(words: []const u32) Capture {
     var res = Resources{};
+    var cap = Capture{};
     var read: usize = 0;
     while (read < words.len) {
         const header = words[read];
@@ -362,11 +413,13 @@ pub fn capture(words: []const u32) Resources {
                     }
                 }
             },
+            opcode_draw_index_auto => snapshotDraw(&cap, &res),
             else => {},
         }
         read += 1 + body_len;
     }
-    return res;
+    if (cap.count == 0) snapshotDraw(&cap, &res);
+    return cap;
 }
 
 // ---------------------------------------------------------------------------
@@ -389,7 +442,8 @@ test "Terraria DCB: recover PS/VS/CS USER_DATA descriptors from real SET_SH_REG 
     try std.testing.expectEqual(@as(usize, 790), dcb.len);
     try std.testing.expectEqual(@as(u32, 0xc005_5800), dcb[0]);
 
-    const res = capture(dcb);
+    const captures = capture(dcb);
+    const res = &captures.draws[captures.count - 1]; // final settled draw
 
     // The DCB really contains SH/UCONFIG/CONTEXT packets; resources come from
     // SH, the other two are counted only for the register dump.
@@ -403,23 +457,23 @@ test "Terraria DCB: recover PS/VS/CS USER_DATA descriptors from real SET_SH_REG 
 
     // Compute (0x244/0x248/0x24c): three V# buffers, including one that views
     // the 1920x1080 colour target at base 0x10_168c8000.
-    try std.testing.expect(hasBinding(&res, .compute, 0x248, .constant_buffer, 0x10_168c8000));
-    try std.testing.expect(hasBinding(&res, .compute, 0x244, .constant_buffer, 0x10_00000704));
-    try std.testing.expect(hasBinding(&res, .compute, 0x24c, .constant_buffer, 0x10_0000074c));
+    try std.testing.expect(hasBinding(res, .compute, 0x248, .constant_buffer, 0x10_168c8000));
+    try std.testing.expect(hasBinding(res, .compute, 0x244, .constant_buffer, 0x10_00000704));
+    try std.testing.expect(hasBinding(res, .compute, 0x24c, .constant_buffer, 0x10_0000074c));
 
     // Vertex (0x4c/0x4e/0x54): two 64-bit raw pointers and one 16-byte-stride
     // constant buffer (4 records = 64 bytes) in each of the two draw blocks.
-    try std.testing.expect(hasBinding(&res, .vertex, 0x4c, .raw_address, 0x10_1009cbb0));
-    try std.testing.expect(hasBinding(&res, .vertex, 0x4e, .raw_address, 0x10_10000f5c));
-    try std.testing.expect(hasBinding(&res, .vertex, 0x4e, .raw_address, 0x10_10000f8c));
-    try std.testing.expect(hasBinding(&res, .vertex, 0x54, .constant_buffer, 0x10_1009cb60));
-    try std.testing.expect(hasBinding(&res, .vertex, 0x54, .constant_buffer, 0x10_1009d0a4));
+    try std.testing.expect(hasBinding(res, .vertex, 0x4c, .raw_address, 0x10_1009cbb0));
+    try std.testing.expect(hasBinding(res, .vertex, 0x4e, .raw_address, 0x10_10000f5c));
+    try std.testing.expect(hasBinding(res, .vertex, 0x4e, .raw_address, 0x10_10000f8c));
+    try std.testing.expect(hasBinding(res, .vertex, 0x54, .constant_buffer, 0x10_1009cb60));
+    try std.testing.expect(hasBinding(res, .vertex, 0x54, .constant_buffer, 0x10_1009d0a4));
 
     // Pixel (0x10/0x18): a 4-dword S# sampler and an 8-dword T# image. The
     // second T# is the guest colour target decoded as 1920x1080 RGBA8.
-    try std.testing.expect(hasBinding(&res, .pixel, 0x18, .sampler, 0));
-    try std.testing.expect(hasBinding(&res, .pixel, 0x10, .sampled_image, 0x10_170c0000));
-    try std.testing.expect(hasBinding(&res, .pixel, 0x10, .sampled_image, 0x10_168c8000));
+    try std.testing.expect(hasBinding(res, .pixel, 0x18, .sampler, 0));
+    try std.testing.expect(hasBinding(res, .pixel, 0x10, .sampled_image, 0x10_170c0000));
+    try std.testing.expect(hasBinding(res, .pixel, 0x10, .sampled_image, 0x10_168c8000));
 
     // Settled USER_DATA row contains the last values written (second draw).
     try std.testing.expectEqual(@as(u32, 0x10168c80), res.pixel_user_data[4]);
@@ -461,21 +515,23 @@ test "format helpers decode GCN V#/T#/S#/pointer descriptors" {
     try std.testing.expectEqual(null, format(&.{ 0x1, 0x2, 0x3 }));
 }
 
-test "publish/captured/reset expose the latest DCB resources at the submit boundary" {
+test "publish/nextDrawResources/reset drain DCB snapshots at the submit boundary" {
     resetCapture();
     defer resetCapture();
-    try std.testing.expect(captured() == null);
+    try std.testing.expect(nextDrawResources() == null);
 
-    const res = capture(dcb);
-    publish(res);
-    const got = captured() orelse return error.TestExpectedResources;
+    publish(capture(dcb));
+    // The real DCB has two DRAW_INDEX_AUTO packets: first sprite T#, then the
+    // colour target. The FIFO returns them in submit/draw order.
+    const first = nextDrawResources() orelse return error.TestExpectedResources;
+    try std.testing.expect(hasBinding(&first, .pixel, 0x10, .sampled_image, 0x10_170c0000));
+    const got = nextDrawResources() orelse return error.TestExpectedResources;
     try std.testing.expectEqual(@as(usize, 13), got.count);
-    // The settled PS USER_DATA row is copied by value, not shared with `res`.
     try std.testing.expectEqual(@as(u32, 0x10168c80), got.pixel_user_data[4]);
     try std.testing.expect(hasBinding(&got, .pixel, 0x10, .sampled_image, 0x10_168c8000));
 
     resetCapture();
-    try std.testing.expect(captured() == null);
+    try std.testing.expect(nextDrawResources() == null);
 }
 
 test "capture ignores SH packets outside USER_DATA rows and malformed packets" {
@@ -493,9 +549,61 @@ test "capture ignores SH packets outside USER_DATA rows and malformed packets" {
         0x1009cbb0,
         0x10,
     };
-    const res = capture(&words);
+    const captures = capture(&words);
+    const res = &captures.draws[0]; // no DRAW_INDEX_AUTO: whole-stream result
     try std.testing.expectEqual(@as(usize, 2), res.sh_reg_packets);
     try std.testing.expectEqual(@as(usize, 1), res.count);
     try std.testing.expectEqual(ResourceKind.raw_address, res.bindings[0].descriptor.kind);
     try std.testing.expectEqual(@as(u64, 0x10_1009cbb0), res.bindings[0].descriptor.address);
+}
+
+// --- Ordered per-draw capture fixtures (real dwords from terraria_frame_test.zig) ---
+
+// PS T# SET_SH_REG (0x10..0x17) with the guest sprite texture at 0x10170c0000.
+const sh_t_a = [_]u32{
+    0xc0087600, 0x00000010, 0x10170c00, 0x00a00000,
+    0x0077c2ab, 0x94d00f2e, 0x0055e000, 0x00000000,
+    0x00000000, 0x00000000,
+};
+// Same register window rebound to the 1920x1080 colour target at 0x10168c8000.
+const sh_t_b = [_]u32{
+    0xc0087600, 0x00000010, 0x10168c80, 0x00a00000,
+    0x010dc77f, 0x94a00fac, 0x00efe000, 0x00000000,
+    0x00000000, 0x00000000,
+};
+const draw_auto = [_]u32{ 0xc0012d00, 0x00000004, 0x00000002 };
+
+const dcb_a = sh_t_a ++ draw_auto;
+const dcb_b = sh_t_b ++ draw_auto;
+const dcb_with_two_draws = sh_t_a ++ draw_auto ++ sh_t_b ++ draw_auto;
+
+fn psImage(res: Resources) ?Descriptor {
+    var out: ?Descriptor = null;
+    for (res.bindings[0..res.count]) |binding| {
+        if (binding.stage == .pixel and binding.descriptor.kind == .sampled_image)
+            out = binding.descriptor; // last PS T# write settles the texture
+    }
+    return out;
+}
+
+test "per-draw snapshots keep distinct PS textures" {
+    resetCapture();
+    defer resetCapture();
+    publish(capture(&dcb_a)); // PS T# 0x10170c0000
+    publish(capture(&dcb_b)); // PS T# 0x10168c8000
+    const a = nextDrawResources().?;
+    const b = nextDrawResources().?;
+    try std.testing.expectEqual(@as(u64, 0x10170c0000), psImage(a).?.address);
+    try std.testing.expectEqual(@as(u64, 0x10168c8000), psImage(b).?.address);
+}
+
+test "capture FIFO is ordered for equal program pairs" {
+    resetCapture();
+    defer resetCapture();
+    publish(capture(&dcb_with_two_draws)); // snapshots: T# A, T# B
+    const first = nextDrawResources().?;
+    const second = nextDrawResources().?;
+    try std.testing.expectEqual(@as(u64, 0x10170c0000), psImage(first).?.address);
+    try std.testing.expectEqual(@as(u64, 0x10168c8000), psImage(second).?.address);
+    try std.testing.expect(nextDrawResources() != null); // clamp to last
 }

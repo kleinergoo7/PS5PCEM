@@ -98,9 +98,10 @@ fn sceGnmSubmitAndFlipCommandBuffers(
         const stream: [*]const u32 = @ptrFromInt(addr);
         const slice = stream[0..words];
         // PS4-only: decode this DCB's GCN shader resources (PS/VS T#/S#/V#
-        // descriptors and settled USER_DATA words) at the submit boundary and
-        // publish them for the PS4 draw's descriptor binding. Pure data capture;
-        // the shared executor and its register checks are untouched.
+        // descriptors and settled USER_DATA words) at the submit boundary as
+        // ordered per-draw snapshots, then publish them so each PS4 draw binds
+        // its own T#/S#/V# resources. Pure data capture; the shared executor and
+        // its register checks are untouched.
         ps4_mode.gcn_resources.publish(ps4_mode.gcn_resources.capture(slice));
         if (scanout_address == 0) scanout_address = pm4_sanitize.colorTargetAddress(slice) orelse 0;
 

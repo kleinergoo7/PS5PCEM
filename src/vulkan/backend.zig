@@ -25752,11 +25752,11 @@ pub const Renderer = struct {
     fn ps4GraphicsScalars(
         stage: ps4_mode.gcn_translate.Stage,
         storage: []gpu.ShaderSpirvScalarRegister,
+        resources: ps4_mode.gcn_resources.Resources,
     ) []const gpu.ShaderSpirvScalarRegister {
         const slots = ps4_mode.gcn_translate.scalarSlots(stage);
         const count = @min(slots.len, storage.len);
-        const captured = ps4_mode.gcn_resources.captured();
-        const user_data = if (captured) |res| res.userData(if (stage == .vertex) .vertex else .pixel) else &.{};
+        const user_data = resources.userData(if (stage == .vertex) .vertex else .pixel);
 
         // The real Terraria VS performs three SGPR loads in its straight prolog:
         // a V# from a raw USER_DATA pointer, then two vertex-attribute reads.
@@ -25775,10 +25775,10 @@ pub const Renderer = struct {
                     previous_pc = pc;
                 }
                 value = switch (group) {
-                    1 => if (captured) |res| blk: {
+                    1 => blk: {
                         // V# words from the captured VS constant buffer (USER_DATA 8..12).
-                        break :blk res.vertex_user_data[8 + word_in_group];
-                    } else 0,
+                        break :blk resources.vertex_user_data[8 + word_in_group];
+                    },
                     2 => 0, // UV origin
                     else => if (word_in_group < 2) step_bits else 0, // UV step
                 };
@@ -25796,14 +25796,13 @@ pub const Renderer = struct {
     }
 
     /// PS4-only: minimal sampled-image descriptor for the translated Terraria
-    /// PS, derived from the settled PS T# published at the GNM submit boundary.
-    /// The captured T# is GCN-encoded; the shared stager wants an RDNA2 view,
-    /// so only the fields the 2D RGBA8 path reads are filled in.
-    fn ps4SampledImageDescriptor() ?gpu.resources.ImageDescriptor {
+    /// PS, derived from this draw's settled PS T# captured at the GNM submit
+    /// boundary. The captured T# is GCN-encoded; the shared stager wants an
+    /// RDNA2 view, so only the fields the 2D RGBA8 path reads are filled in.
+    fn ps4SampledImageDescriptor(resources: ps4_mode.gcn_resources.Resources) ?gpu.resources.ImageDescriptor {
         if (!@atomicLoad(bool, &ps4_compat_enabled, .monotonic)) return null;
-        const captured = ps4_mode.gcn_resources.captured() orelse return null;
         var image: ?ps4_mode.gcn_resources.Descriptor = null;
-        for (captured.bindings[0..captured.count]) |binding| {
+        for (resources.bindings[0..resources.count]) |binding| {
             if (binding.stage != .pixel or binding.descriptor.kind != .sampled_image) continue;
             image = binding.descriptor; // last write is the settled PS T#
         }
@@ -25832,9 +25831,9 @@ pub const Renderer = struct {
     /// sampled-image bank at binding 1, element 1 — the exact slot the
     /// translated Terraria PS samples. The caller releases the returned image
     /// after the draw has been queued. Returns null off the PS4 path.
-    fn stagePs4GraphicsSampledImage(self: *Renderer) anyerror!?PreparedSampledImage {
+    fn stagePs4GraphicsSampledImage(self: *Renderer, resources: ps4_mode.gcn_resources.Resources) anyerror!?PreparedSampledImage {
         if (!@atomicLoad(bool, &ps4_compat_enabled, .monotonic)) return null;
-        const descriptor = ps4SampledImageDescriptor() orelse return null;
+        const descriptor = ps4SampledImageDescriptor(resources) orelse return null;
         const sampler = try gpu.resources.decodeSamplerDescriptor(&.{ 0, 0, 0, 0 });
         const prepared = self.stageSampledImage(descriptor, sampler, 1, .two_d, null) catch |err| {
             std.debug.print("[ps4] sampled image @0x{x} {d}x{d} staging failed: {s}\n", .{
@@ -25879,6 +25878,11 @@ pub const Renderer = struct {
     /// probe so the guest frame still materializes. Both use the shared draw
     /// path and the guest's own decoded color target. PS5 never takes this.
     fn drawPs4FixedColor(self: *Renderer, state: *const gpu.State, draw: GuestDraw) anyerror!void {
+        // One snapshot per draw, in submit/draw order. Without a published
+        // capture there are no GCN resources to bind, so this draw is not
+        // representable on the PS4 path.
+        const resources = ps4_mode.gcn_resources.nextDrawResources() orelse
+            return Error.UnsupportedGraphicsState;
         const render_state = gpu.resources.decodeRenderState(state);
         var target: ?GuestColorTarget = null;
         for (render_state.color_targets) |candidate| {
@@ -25894,11 +25898,11 @@ pub const Renderer = struct {
         var vertex_storage: [64]gpu.ShaderSpirvScalarRegister = undefined;
         var fragment_storage: [64]gpu.ShaderSpirvScalarRegister = undefined;
         const vertex_scalars: []const gpu.ShaderSpirvScalarRegister = if (use_real_shader)
-            ps4GraphicsScalars(.vertex, &vertex_storage)
+            ps4GraphicsScalars(.vertex, &vertex_storage, resources)
         else
             &.{};
         const fragment_scalars: []const gpu.ShaderSpirvScalarRegister = if (use_real_shader)
-            ps4GraphicsScalars(.pixel, &fragment_storage)
+            ps4GraphicsScalars(.pixel, &fragment_storage, resources)
         else
             &.{};
         // The translated PS reads a sampled image at binding 1 / element 1.
@@ -25906,7 +25910,7 @@ pub const Renderer = struct {
         // and keep it alive until the draw has been queued.
         var ps4_sampled: ?PreparedSampledImage = null;
         defer if (ps4_sampled) |prepared| self.releasePs4GraphicsSampledImage(prepared);
-        if (use_real_shader) ps4_sampled = try self.stagePs4GraphicsSampledImage();
+        if (use_real_shader) ps4_sampled = try self.stagePs4GraphicsSampledImage(resources);
         try self.drawGraphicsShadersWithModules(
             if (translated) |t| t.vertex_words else &graphics_probe_vertex_spirv,
             if (translated) |t| t.fragment_words else &graphics_probe_fragment_spirv,
@@ -49507,11 +49511,12 @@ test "PS5 draws never take the PS4 fixed-color fallback" {
     // PS5: even with both program registers bound, the fallback is off and the
     // native guest-draw path is the only one that can run. Captured PS4 GCN
     // resources never pull a PS5 draw into the fallback either.
+    ps4_mode.gcn_resources.resetCapture();
     ps4_mode.gcn_resources.publish(ps4_mode.gcn_resources.capture(
         &ps4_mode.terraria_frame_test.captured_dcb,
     ));
     defer ps4_mode.gcn_resources.resetCapture();
-    try std.testing.expect(ps4_mode.gcn_resources.captured() != null);
+    try std.testing.expect(ps4_mode.gcn_resources.nextDrawResources() != null);
     ps4_compat_enabled = false;
     try std.testing.expect(!Renderer.wantsPs4FixedColorDraw(&state));
 
@@ -49550,15 +49555,21 @@ test "PS4 sampled-image staging is gated off for PS5 draws" {
     ps4_mode.gcn_resources.publish(ps4_mode.gcn_resources.capture(
         &ps4_mode.terraria_frame_test.captured_dcb,
     ));
+    // The second draw rebinds the PS T# to the 1920x1080 colour target.
+    _ = ps4_mode.gcn_resources.nextDrawResources();
+    const resources = ps4_mode.gcn_resources.nextDrawResources() orelse
+        return error.TestExpectedResources;
 
     // PS5: no image descriptor is produced, so no Vulkan descriptor write
     // happens and the native path is untouched.
     ps4_compat_enabled = false;
-    try std.testing.expect(Renderer.ps4SampledImageDescriptor() == null);
+    try std.testing.expect(Renderer.ps4SampledImageDescriptor(resources) == null);
+    var renderer: Renderer = undefined;
+    try std.testing.expect(try Renderer.stagePs4GraphicsSampledImage(&renderer, resources) == null);
 
     // PS4: the same captured DCB yields the settled PS T# view.
     ps4_compat_enabled = true;
-    const descriptor = Renderer.ps4SampledImageDescriptor() orelse
+    const descriptor = Renderer.ps4SampledImageDescriptor(resources) orelse
         return error.TestExpectedSampledImageDescriptor;
     try std.testing.expectEqual(@as(u64, 0x10_168c8000), descriptor.address);
     try std.testing.expectEqual(@as(u32, 1920), descriptor.width);
