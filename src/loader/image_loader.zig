@@ -250,27 +250,20 @@ pub fn prepare(
         }
     }
 
-    // Adjacent protection runs are one staging allocation. This also handles
-    // ELF segments that share their boundary page.
-    var run_index: usize = 0;
-    while (run_index < final_runs.items.len) {
-        const start = final_runs.items[run_index].range.start;
-        var end = final_runs.items[run_index].range.end;
-        run_index += 1;
-        while (run_index < final_runs.items.len and final_runs.items[run_index].range.start == end) {
-            end = final_runs.items[run_index].range.end;
-            run_index += 1;
-        }
-
-        try address_space.mapFixed(
-            start,
-            end - start,
-            .read_write,
-            .module,
-            null,
-        );
-        try mapped.ranges.append(allocator, .{ .start = start, .end = end });
+    // Stage the whole image span writable, including the page gaps between
+    // PT_LOAD segments. PS4 SELF modules keep their GOT/jump-slot table in such
+    // a gap and relocate into it; mapping only the segment pages left those
+    // writes with no target. Only real segment pages receive their final
+    // protection in `link`, so gap pages stay writable and images without a gap
+    // are unaffected.
+    var whole_start: u64 = std.math.maxInt(u64);
+    var whole_end: u64 = 0;
+    for (plans.items) |plan| {
+        whole_start = @min(whole_start, plan.page_range.start);
+        whole_end = @max(whole_end, plan.page_range.end);
     }
+    try address_space.mapFixed(whole_start, whole_end - whole_start, .read_write, .module, null);
+    try mapped.ranges.append(allocator, .{ .start = whole_start, .end = whole_end });
 
     // Anonymous committed pages start at zero, so copying filesz bytes also
     // gives every memsz-filesz tail the ELF-required zero fill.
@@ -485,6 +478,58 @@ test "a load segment is copied at its exact guest address and finalized read-onl
         memory.Error.ProtectionDenied,
         address_space.write(memory.system_managed.start, "x"),
     );
+}
+
+test "the page gap between load segments is staged writable" {
+    const payload = "gap stage";
+    const offset = elf.TestImage.payloadOffset(2);
+    const segments = [_]elf.ProgramHeader{
+        .{
+            .type = @intFromEnum(elf.SegmentType.load),
+            .flags = 0x4,
+            .offset = offset,
+            .vaddr = 0,
+            .paddr = 0,
+            .filesz = payload.len,
+            .memsz = memory.page_size,
+            .@"align" = memory.page_size,
+        },
+        .{
+            .type = @intFromEnum(elf.SegmentType.load),
+            .flags = 0x6,
+            .offset = offset,
+            .vaddr = 3 * memory.page_size,
+            .paddr = 0,
+            .filesz = 0,
+            .memsz = memory.page_size,
+            .@"align" = memory.page_size,
+        },
+    };
+
+    var fixture = try elf.TestImage.build(testing.allocator, .sce_dynexec, &segments, payload);
+    defer fixture.deinit(testing.allocator);
+    const image = try elf.parse(fixture.bytes());
+
+    var address_space = try memory.AddressSpace.init(testing.allocator);
+    defer address_space.deinit();
+    var info = dynamic.DynamicInfo{};
+    defer info.deinit(testing.allocator);
+
+    var mapped = try load(
+        testing.allocator,
+        &address_space,
+        image,
+        &info,
+        null,
+        .{ .load_bias = memory.system_managed.start },
+    );
+    defer mapped.deinit();
+
+    // PS4 SELF modules keep their GOT/jump-slot table in the gap between
+    // PT_LOAD segments and relocate into it, so the gap must stay writable.
+    const gap = memory.system_managed.start + 2 * memory.page_size;
+    try testing.expect(address_space.isMapped(gap, 8));
+    try address_space.writeInt(u64, gap, 0x1234_5678);
 }
 
 test "startup functions resolve direct and array entries in ABI order" {

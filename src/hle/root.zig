@@ -43,6 +43,7 @@ pub const libs = struct {
     pub const ps4_heap = @import("libs/ps4_heap.zig");
     pub const ps4_title_stubs = @import("libs/ps4_title_stubs.zig");
     pub const ps4_terraria_stubs = @import("libs/ps4_terraria_stubs.zig");
+    pub const ps4_oneshot_stubs = @import("libs/ps4_oneshot_stubs.zig");
     pub const kernel_aio = @import("libs/kernel_aio.zig");
     pub const kernel_mapper = @import("libs/kernel_mapper.zig");
     pub const kernel_files = @import("libs/kernel_files.zig");
@@ -112,6 +113,7 @@ pub fn registerAll(db: *Database, gpa: @import("std").mem.Allocator) symbols.Err
     try libs.ps4_heap.register(db, gpa);
     try libs.ps4_title_stubs.register(db, gpa);
     try libs.ps4_terraria_stubs.register(db, gpa);
+    try libs.ps4_oneshot_stubs.register(db, gpa);
 }
 
 test {
@@ -167,6 +169,7 @@ test {
     _ = libs.ult;
     _ = libs.user_service;
     _ = libs.ps4_terraria_stubs;
+    _ = libs.ps4_oneshot_stubs;
     _ = @import("libs/gnm_service_compat.zig");
 }
 
