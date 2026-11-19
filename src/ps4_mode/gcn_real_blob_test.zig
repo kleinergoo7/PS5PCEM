@@ -18,6 +18,7 @@ const gcn_translate = @import("gcn_translate.zig");
 const ProgramPair = gcn_translate.ProgramPair;
 const registerShaderFor = gcn_translate.registerShaderFor;
 const translatedGraphicsFor = gcn_translate.translatedGraphicsFor;
+const fragmentInputsFor = gcn_translate.fragmentInputsFor;
 
 /// Full VS blob (2048-byte dump truncated to the parsed ISA extent).
 /// isa_offset = 0x104, isa_size = 88 (22 dwords).
@@ -78,4 +79,85 @@ test "program-keyed translation rejects mismatched pair" {
     registerShaderFor(program, .pixel, &ps_words);
     try std.testing.expect(translatedGraphicsFor(program) != null);
     try std.testing.expect(translatedGraphicsFor(.{ .vertex = 1, .pixel = 2 }) == null);
+}
+
+/// Two OpConstant float values forming the coordinate composite consumed by an
+/// image sample: the hardcoded `(0,0)` UV fallback this task removes.
+fn constantUvOnly(words: []const u32) bool {
+    var float_type: u32 = 0;
+    for (words, 0..) |word, i| {
+        if (word == 0x0003_0015 and i + 2 < words.len and words[i + 2] == 32) {
+            float_type = words[i + 1]; // OpTypeFloat %float 32
+            break;
+        }
+    }
+    if (float_type == 0) return false;
+
+    var constants: [64]u32 = undefined;
+    var nconst: usize = 0;
+    for (words, 0..) |word, i| {
+        // OpConstant: 5 words, result type is the 32-bit float type.
+        if (word != 0x0005_002b or i + 3 >= words.len or words[i + 1] != float_type) continue;
+        if (nconst < constants.len) {
+            constants[nconst] = words[i + 2];
+            nconst += 1;
+        }
+    }
+
+    var composites: [64]u32 = undefined;
+    var ncomp: usize = 0;
+    for (words, 0..) |word, i| {
+        const count: usize = word >> 16;
+        if ((word & 0xffff) != 80 or count < 4 or i + count > words.len) continue; // OpCompositeConstruct
+        var hits: usize = 0;
+        for (words[i + 3 .. i + count]) |operand| {
+            for (constants[0..nconst]) |constant| {
+                if (constant == operand) {
+                    hits += 1;
+                    break;
+                }
+            }
+        }
+        if (hits >= 2 and ncomp < composites.len) {
+            composites[ncomp] = words[i + 2];
+            ncomp += 1;
+        }
+    }
+    if (ncomp == 0) return false;
+
+    for (words, 0..) |word, i| {
+        const op = word & 0xffff;
+        if ((op != 87 and op != 88) or i + 4 >= words.len) continue; // image sample
+        const coordinate = words[i + 4];
+        for (composites[0..ncomp]) |composite| if (composite == coordinate) return true;
+    }
+    return false;
+}
+
+test "real PS fragment inputs come from VS PARAM exports and VINTRP attrs" {
+    // The embedded arrays are named after the OrbShdr header stage field, but
+    // the runtime classifies by EXP target (ps4_title_stubs.stageFromIsa): the
+    // blob exporting POS0 (0x0c) / PARAM0 (0x20) is the VS, and the blob
+    // exporting MRT0 (0x00) with an image sample is the PS.
+    const program: ProgramPair = .{ .vertex = 0x1000000b88, .pixel = 0x1000000ba4 };
+    registerShaderFor(program, .vertex, &ps_words);
+    registerShaderFor(program, .pixel, &vs_words);
+    const inputs = fragmentInputsFor(program).?;
+    try std.testing.expectEqual(@as(u32, 1), inputs.allocated); // VS PARAM0 -> bit 0
+    try std.testing.expectEqual(inputs.allocated, inputs.enabled);
+    const graphics = translatedGraphicsFor(program) orelse return error.TestExpectedGraphics;
+    try std.testing.expect(!constantUvOnly(graphics.fragment_words));
+}
+
+test "VINTRP attr without a VS PARAM export reports null, never a guessed input" {
+    const program: ProgramPair = .{ .vertex = 0x1000000c88, .pixel = 0x1000000ca4 };
+    const ps_with_vintrp = [_]u32{
+        gcn_decode.vintrp(false, 0, 0, 0), // consumes attr 0
+        gcn_decode.vintrp(true, 1, 0, 0),
+        0xbf81_0000,
+    };
+    registerShaderFor(program, .vertex, &[_]u32{0xbf81_0000}); // no PARAM exports
+    registerShaderFor(program, .pixel, &ps_with_vintrp);
+    try std.testing.expect(fragmentInputsFor(program) == null);
+    try std.testing.expect(gcn_translate.lastDiagnostic() != null);
 }
