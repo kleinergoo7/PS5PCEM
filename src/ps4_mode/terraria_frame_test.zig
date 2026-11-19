@@ -20,7 +20,7 @@ const pm4 = @import("pm4_sanitize.zig");
 const shader_binding = @import("shader_binding.zig");
 
 /// Terraria PS4 setup DCB, 790 dwords, verbatim from the capture.
-const captured_dcb = [_]u32{
+pub const captured_dcb = [_]u32{
     0xc0055800, 0x88c40000, 0x00000001, 0x00000000, 0x00000000, 0x00000000, 0x0000000a, 0xc0016900,
     0x00000205, 0x00000246, 0xc0016900, 0x000002df, 0x00000000, 0xc0016900, 0xc0066900, 0x00000318,
     0x10100a00, 0x09f0009f, 0x00003bff, 0x00000000, 0x00028828, 0x0000014a, 0xc0046900, 0x0000031f,

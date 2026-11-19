@@ -17,6 +17,7 @@ pub const detector = @import("detector.zig");
 pub const gcn_header = @import("gcn_header.zig");
 pub const gnm_packets = @import("gnm_packets.zig");
 pub const pm4_sanitize = @import("pm4_sanitize.zig");
+pub const gcn_resources = @import("gcn_resources.zig");
 pub const shader_binding = @import("shader_binding.zig");
 pub const terraria_frame_test = @import("terraria_frame_test.zig");
 pub const image_layout = @import("image_layout.zig");
@@ -51,6 +52,7 @@ test {
     _ = gcn_header;
     _ = gnm_packets;
     _ = pm4_sanitize;
+    _ = gcn_resources;
     _ = shader_binding;
     _ = terraria_frame_test;
     _ = image_layout;
