@@ -25,6 +25,11 @@ pub const configFrom = runtime.configFrom;
 var seeded_config: ?runtime.Config = null;
 
 /// Seed the cached env values. `null` policy means PS5_PS4_MODE was unset.
+/// PS4-mode libc I/O shim gate. Set from the launch config before guest module
+/// loading, so the linker can prefer the HLE fopen/fread/... exports over the
+/// title's bundled libc PRX. Native PS5 titles leave this false.
+pub var libc_io_active: bool = false;
+
 pub fn seedEnvConfig(policy_value: ?[]const u8, diag: bool) void {
     seeded_config = configFrom(policy_value, diag);
 }

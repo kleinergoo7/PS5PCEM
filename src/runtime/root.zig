@@ -664,7 +664,12 @@ fn preferHleImportId(id: []const u8) bool {
     or std.mem.eql(u8, id, "kiZSXIWd9vg") // strcpy
         // Bring-up mitigation (DRIVECLUB): memset(NULL,0,0xc0000) during
         // threaded init; defensive wrapper logs and skips the NULL dest.
-    or std.mem.eql(u8, id, "8zTFvBIAIN8"); // memset
+    or std.mem.eql(u8, id, "8zTFvBIAIN8") // memset
+        // PS4 libc I/O boundary: in PS4 mode the title's bundled libc PRX's
+        // fopen returns a null FILE* for /app0 assets (its internal open path
+        // never reaches HLE). Prefer the PS4-only HLE exports so asset loads go
+        // through the emulated filesystem. Gated off for native PS5 titles.
+   ;
 }
 
 fn resolveHleExact(context: *const ResolverContext, import: *const loader.Import, symbol_type: hle.SymbolType) ?u64 {
