@@ -90,9 +90,12 @@ fn insertFreeLocked(block: u64) void {
         writeHeader(block, size + readHeader(cur).size);
         cur = getNext(cur);
     }
-    // Merge with prev.
+    // Merge with prev. When prev absorbs block, prev's next must skip the
+    // absorbed node or it stays linked as a ghost whose header/next get
+    // overwritten once the merged region is allocated -> free-list corruption.
     if (prev != 0 and prev + readHeader(prev).size == block) {
         writeHeader(prev, readHeader(prev).size + readHeader(block).size);
+        setNext(prev, cur);
     } else {
         setNext(block, cur);
         if (prev == 0) free_head = block else setNext(prev, block);
