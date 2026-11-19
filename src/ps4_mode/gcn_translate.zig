@@ -54,6 +54,33 @@ pub fn vertexDataSourceFor(res: gcn_resources.Resources) ?VertexDataSource {
     return best;
 }
 
+/// USER_DATA word index backing the registered PS's sampled image. GNM writes
+/// each T# as a contiguous 8-word SET_SH_REG block at USER_DATA base + index,
+/// and patches the MIMG resource operand to name that same word index. So the
+/// decoded `Mimg.tsgpr` (equivalently `SampledImageBinding.resource_sgpr`) is
+/// the slot the shader actually samples. Returns null without a registered PS
+/// or when that PS samples no image.
+pub fn sampledImageUserIndexFor(program: ProgramPair) ?u8 {
+    lockGlobal();
+    defer lock.unlock();
+    const index = findEntry(program) orelse return null;
+    const isa = registry[index].pixel_isa orelse return null;
+    var it = gcn_decode.decode(isa);
+    while (true) {
+        const maybe = it.next() catch return null;
+        const inst = maybe orelse break;
+        switch (inst) {
+            .image_sample => |sample| {
+                const word_index = sample.tsgpr;
+                if (word_index >= gcn_resources.user_data_words) return null;
+                return @intCast(word_index);
+            },
+            else => {},
+        }
+    }
+    return null;
+}
+
 /// PS4-only dynamic scalar layout. One slot per SGPR the GCN program reads plus
 /// one slot per SMEM destination word, in a deterministic order. The draw path
 /// uploads values in exactly this order; the writer loads slot N from

@@ -21,7 +21,9 @@ const registerShaderFor = gcn_translate.registerShaderFor;
 const translatedGraphicsFor = gcn_translate.translatedGraphicsFor;
 const fragmentInputsFor = gcn_translate.fragmentInputsFor;
 const vertexDataSourceFor = gcn_translate.vertexDataSourceFor;
+const sampledImageUserIndexFor = gcn_translate.sampledImageUserIndexFor;
 const capture = gcn_resources.capture;
+const nextDrawResources = gcn_resources.nextDrawResources;
 const real_terraria_dcb = @import("terraria_frame_test.zig").captured_dcb;
 
 /// Pair used by the PS4 vertex-path check. `vs_words` is registered as VS (the
@@ -511,4 +513,19 @@ test "vertexDataSourceFor reports null with a diagnostic when no VS V# exists" {
     const empty: gcn_resources.Resources = .{};
     try std.testing.expect(vertexDataSourceFor(empty) == null);
     try std.testing.expect(gcn_translate.lastDiagnostic() != null);
+}
+
+test "PS image samples the USER_DATA slot of its own draw" {
+    // The real Terraria PS (the MRT0-exporting blob) names its T# through the
+    // MIMG resource operand; register it so that slot can be decoded.
+    registerShaderFor(program, .pixel, &vs_words);
+    gcn_resources.resetCapture();
+    defer gcn_resources.resetCapture();
+    gcn_resources.publish(capture(&real_terraria_dcb));
+
+    const index = sampledImageUserIndexFor(program).?;
+    const first = nextDrawResources().?; // Task 1 FIFO
+    const second = nextDrawResources().?;
+    try std.testing.expectEqual(@as(u64, 0x10170c0000), @as(u64, first.userData(.pixel)[index]) << 8);
+    try std.testing.expectEqual(@as(u64, 0x10168c8000), @as(u64, second.userData(.pixel)[index]) << 8);
 }
