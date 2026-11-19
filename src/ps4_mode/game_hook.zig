@@ -32,6 +32,7 @@ pub var libc_io_active: bool = false;
 
 pub fn seedEnvConfig(policy_value: ?[]const u8, diag: bool) void {
     seeded_config = configFrom(policy_value, diag);
+    libc_io_active = seeded_config.?.policy == .on;
 }
 
 /// Return the env-derived config seeded by the runner (auto policy if unseeded).

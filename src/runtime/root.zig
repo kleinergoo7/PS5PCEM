@@ -669,7 +669,7 @@ fn preferHleImportId(id: []const u8) bool {
         // fopen returns a null FILE* for /app0 assets (its internal open path
         // never reaches HLE). Prefer the PS4-only HLE exports so asset loads go
         // through the emulated filesystem. Gated off for native PS5 titles.
-   ;
+    or hle.libs.ps4_libc_io.preferred(id);
 }
 
 fn resolveHleExact(context: *const ResolverContext, import: *const loader.Import, symbol_type: hle.SymbolType) ?u64 {
