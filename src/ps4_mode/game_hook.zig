@@ -18,8 +18,21 @@ const detector = @import("detector.zig");
 const runtime = @import("runtime.zig");
 
 pub const decideForBlobs = detector.decideFromBlobs;
-pub const configFromEnv = runtime.configFromEnv;
 pub const configFrom = runtime.configFrom;
+
+/// Once-per-process config. Zig 0.16 has no global `getenv`, so the runner seeds
+/// these values from its environment block before calling `configFromEnv()`.
+var seeded_config: ?runtime.Config = null;
+
+/// Seed the cached env values. `null` policy means PS5_PS4_MODE was unset.
+pub fn seedEnvConfig(policy_value: ?[]const u8, diag: bool) void {
+    seeded_config = configFrom(policy_value, diag);
+}
+
+/// Return the env-derived config seeded by the runner (auto policy if unseeded).
+pub fn configFromEnv() runtime.Config {
+    return seeded_config orelse configFrom(null, false);
+}
 
 /// Environment override names (single source of truth for docs + launchers).
 pub const env_mode = "PS5_PS4_MODE";
@@ -41,4 +54,19 @@ pub fn startupLine(mode: detector.Mode, cfg: runtime.Config, buf: []u8) []const 
     @memcpy(buf[n..][0..active.len], active);
     n += active.len;
     return buf[0..n];
+}
+
+test "configFromEnv: PS5_PS4_MODE=on enables compat, absent follows auto policy" {
+    // PS5_PS4_MODE=on
+    seedEnvConfig("on", false);
+    const forced = configFromEnv();
+    try std.testing.expect(forced.enabledFor(.ps4_gnm));
+    try std.testing.expect(forced.enabledFor(.ps5_native));
+
+    // PS5_PS4_MODE unset -> auto policy
+    seedEnvConfig(null, false);
+    const automatic = configFromEnv();
+    try std.testing.expectEqual(runtime.Policy.auto, automatic.policy);
+    try std.testing.expect(automatic.enabledFor(.ps4_gnm));
+    try std.testing.expect(!automatic.enabledFor(.ps5_native));
 }

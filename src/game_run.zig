@@ -18,6 +18,7 @@ const window = @import("window");
 const display_mode = @import("display_mode.zig");
 const performance_mode = @import("performance_mode.zig");
 const frame_limit = @import("frame_limit.zig");
+const ps4_mode = @import("ps4_mode/root.zig");
 
 fn acquireHostMemory(context: ?*anyopaque, address: u64, size: usize, identity: u64) ?vulkan.GuestMemory.HostMapping {
     const view = runtime.firmware.libs.agc_submit.pinDirectMemory(context, address, size, identity) orelse return null;
@@ -193,6 +194,38 @@ fn readTitleIdentifierArchive(reader: *zarchive.Reader, storage: []u8) ?[]const 
     var document: [8192]u8 = undefined;
     const size = reader.readAt(node, 0, &document) catch return null;
     return savedata.findJsonString(document[0..size], "titleId", storage);
+}
+
+/// Reads the small prefixes the PS4 detector needs: param.sfo carries TITLE_ID
+/// and the ELF header carries e_type. Both stay caller-owned stack buffers.
+fn readPs4Blobs(
+    io: std.Io,
+    content: ?std.Io.Dir,
+    archive_reader: ?*zarchive.Reader,
+    executable_name: []const u8,
+    sfo_buffer: []u8,
+    elf_buffer: []u8,
+) struct { sfo: ?[]const u8, elf: ?[]const u8 } {
+    var sfo: ?[]const u8 = null;
+    var elf: ?[]const u8 = null;
+    if (archive_reader) |reader| {
+        if (reader.lookup("sce_sys/param.sfo")) |node| {
+            if (reader.isFile(node)) {
+                const n = reader.readAt(node, 0, sfo_buffer) catch 0;
+                sfo = sfo_buffer[0..n];
+            }
+        }
+        if (reader.lookup(executable_name)) |node| {
+            if (reader.isFile(node)) {
+                const n = reader.readAt(node, 0, elf_buffer) catch 0;
+                elf = elf_buffer[0..n];
+            }
+        }
+    } else if (content) |directory| {
+        sfo = directory.readFile(io, "sce_sys/param.sfo", sfo_buffer) catch null;
+        elf = directory.readFile(io, executable_name, elf_buffer) catch null;
+    }
+    return .{ .sfo = sfo, .elf = elf };
 }
 
 /// Whether a path names an existing host directory.
@@ -576,6 +609,34 @@ fn run(init: std.process.Init) !bool {
             try stderr.flush();
             return false;
         };
+    }
+
+    // PS4-only hook: resolve the mode once from the runner environment, classify
+    // the content, and lower the driver default-state preamble. When compat is
+    // inactive nothing below changes and the native PS5 path runs as before.
+    {
+        const ps4_policy = init.minimal.environ.getAlloc(allocator, ps4_mode.game_hook.env_mode) catch null;
+        defer if (ps4_policy) |value| allocator.free(value);
+        const ps4_diag = init.minimal.environ.containsUnempty(allocator, ps4_mode.game_hook.env_diag) catch false;
+        ps4_mode.game_hook.seedEnvConfig(ps4_policy, ps4_diag);
+        const ps4_cfg = ps4_mode.game_hook.configFromEnv();
+
+        const executable_name = if (archive_reader != null) archive_executable else std.fs.path.basename(executable_path);
+        var sfo_bytes: [4096]u8 = undefined;
+        var elf_bytes: [64]u8 = undefined;
+        const blobs = readPs4Blobs(io, content, archive_reader, executable_name, &sfo_bytes, &elf_bytes);
+        const detected = ps4_mode.game_hook.decideForBlobs(blobs.sfo, blobs.elf);
+        if (ps4_cfg.enabledFor(detected)) {
+            var line_buffer: [128]u8 = undefined;
+            try out.print("{s}\n", .{ps4_mode.game_hook.startupLine(detected, ps4_cfg, &line_buffer)});
+            try out.flush();
+
+            var ps4_session = ps4_mode.runtime.Session{};
+            var ps4_stats = ps4_mode.bridge.PipelineStats{};
+            ps4_mode.bridge.runBuffer(&ps4_session, blobs.sfo, blobs.elf, ps4_cfg, &.{}, &.{}, &.{}, &ps4_stats);
+            var lowered: [16]ps4_mode.gpu_translate.Lowered = undefined;
+            _ = ps4_mode.bridge.runDefaultState(&lowered, &ps4_stats);
+        }
     }
 
     var title_identifier_storage: [runtime.firmware.savedata.maximum_slot_name]u8 = undefined;
