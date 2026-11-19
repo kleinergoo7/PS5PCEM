@@ -32,7 +32,14 @@ const Header = struct {
 var heap_lock = std.atomic.Mutex.unlocked;
 var chunks: [max_chunks]u64 = [_]u64{0} ** max_chunks;
 var chunk_count: usize = 0;
-var free_head: u64 = 0; // guest address of first free block, 0 = empty
+
+/// Free-list links live here, not inside freed blocks: titles keep writing to
+/// released memory during bootstrap, and an in-heap `next` pointer turns one
+/// such write into a corrupted list and an alignment panic.
+const FreeNode = struct { addr: u64, size: u64 };
+const max_free_nodes = 16 * 1024;
+var free_nodes: [max_free_nodes]FreeNode = undefined;
+var free_count: usize = 0;
 
 fn alignUp(v: u64, a: u64) u64 {
     return (v + a - 1) & ~(a - 1);
@@ -46,14 +53,6 @@ fn writeHeader(at: u64, size: u64) void {
 
 fn readHeader(at: u64) Header {
     return @as(*const Header, @ptrFromInt(at)).*;
-}
-
-fn setNext(block: u64, next: u64) void {
-    @as(*u64, @ptrFromInt(block + header_size)).* = next;
-}
-
-fn getNext(block: u64) u64 {
-    return @as(*const u64, @ptrFromInt(block + header_size)).*;
 }
 
 /// Map one more arena chunk. Caller holds the lock.
@@ -72,77 +71,95 @@ fn growLocked() bool {
     chunk_count += 1;
     // Whole chunk starts as one free block, inserted sorted.
     writeHeader(addr, chunk_len);
-    insertFreeLocked(addr);
+    insertFreeLocked(addr, chunk_len);
     return true;
 }
 
+fn removeFreeNodeLocked(index: usize) void {
+    var i = index;
+    while (i + 1 < free_count) : (i += 1) free_nodes[i] = free_nodes[i + 1];
+    free_count -= 1;
+}
+
 /// Insert a free block sorted by address, merging neighbours. Lock held.
-fn insertFreeLocked(block: u64) void {
-    const size = readHeader(block).size;
-    var prev: u64 = 0;
-    var cur = free_head;
-    while (cur != 0 and cur < block) {
-        prev = cur;
-        cur = getNext(cur);
+/// Corrupt or unaligned input is dropped instead of poisoning the list.
+fn insertFreeLocked(addr: u64, size: u64) void {
+    if (size < min_block or (addr & 15) != 0) {
+        std.debug.print("[ps4heap] drop free block 0x{x} size 0x{x}\n", .{ addr, size });
+        return;
     }
-    // Merge with next.
-    if (cur != 0 and block + size == cur) {
-        writeHeader(block, size + readHeader(cur).size);
-        cur = getNext(cur);
+    for (free_nodes[0..free_count]) |node| {
+        if (addr < node.addr + node.size and node.addr < addr + size) {
+            std.debug.print("[ps4heap] double free / overlapping block 0x{x}\n", .{addr});
+            return;
+        }
     }
-    // Merge with prev. When prev absorbs block, prev's next must skip the
-    // absorbed node or it stays linked as a ghost whose header/next get
-    // overwritten once the merged region is allocated -> free-list corruption.
-    if (prev != 0 and prev + readHeader(prev).size == block) {
-        writeHeader(prev, readHeader(prev).size + readHeader(block).size);
-        setNext(prev, cur);
-    } else {
-        setNext(block, cur);
-        if (prev == 0) free_head = block else setNext(prev, block);
+    var i: usize = 0;
+    while (i < free_count and free_nodes[i].addr < addr) : (i += 1) {}
+    if (i < free_count and free_nodes[i].addr == addr) {
+        std.debug.print("[ps4heap] double free 0x{x}\n", .{addr});
+        return;
     }
+    if (i > 0 and free_nodes[i - 1].addr + free_nodes[i - 1].size == addr) {
+        free_nodes[i - 1].size += size;
+        if (i < free_count and free_nodes[i - 1].addr + free_nodes[i - 1].size == free_nodes[i].addr) {
+            free_nodes[i - 1].size += free_nodes[i].size;
+            removeFreeNodeLocked(i);
+        }
+        return;
+    }
+    if (i < free_count and addr + size == free_nodes[i].addr) {
+        free_nodes[i].addr = addr;
+        free_nodes[i].size += size;
+        return;
+    }
+    if (free_count == max_free_nodes) {
+        std.debug.print("[ps4heap] free node table full; leaking 0x{x}\n", .{addr});
+        return;
+    }
+    var j = free_count;
+    while (j > i) : (j -= 1) free_nodes[j] = free_nodes[j - 1];
+    free_nodes[i] = .{ .addr = addr, .size = size };
+    free_count += 1;
 }
 
 /// Allocate `size` user bytes with `alignment`. Lock held. Returns user ptr.
 fn allocLocked(size: u64, alignment: u64) u64 {
     const need = @max(alignUp(size + header_size, 16), min_block);
     while (true) {
-        var prev: u64 = 0;
-        var cur = free_head;
-        while (cur != 0) {
-            const bsize = readHeader(cur).size;
-            const next = getNext(cur);
+        var i: usize = 0;
+        while (i < free_count) : (i += 1) {
+            const cur = free_nodes[i].addr;
+            const bsize = free_nodes[i].size;
             // Aligned user address inside this block.
             const user = alignUp(cur + header_size, alignment);
             const pad = user - (cur + header_size);
-            if (bsize >= pad + need) {
-                // Unlink cur; reinsert leftovers through the normal path.
-                if (prev == 0) free_head = next else setNext(prev, next);
-                var acur = cur;
-                var asize = bsize;
-                if (pad >= min_block) {
-                    writeHeader(acur, pad);
-                    insertFreeLocked(acur);
-                    acur = user - header_size;
-                    asize = bsize - pad;
-                }
-                // If the header cannot sit 16 below the user pointer
-                // (tiny absorbed pad), the pad bytes leak inside this
-                // allocation: safe, just untracked.
-                const hpos = if (acur + header_size == user) acur else user - header_size;
-                const use = need;
-                const leftover = asize - (hpos - acur) - use;
-                if (leftover >= min_block) {
-                    writeHeader(hpos, (hpos - acur) + use);
-                    const tail = hpos + (hpos - acur) + use;
-                    writeHeader(tail, leftover);
-                    insertFreeLocked(tail);
-                } else {
-                    writeHeader(hpos, asize - (hpos - acur));
-                }
-                return user;
+            if (bsize < pad + need) continue;
+            // Unlink cur; reinsert leftovers through the normal path.
+            removeFreeNodeLocked(i);
+            var acur = cur;
+            var asize = bsize;
+            if (pad >= min_block) {
+                writeHeader(acur, pad);
+                insertFreeLocked(acur, pad);
+                acur = user - header_size;
+                asize = bsize - pad;
             }
-            prev = cur;
-            cur = next;
+            // If the header cannot sit 16 below the user pointer
+            // (tiny absorbed pad), the pad bytes leak inside this
+            // allocation: safe, just untracked.
+            const hpos = if (acur + header_size == user) acur else user - header_size;
+            const use = need;
+            const leftover = asize - (hpos - acur) - use;
+            if (leftover >= min_block) {
+                writeHeader(hpos, (hpos - acur) + use);
+                const tail = hpos + (hpos - acur) + use;
+                writeHeader(tail, leftover);
+                insertFreeLocked(tail, leftover);
+            } else {
+                writeHeader(hpos, asize - (hpos - acur));
+            }
+            return user;
         }
         if (!growLocked()) return 0;
     }
@@ -157,7 +174,7 @@ fn freeLocked(ptr: u64) void {
     const h = readHeader(ptr - header_size);
     if (h.magic != heap_magic) return;
     if (h.size < min_block or h.size > chunk_len) return;
-    insertFreeLocked(ptr - header_size);
+    insertFreeLocked(ptr - header_size, h.size);
 }
 
 fn heapLock() void {
@@ -336,4 +353,28 @@ pub const module = symbols.Module{ .name = "libc", .version_major = 1, .version_
 
 pub fn register(db: *symbols.Database, gpa: std.mem.Allocator) symbols.Error!void {
     try db.addLibrary(gpa, library, module, &exports);
+}
+
+test "free list merges neighbours and rejects duplicates/unaligned nodes" {
+    var arena: [256]u8 align(16) = undefined;
+    const base = @intFromPtr(&arena);
+    free_count = 0;
+    defer free_count = 0;
+
+    insertFreeLocked(base, 64);
+    try std.testing.expectEqual(@as(usize, 1), free_count);
+
+    insertFreeLocked(base + 64, 64);
+    try std.testing.expectEqual(@as(usize, 1), free_count);
+    try std.testing.expectEqual(@as(u64, 128), free_nodes[0].size);
+
+    insertFreeLocked(base + 64, 64); // duplicate
+    try std.testing.expectEqual(@as(usize, 1), free_count);
+
+    insertFreeLocked(base + 8, 16); // unaligned
+    try std.testing.expectEqual(@as(usize, 1), free_count);
+
+    insertFreeLocked(base + 160, 64); // disjoint, stays separate
+    try std.testing.expectEqual(@as(usize, 2), free_count);
+    try std.testing.expectEqual(base + 160, free_nodes[1].addr);
 }
