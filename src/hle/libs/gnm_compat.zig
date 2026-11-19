@@ -12,8 +12,9 @@
 //! `sceGnmSubmitAndFlipCommandBuffers` is the one hot path: PS4 GNM command
 //! buffers are GCN-era PM4, which the shared executor already walks. The PS4
 //! descriptor layout {addr[], size[]} is decoded here, then each buffer is
-//! handed to `agc_submit.submitDeviceStream` unchanged. Nothing in the shared
-//! executor knows this came from a PS4 title.
+//! sanitized (GCN register offsets outside the shared register files are
+//! dropped) and handed to `agc_submit.submitDeviceStream`. Nothing in the
+//! shared executor knows this came from a PS4 title.
 
 const std = @import("std");
 const abi = @import("../abi.zig");
@@ -22,7 +23,10 @@ const errno = @import("../errno.zig");
 const symbols = @import("../symbols.zig");
 const agc_submit = @import("agc_submit.zig");
 const kernel_memory = @import("kernel_memory.zig");
-const hits = @import("ps4_mode").hits;
+const kernel_event_queue = @import("kernel_event_queue.zig");
+const ps4_mode = @import("ps4_mode");
+const hits = ps4_mode.hits;
+const pm4_sanitize = ps4_mode.pm4_sanitize;
 
 /// Submit a PS4 GNM command buffer set through the shared AGC executor.
 ///
@@ -55,8 +59,40 @@ fn sceGnmSubmitAndFlipCommandBuffers(
         if (!kernel_memory.isGuestRangeAccessible(addr, bytes)) continue;
         const words: usize = bytes / 4;
         const stream: [*]const u32 = @ptrFromInt(addr);
-        _ = agc_submit.submitDeviceStream(stream[0..words]);
+        const slice = stream[0..words];
+
+        // PS4 GCN PM4 is not walkable by the shared RDNA2 parser as-is: an
+        // out-of-range SET_*_REG stops the queue, and a malformed body length
+        // hides the real packets (including draws) behind it. Rebuild a clean
+        // Type-3-only stream here, at the PS4 boundary; the shared executor's
+        // register-range check is never relaxed. Fall back to the original
+        // stream if the scratch buffer cannot be allocated.
+        const clean = std.heap.page_allocator.alloc(u32, words) catch {
+            _ = agc_submit.submitDeviceStream(slice);
+            submitted += 1;
+            continue;
+        };
+        defer std.heap.page_allocator.free(clean);
+        var stats: pm4_sanitize.Stats = .{};
+        const clean_words = pm4_sanitize.sanitize(slice, clean, &stats);
+        if (clean_words == 0) continue;
+        if (trace.announces("sceGnmSubmitAndFlipCommandBuffers") and
+            (stats.dropped_config | stats.dropped_context | stats.dropped_shader | stats.dropped_uconfig) != 0)
+        {
+            std.debug.print(
+                "[gnm submit] sanitized DCB {d}->{d} dwords (kept={d} cfg={d} ctx={d} sh={d} ucfg={d} skipped={d})\n",
+                .{ words, clean_words, stats.kept, stats.dropped_config, stats.dropped_context, stats.dropped_shader, stats.dropped_uconfig, stats.skipped_words },
+            );
+        }
+        _ = agc_submit.submitDeviceStream(clean[0..clean_words]);
         submitted += 1;
+    }
+    if (submitted != 0) {
+        // PS4 GNM owns the flip notification: titles register a VideoOut flip
+        // event and wait on it right after SubmitAndFlipCommandBuffers. The
+        // setup DCB carries no FLIP/RELEASE_MEM packet for the shared path to
+        // publish that edge, so deliver it here at the PS4 boundary.
+        _ = kernel_event_queue.triggerVideoOutFlip(0);
     }
     if (trace.announces("sceGnmSubmitAndFlipCommandBuffers")) {
         std.debug.print("[gnm submit] dcbs={d} submitted={d}\n", .{ dcb_count, submitted });
