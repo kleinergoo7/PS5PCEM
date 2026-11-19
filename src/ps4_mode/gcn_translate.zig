@@ -41,6 +41,15 @@ pub fn translateShader(allocator: std.mem.Allocator, stage: Stage, words: []cons
     var decoded = try gcn_decode.decodeToRdna2(allocator, words);
     defer decoded.deinit(allocator);
 
+    // Real Terraria vertex shaders use IMAGE_SAMPLE with implicit LOD for
+    // vertex texture fetches. The shared writer only permits level-zero /
+    // explicit LOD in the vertex stage, and GCN VTF is LOD 0 by definition.
+    if (stage == .vertex) {
+        for (decoded.program.instructions.items) |*inst| {
+            if (inst.opcode == .image_sample) inst.image_sample_flags.level_zero = true;
+        }
+    }
+
     var options = try buildOptions(allocator, stage, &decoded.program);
     defer options.deinit();
 
@@ -111,7 +120,7 @@ var vertex_spirv: ?[]u32 = null;
 var pixel_spirv: ?[]u32 = null;
 var diagnostic: ?Diagnostic = null;
 
-pub fn registerShader(stage: enum { vertex, pixel }, words: []const u32) void {
+pub fn registerShader(stage: Stage, words: []const u32) void {
     const allocator = std.heap.page_allocator;
     const copy = allocator.dupe(u32, words) catch return;
 

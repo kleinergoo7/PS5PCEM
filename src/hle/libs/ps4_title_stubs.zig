@@ -16,7 +16,9 @@ const std = @import("std");
 const abi = @import("../abi.zig");
 const trace = @import("../trace.zig");
 const symbols = @import("../symbols.zig");
-const shader_binding = @import("ps4_mode").shader_binding;
+const ps4_mode = @import("ps4_mode");
+const shader_binding = ps4_mode.shader_binding;
+const agc_submit = @import("agc_submit.zig");
 
 fn stubFunc() callconv(abi.guest) u64 {
     return 0;
@@ -27,12 +29,86 @@ const stub = trace.wrap("ps4-title-stub", &stubFunc);
 // PS4 shader binding: the GNM driver normally emits SH program-address packets
 // for these imports. Record the guest pointer at the PS4 boundary so the GNM
 // submit can inject those packets for the shared executor.
+//
+// On the first binding, locate the real OrbShdr GCN blobs Terraria ships in
+// its eboot image and register a VS/PS pair with the GCN->SPIR-V translator.
+// The shader-set arguments are zeroed descriptors, not shader code, so we
+// scan the known eboot region for the `OrbShdr\x07` magic instead.
+var real_shaders_attempted: bool = false;
+
+const eboot_scan_base: u64 = 0x50a800;
+const eboot_scan_len: usize = 0x1600; // covers 0x50a800 .. 0x50be00
+
+/// Infer shader stage from EXP targets: POS0(0x0c)/PARAM(>=0x20) exports
+/// mean vertex, MRT0..7 (<8) means pixel. The OrbShdr header stage field
+/// does not agree with the ISA for all dumped blobs.
+fn stageFromIsa(words: []const u32) ?ps4_mode.gcn_translate.Stage {
+    var has_vertex_export = false;
+    var has_pixel_export = false;
+    for (words) |w| {
+        if ((w >> 26) != 0x3e) continue;
+        const target = (w >> 4) & 0x3f;
+        if (target == 0x0c or target >= 0x20) has_vertex_export = true;
+        if (target < 8) has_pixel_export = true;
+    }
+    if (has_vertex_export and !has_pixel_export) return .vertex;
+    if (has_pixel_export and !has_vertex_export) return .pixel;
+    return null;
+}
+
+fn registerRealShaderAt(address: u64) bool {
+    var bytes: [2048]u8 = undefined;
+    if (!agc_submit.readGuestMemory(null, address, &bytes)) return false;
+    const parsed = ps4_mode.gcn_blob.parse(&bytes) catch return false;
+    const isa = ps4_mode.gcn_blob.isaBytes(&bytes, parsed);
+    if (isa.len == 0 or isa.len % 4 != 0) return false;
+    var words: [512]u32 = undefined;
+    const count = isa.len / 4;
+    if (count > words.len) return false;
+    for (0..count) |i| words[i] = std.mem.readInt(u32, isa[i * 4 ..][0..4], .little);
+    const stage = stageFromIsa(words[0..count]) orelse return false;
+    ps4_mode.gcn_translate.registerShader(stage, words[0..count]);
+    return ps4_mode.gcn_translate.lastDiagnostic() == null;
+}
+
+fn tryRegisterRealShaders() void {
+    if (@atomicLoad(bool, &real_shaders_attempted, .monotonic)) return;
+    @atomicStore(bool, &real_shaders_attempted, true, .monotonic);
+
+    var region: [eboot_scan_len]u8 = undefined;
+    if (!agc_submit.readGuestMemory(null, eboot_scan_base, &region)) return;
+    const magic = "OrbShdr\x07";
+    var vs_ok = false;
+    var ps_ok = false;
+    var cursor: usize = 0;
+    while (cursor + magic.len <= region.len) : (cursor += 4) {
+        if (!std.mem.eql(u8, region[cursor .. cursor + magic.len], magic)) continue;
+        const address = eboot_scan_base + cursor;
+        var bytes: [2048]u8 = undefined;
+        if (!agc_submit.readGuestMemory(null, address, &bytes)) continue;
+        const parsed = ps4_mode.gcn_blob.parse(&bytes) catch continue;
+        const isa = ps4_mode.gcn_blob.isaBytes(&bytes, parsed);
+        var words: [512]u32 = undefined;
+        const count = isa.len / 4;
+        if (count == 0 or count > words.len) continue;
+        for (0..count) |i| words[i] = std.mem.readInt(u32, isa[i * 4 ..][0..4], .little);
+        const stage = stageFromIsa(words[0..count]) orelse continue;
+        if ((stage == .vertex and vs_ok) or (stage == .pixel and ps_ok)) continue;
+        ps4_mode.gcn_translate.registerShader(stage, words[0..count]);
+        if (ps4_mode.gcn_translate.lastDiagnostic() != null) continue;
+        if (stage == .vertex) vs_ok = true else ps_ok = true;
+        if (vs_ok and ps_ok) break;
+    }
+}
+
 fn setPsShader(shader: u64) callconv(abi.guest) void {
     shader_binding.setPixelShader(shader);
+    tryRegisterRealShaders();
 }
 
 fn setVsShader(shader: u64) callconv(abi.guest) void {
     shader_binding.setVertexShader(shader);
+    tryRegisterRealShaders();
 }
 
 const shader_exports = [_]symbols.Export{

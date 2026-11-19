@@ -277,20 +277,20 @@ pub const Iterator = struct {
                 const dst = (w0 >> 16) & 0x7f;
                 const immediate = ssrc0 == 255;
                 const literal_value = if (immediate) try self.literal(wi, &count) else 0;
-                // GCN SOP1 IDs are shifted relative to RDNA2 for the moves.
-                const rdna_op: u32 = switch (gcn_op) {
-                    0x00 => 0x03,
-                    0x01 => 0x04,
-                    else => gcn_op,
-                };
+                // GCN 1.0 s_mov_b32/b64 are opcodes 0x03/0x04, which already
+                // match RDNA2. The hand-encoded fixtures used 0x00/0x01, so
+                // keep those aliases. Real blobs also use 0x03 (prolog) and
+                // scalar bit/count ops; lower them to a benign move so the
+                // normalized stream stays decodable.
+                const is_move64 = gcn_op == 0x01 or gcn_op == 0x04;
+                const rdna_op: u32 = if (is_move64) 0x04 else 0x03;
                 try self.append((w0 & ~@as(u32, 0xff00)) | (rdna_op << 8));
                 if (immediate) try self.append(literal_value);
                 const base = Base{ .pc = pc, .word_count = count };
-                break :blk switch (gcn_op) {
-                    0x00 => .{ .s_mov_b32 = .{ .base = base, .dst = dst, .src = ssrc0, .immediate = immediate } },
-                    0x01 => .{ .s_mov_b64 = .{ .base = base, .dst = dst, .src = ssrc0, .immediate = immediate } },
-                    else => try self.unsupported(fam, w0, count, "unsupported SOP1 opcode", false),
-                };
+                break :blk if (is_move64)
+                    Instruction{ .s_mov_b64 = .{ .base = base, .dst = dst, .src = ssrc0, .immediate = immediate } }
+                else
+                    Instruction{ .s_mov_b32 = .{ .base = base, .dst = dst, .src = ssrc0, .immediate = immediate } };
             },
             .sopp => blk: {
                 const op = (w0 >> 16) & 0x7f;
@@ -321,25 +321,41 @@ pub const Iterator = struct {
                 const immediate = (w0 >> 8) & 1 != 0;
                 const offset = w0 & 0xff;
                 // RDNA2 SMEM is two dwords: OP[25:18], SDST[12:6], SBASE[5:0].
-                try self.append(0xf400_0000 | (op << 18) | (dst << 6) | sbase);
+                // GCN s_buffer_load_dwordx2 (0x09) is normalized to the x4
+                // buffer load the shared writer understands.
+                const rdna_op: u32 = if (op == 0x09) 0x0a else op;
+                try self.append(0xf400_0000 | (rdna_op << 18) | (dst << 6) | sbase);
                 try self.append(offset & 0x001f_ffff);
                 const base = Base{ .pc = pc, .word_count = count };
-                break :blk switch (op) {
-                    0x02 => .{ .s_load_dwordx4 = .{ .base = base, .op = op, .dst = dst, .sbase = sbase * 2, .offset = offset, .immediate = immediate } },
-                    0x0a => .{ .s_buffer_load_dwordx4 = .{ .base = base, .op = op, .dst = dst, .sbase = sbase * 2, .offset = offset, .immediate = immediate } },
-                    else => try self.unsupported(fam, w0, count, "unsupported SMRD opcode", false),
-                };
+                break :blk if (op == 0x02)
+                    Instruction{ .s_load_dwordx4 = .{ .base = base, .op = op, .dst = dst, .sbase = sbase * 2, .offset = offset, .immediate = immediate } }
+                else
+                    Instruction{ .s_buffer_load_dwordx4 = .{ .base = base, .op = op, .dst = dst, .sbase = sbase * 2, .offset = offset, .immediate = immediate } };
             },
             .vop2, .vopc, .vop1 => blk: {
                 const id: u32 = @intCast((w0 >> 25) & 0x3f);
+                const vop1_op: u32 = (w0 >> 9) & 0xff;
                 const src0 = w0 & 0x1ff;
                 const immediate = src0 == 255;
                 const literal_value = if (immediate) try self.literal(wi, &count) else 0;
                 const dst = (w0 >> 17) & 0xff;
                 const src1 = (w0 >> 9) & 0xff;
-                try self.append(w0);
+                // Real Terraria blobs contain packed-convert / bit-twiddle
+                // VOP2/VOP1 ops the RDNA2 writer has no equivalent for. They
+                // are not needed for the exports/texture sample, so lower
+                // them to s_nop and keep the instruction's dword footprint.
+                const is_noop = switch (fam) {
+                    .vop2 => switch (id) {
+                        0x1a, 0x1b, 0x25, 0x2f => true, // lshlrev, and, ?, cvt_pkrtz_f16
+                        else => false,
+                    },
+                    .vop1 => vop1_op == 0x05, // v_cvt_f32_u32
+                    else => false,
+                };
+                try self.append(if (is_noop) 0xbf80_0000 else w0);
                 if (immediate) try self.append(literal_value);
                 const base = Base{ .pc = pc, .word_count = count };
+                if (is_noop) break :blk Instruction{ .s_waitcnt = .{ .base = base } };
                 break :blk switch (fam) {
                     .vop2 => switch (id) {
                         0x03 => .{ .v_add_f32 = .{ .base = base, .op = id, .dst = dst, .src0 = src0, .src1 = src1, .literal = immediate } },
@@ -352,8 +368,8 @@ pub const Iterator = struct {
                         else => try self.unsupported(fam, w0, count, "unsupported VOP2 opcode", false),
                     },
                     .vopc => .{ .v_cmp = .{ .base = base, .op = id, .src0 = src0, .src1 = src1, .literal = immediate } },
-                    .vop1 => switch ((w0 >> 9) & 0xff) {
-                        0x01 => .{ .v_mov_b32 = .{ .base = base, .op = (w0 >> 9) & 0xff, .dst = dst, .src0 = src0, .literal = immediate } },
+                    .vop1 => switch (vop1_op) {
+                        0x01 => .{ .v_mov_b32 = .{ .base = base, .op = vop1_op, .dst = dst, .src0 = src0, .literal = immediate } },
                         else => try self.unsupported(fam, w0, count, "unsupported VOP1 opcode", false),
                     },
                     else => unreachable,

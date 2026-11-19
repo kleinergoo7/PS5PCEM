@@ -35,6 +35,7 @@ pub const bridge = @import("bridge.zig");
 pub const gcn_lower = @import("gcn_lower.zig");
 pub const gcn_decode = @import("gcn_decode.zig");
 pub const gcn_translate = @import("gcn_translate.zig");
+pub const gcn_real_blob_test = @import("gcn_real_blob_test.zig");
 pub const audio_np = @import("audio_np.zig");
 pub const submit = @import("submit.zig");
 pub const game_hook = @import("game_hook.zig");
@@ -73,6 +74,7 @@ test {
     _ = gcn_lower;
     _ = gcn_decode;
     _ = gcn_translate;
+    _ = gcn_real_blob_test;
     _ = audio_np;
     _ = submit;
     _ = game_hook;
