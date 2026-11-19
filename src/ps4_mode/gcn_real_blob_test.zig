@@ -431,15 +431,48 @@ test "VINTRP attr without a VS PARAM export reports null, never a guessed input"
 }
 
 test "no synthetic corner fallback in PS4 vertex path" {
-    registerShaderFor(program, .vertex, &vs_words);
-    registerShaderFor(program, .pixel, &ps_words);
+    // Correct stage mapping: ps_words exports POS0/PARAM0 (VS); vs_words
+    // exports MRT0 with an image sample (PS).
     const res = capture(&real_terraria_dcb).draws[0];
     const src = vertexDataSourceFor(res).?;
     try std.testing.expect(src.address != 0);
     try std.testing.expect(src.size_bytes > 0);
+    gcn_translate.registerShaderForWithVertexSource(program, .vertex, &ps_words, src);
+    registerShaderFor(program, .pixel, &vs_words);
     const spirv = translatedGraphicsFor(program).?.vertex_words;
     try std.testing.expect(!syntheticCornerSequence(spirv));
     try std.testing.expect(positionTracesToStorageBufferLoad(spirv));
+}
+
+test "real VS POS0 reads the staged V# indexed by the draw's sequential VertexIndex" {
+    // The classification-accurate VS (ps_words) must contain the reconstructed
+    // four-component V# fetch, indexed by v4 (the sequential VertexIndex), not
+    // a synthetic quad corner.
+    var decoded = try gcn_decode.decodeVertexToRdna2(std.testing.allocator, &ps_words);
+    defer decoded.deinit(std.testing.allocator);
+    var fetch_count: usize = 0;
+    for (decoded.program.instructions.items) |inst| {
+        if (inst.opcode != .buffer_load_format_xyzw) continue;
+        fetch_count += 1;
+        try std.testing.expect(inst.index_enable);
+        try std.testing.expectEqual(@as(u32, 4), inst.src0.reg); // vaddr = v4
+        try std.testing.expectEqual(@as(u32, 4), inst.src1.reg); // V# at descriptor 0
+    }
+    try std.testing.expectEqual(@as(usize, 1), fetch_count);
+
+    const res = capture(&real_terraria_dcb).draws[0];
+    gcn_translate.registerShaderForWithVertexSource(program, .vertex, &ps_words, vertexDataSourceFor(res));
+    registerShaderFor(program, .pixel, &vs_words);
+    const spirv = translatedGraphicsFor(program).?.vertex_words;
+    // BuiltIn VertexIndex (decoration 11 / value 42) is present in the VS.
+    var has_vertex_index = false;
+    var i: usize = 5;
+    while (i + 3 < spirv.len) {
+        const wc: usize = spirv[i] >> 16;
+        if (wc >= 4 and (spirv[i] & 0xffff) == 71 and spirv[i + 2] == 11 and spirv[i + 3] == 42) has_vertex_index = true;
+        i += @max(wc, 1);
+    }
+    try std.testing.expect(has_vertex_index);
 }
 
 test "vertexDataSourceFor reports null with a diagnostic when no VS V# exists" {

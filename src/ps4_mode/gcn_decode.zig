@@ -529,6 +529,41 @@ pub fn decodeToRdna2(allocator: std.mem.Allocator, words: []const u32) Error!Rdn
     return .{ .program = program, .normalized = owned };
 }
 
+/// PS4 vertex front-end. Terraria's captured VS exports POS0 directly from
+/// VGPRs whose original attribute fetch is absent from the dumped ISA (its
+/// prolog words are packed bit-twiddles the GCN decoder cannot map). Supply the
+/// fetch from the guest V# the backend stages at descriptor 0: a four-component
+/// MUBUF indexed by VertexIndex (v4) into v0..v3, inserted immediately before
+/// the POS0 export. The positions are real bytes from the captured V#, never
+/// synthesized quad corners.
+pub fn decodeVertexToRdna2(allocator: std.mem.Allocator, words: []const u32) Error!Rdna2Program {
+    const fetch = [2]u32{
+        0xe00c_2000, // MUBUF op 0x03 (load_format_xyzw), idxen, offset 0
+        0x7d01_0004, // SOFFSET=null, srsrc=1 (V# -> RDNA2 s4), dst=v0, vaddr=v4
+    };
+    var normalized: std.ArrayList(u32) = .empty;
+    errdefer normalized.deinit(allocator);
+    var it = decodeWithAllocator(allocator, words);
+    it.normalized = &normalized;
+    var injected = false;
+    while (true) {
+        const before = normalized.items.len;
+        const inst = (try it.next()) orelse break;
+        if (!injected) {
+            switch (inst) {
+                .exp => |e| if (e.target == 0x0c) {
+                    try normalized.insertSlice(allocator, before, &fetch);
+                    injected = true;
+                },
+                else => {},
+            }
+        }
+    }
+    const owned = try normalized.toOwnedSlice(allocator);
+    const program = rdna2.decodeProgram(allocator, owned) catch return Error.UnsupportedInstruction;
+    return .{ .program = program, .normalized = owned };
+}
+
 // ---- encoding helpers (used by tests and by future shader captures) ----
 
 pub fn vop2(op: u32, dst: u32, src1: u32, src0: u32) u32 {
