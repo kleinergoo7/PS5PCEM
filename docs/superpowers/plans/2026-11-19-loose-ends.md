@@ -109,7 +109,7 @@ Stage 2 briefs are written by the coordinator from the matching Stage 1 verdict.
 - [ ] **Step 1:** Run `zig build test-hle` and confirm the named `kernel_memory` test fails on the `sceKernelVirtualQuery` expectation for a pure non-pooled reservation.
 - [ ] **Step 2:** Apply the minimal root-cause fix named in Task 2's verdict: expect `KernelError.eacces.raw()` at `src/hle/libs/kernel_memory.zig:3929-3933`.
 - [ ] **Step 3:** Run `zig build test-hle`; expect that test green and no new failures. The other real failure is the host-dependent pad `ABS_X` test (a live DS4 axis read `129` instead of `128`), pinned by Task 7 via a test-only scripted-input helper in `src/input/root.zig` consumed by `src/hle/libs/pad.zig`.
-- [ ] **Step 4:** Commit only that file: `git commit -m "fix(hle): accept batch map with zero base and offset"`.
+- [ ] **Step 4:** Commit only that file: `git commit -m "fix(hle): align virtual query test with reservation visibility"`. (The literal commit message from the original brief is preserved in git history; this line reflects the corrected root cause.)
 
 ### Task 7: Fix pad primary-user port
 
