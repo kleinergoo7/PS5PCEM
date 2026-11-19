@@ -134,6 +134,98 @@ fn constantUvOnly(words: []const u32) bool {
     return false;
 }
 
+/// Positive guest-UV check: an Input at `location` is declared, its X/Y are
+/// extracted from an OpLoad and composed into the coordinate consumed by an
+/// image sample. This proves interpolation is wired, not merely that a
+/// constant UV is absent.
+fn inputFeedsImageSampleCoordinate(words: []const u32, location: u32) bool {
+    var inputs: [16]u32 = undefined;
+    var ninputs: usize = 0;
+    for (words, 0..) |word, i| {
+        if (word != 0x0004_0047 or i + 3 >= words.len) continue; // OpDecorate
+        if (words[i + 2] != 30 or words[i + 3] != location) continue; // Location
+        const id = words[i + 1];
+        var is_input = false;
+        for (words, 0..) |vword, j| {
+            // OpVariable <type> <id> Input(1): distinguish from Location-0 color output.
+            if (vword == 0x0004_003b and j + 3 < words.len and words[j + 2] == id and words[j + 3] == 1) {
+                is_input = true;
+                break;
+            }
+        }
+        if (is_input and ninputs < inputs.len) {
+            inputs[ninputs] = id;
+            ninputs += 1;
+        }
+    }
+    if (ninputs == 0) return false;
+
+    var loads: [16]u32 = undefined;
+    var nloads: usize = 0;
+    for (words, 0..) |word, i| {
+        if (word != 0x0004_003d or i + 3 >= words.len) continue; // OpLoad
+        for (inputs[0..ninputs]) |input| {
+            if (words[i + 3] == input and nloads < loads.len) {
+                loads[nloads] = words[i + 2];
+                nloads += 1;
+                break;
+            }
+        }
+    }
+
+    var xs: [16]u32 = undefined;
+    var nxs: usize = 0;
+    var ys: [16]u32 = undefined;
+    var nys: usize = 0;
+    for (words, 0..) |word, i| {
+        if (word != 0x0005_0051 or i + 4 >= words.len) continue; // OpCompositeExtract
+        var from_load = false;
+        for (loads[0..nloads]) |load| {
+            if (words[i + 3] == load) {
+                from_load = true;
+                break;
+            }
+        }
+        if (!from_load) continue;
+        if (words[i + 4] == 0 and nxs < xs.len) {
+            xs[nxs] = words[i + 2];
+            nxs += 1;
+        }
+        if (words[i + 4] == 1 and nys < ys.len) {
+            ys[nys] = words[i + 2];
+            nys += 1;
+        }
+    }
+
+    var coordinates: [16]u32 = undefined;
+    var ncoords: usize = 0;
+    for (words, 0..) |word, i| {
+        if (word != 0x0005_0050 or i + 4 >= words.len) continue; // OpCompositeConstruct
+        var has_x = false;
+        var has_y = false;
+        for (xs[0..nxs]) |x| if (words[i + 3] == x) {
+            has_x = true;
+            break;
+        };
+        for (ys[0..nys]) |y| if (words[i + 4] == y) {
+            has_y = true;
+            break;
+        };
+        if (has_x and has_y and ncoords < coordinates.len) {
+            coordinates[ncoords] = words[i + 2];
+            ncoords += 1;
+        }
+    }
+    if (ncoords == 0) return false;
+
+    for (words, 0..) |word, i| {
+        const op = word & 0xffff;
+        if ((op != 87 and op != 88) or i + 4 >= words.len) continue; // image sample
+        for (coordinates[0..ncoords]) |coord| if (words[i + 4] == coord) return true;
+    }
+    return false;
+}
+
 test "real PS fragment inputs come from VS PARAM exports and VINTRP attrs" {
     // The embedded arrays are named after the OrbShdr header stage field, but
     // the runtime classifies by EXP target (ps4_title_stubs.stageFromIsa): the
@@ -146,7 +238,16 @@ test "real PS fragment inputs come from VS PARAM exports and VINTRP attrs" {
     try std.testing.expectEqual(@as(u32, 1), inputs.allocated); // VS PARAM0 -> bit 0
     try std.testing.expectEqual(inputs.allocated, inputs.enabled);
     const graphics = translatedGraphicsFor(program) orelse return error.TestExpectedGraphics;
+    // Positive: the VS PARAM0 Input at Location 0 feeds the image-sample UV.
+    try std.testing.expect(inputFeedsImageSampleCoordinate(graphics.fragment_words, 0));
+    // Secondary guard: no two-constant fallback UV.
     try std.testing.expect(!constantUvOnly(graphics.fragment_words));
+}
+
+test "input-fed UV is PS4-gated: standalone pixel translation has no such Input" {
+    const standalone = try gcn_translate.translateShader(std.testing.allocator, .pixel, &vs_words);
+    defer std.testing.allocator.free(standalone);
+    try std.testing.expect(!inputFeedsImageSampleCoordinate(standalone, 0));
 }
 
 test "VINTRP attr without a VS PARAM export reports null, never a guessed input" {

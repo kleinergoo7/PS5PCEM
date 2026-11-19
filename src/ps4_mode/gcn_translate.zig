@@ -183,10 +183,8 @@ fn buildOptions(allocator: std.mem.Allocator, stage: Stage, program: *const rdna
     // storage buffer (2 + maximum_storage_images); the fragment stage uses a
     // disjoint value_base so writeGraphicsScalarValues can fill both stages.
     const fragment_words_per_stage: u32 = 512 * 16 + 128 * 2;
-    const inputs = if (stage == .pixel and fragment_inputs != null)
-        fragment_inputs.?
-    else
-        FragmentInputs{ .allocated = 0b11, .enabled = 0b11 };
+    const derived_inputs = if (stage == .pixel) fragment_inputs else null;
+    const inputs = derived_inputs orelse FragmentInputs{ .allocated = 0b11, .enabled = 0b11 };
     builder.options = .{
         .stage = if (stage == .vertex) .vertex else .fragment,
         .sampled_images = builder.images.items,
@@ -195,6 +193,12 @@ fn buildOptions(allocator: std.mem.Allocator, stage: Stage, program: *const rdna
             .allocated = @intCast(inputs.allocated),
             .enabled = @intCast(inputs.enabled),
         },
+        // The lowest exported PARAM slot is the guest UV. Only set for a
+        // registered pair with a real VS PARAM export, never on PS5/native.
+        .ps4_sample_coordinate_location = if (derived_inputs != null and inputs.allocated != 0)
+            @intCast(@ctz(inputs.allocated))
+        else
+            null,
         .scalar_registers = slots,
         .vertex_corner_vgprs = if (stage == .vertex) .{ 2, 3 } else null,
         .vertex_position_corner_override = stage == .vertex,

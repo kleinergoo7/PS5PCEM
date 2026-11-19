@@ -449,6 +449,11 @@ pub const Options = struct {
     /// interface is unavailable. The backend supplies the active color target.
     fragment_extent: [2]u32 = .{ 1280, 720 },
     fragment_inputs: FragmentInputs = .{},
+    /// PS4-only: VINTRP ATTR / VS PARAM slot whose interpolated vec4 drives
+    /// 2D image-sample coordinates. The Input is declared at this Location so
+    /// the paired VS PARAM export supplies it; null leaves every native path
+    /// (and normal VINTRP lowering) unchanged.
+    ps4_sample_coordinate_location: ?u8 = null,
     layered_rendering: bool = false,
     /// Optional host feature for raw per-vertex attributes and manual VINTRP.
     allow_fragment_barycentric: bool = false,
@@ -1133,6 +1138,7 @@ const Builder = struct {
     frag_coord_input: u32 = 0,
     front_face_input: u32 = 0,
     fragment_inputs: FragmentInputs,
+    ps4_sample_coordinate_location: ?u8 = null,
     storage_bindings: []const StorageBufferBinding,
     scalar_memory_bindings: []const ScalarMemoryBinding,
     flat_memory_bindings: []const FlatMemoryBinding,
@@ -1336,6 +1342,7 @@ const Builder = struct {
             .scalarize_ballot_first = options.scalarize_ballot_first,
             .fragment_extent = options.fragment_extent,
             .fragment_inputs = options.fragment_inputs,
+            .ps4_sample_coordinate_location = options.ps4_sample_coordinate_location,
             .fragment_quad_broadcasts = options.fragment_quad_broadcasts,
             .fragment_per_vertex_mask = options.fragment_per_vertex_mask,
             .fragment_custom_interpolation_mask = options.fragment_custom_interpolation_mask,
@@ -7545,6 +7552,24 @@ const Builder = struct {
                 }
             } else {
                 try self.emit(&self.body, 80, &.{ try self.ensureFloatVec2(), coordinates, coordinate_x, coordinate_y });
+            }
+        }
+        // PS4-only: use the interpolated VS PARAM Input as the sample UV rather
+        // than the host-updated scalar address VGPRs. Default-off for natives.
+        if (self.ps4_sample_coordinate_location) |location| {
+            if (self.stage == .fragment and image_dimension == .two_d and
+                !one_dimensional and !one_dimensional_array)
+            {
+                const variable = self.parameter_variables[location];
+                if (variable == 0) return Error.InvalidStageInterface;
+                const vector = self.id();
+                try self.emit(&self.body, 61, &.{ self.vector4_type, vector, variable }); // OpLoad
+                const u = self.id();
+                const v = self.id();
+                try self.emit(&self.body, 81, &.{ self.float_type, u, vector, 0 }); // OpCompositeExtract
+                try self.emit(&self.body, 81, &.{ self.float_type, v, vector, 1 });
+                coordinates = self.id();
+                try self.emit(&self.body, 80, &.{ try self.ensureFloatVec2(), coordinates, u, v }); // OpCompositeConstruct
             }
         }
         const sampled_image = try self.loadSampledImage(binding, inst);
@@ -13944,6 +13969,14 @@ fn translateInstructions(
     for (effective.ngg_lds_exports) |ngg_export| {
         if (effective.stage == .vertex and effective.vertex_parameter_sources.len == 0 and ngg_export.target >= 0x20 and ngg_export.target < 0x40) {
             effective.parameter_mask |= @as(u32, 1) << @intCast(ngg_export.target - 0x20);
+        }
+    }
+    // PS4 PS with no VINTRP: still declare the VS PARAM slot the backend
+    // identified so the image sample can consume its interpolated value.
+    if (effective.stage == .fragment) {
+        if (effective.ps4_sample_coordinate_location) |location| {
+            if (location >= 32) return Error.InvalidStageInterface;
+            effective.parameter_mask |= @as(u32, 1) << @intCast(location);
         }
     }
     for (instructions) |candidate| {
