@@ -1,7 +1,7 @@
 # Correctly rendered first frame for PS4 Terraria — design
 
 Date: 2026-11-19
-Status: DRAFT (awaiting builder check and partner approval)
+Status: AWAITING APPROVAL (builder check complete; settlements recorded below)
 
 ## Intent
 
@@ -153,6 +153,38 @@ asserts the right set is selected for each program pair.
   materialized target, a multi-colored window capture (not one flat color),
   and the same result on three consecutive runs.
 - Full `zig build test` must remain green; PS5-gate tests unchanged.
+
+## Settled by the builder check
+
+These were the five open questions from the builder review; each is settled
+here so the plan does not have to guess.
+
+1. **What counts as "the first frame" (my call):** all draws submitted before
+   the first presented flip — in the captured fixture that is the single
+   790-dword DCB containing **two** `DRAW_INDEX_AUTO` draws with different
+   PS T#s. "Correct" means both draws are composed into that frame, not just
+   the one sampling the 1920×1080 texture. The hermetic test covers both.
+2. **Authoritative program identity (my call):** the program addresses bound
+   at draw time (`shader_binding.programs()` / SH registers `0x008/0x048`),
+   not "the first OrbShdr blob found by a scan". Resource capture is tagged
+   with the program pair active for its DCB, and blob selection must match
+   that pair; a wrong-pair match is a correctness bug, not a fallback.
+3. **Black-frame nondeterminism (my call):** robust fix regardless of whether
+   the cause is keying or a submit/execute race — carry resources with the
+   submission/draw instead of reading a global `captured()` that `publish`
+   overwrites per DCB. Remove last-DCB-wins from the final path. A short
+   diagnostic in the plan confirms which cause dominated, but the design does
+   not depend on the answer.
+4. **Hermetic test scope (my call):** structural assertions only — correct
+   T#/V# set selected per draw, deterministic program-pair key, VINTRP-derived
+   fragment inputs with no constant UV, real topology/vertex count. Pixel-level
+   "real textured content" is verified from the live first-frame PPM/window
+   histogram, where guest texture bytes actually exist. The test does not
+   embed a software texture sampler.
+5. **Vertex staging and topology (my call):** the plan includes the explicit
+   guest-V# → `StorageBufferBinding` staging step; without it positions stay
+   synthetic. `DRAW_INDEX_AUTO count=4` is treated as four non-indexed
+   vertices, confirmed against the draw packet before relying on it.
 
 ## What is left to the builder
 
