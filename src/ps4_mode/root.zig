@@ -17,6 +17,7 @@ pub const detector = @import("detector.zig");
 pub const gcn_header = @import("gcn_header.zig");
 pub const gnm_packets = @import("gnm_packets.zig");
 pub const pm4_sanitize = @import("pm4_sanitize.zig");
+pub const shader_binding = @import("shader_binding.zig");
 pub const image_layout = @import("image_layout.zig");
 pub const compat_hle = @import("compat_hle.zig");
 pub const runtime = @import("runtime.zig");
@@ -49,6 +50,7 @@ test {
     _ = gcn_header;
     _ = gnm_packets;
     _ = pm4_sanitize;
+    _ = shader_binding;
     _ = image_layout;
     _ = compat_hle;
     _ = runtime;

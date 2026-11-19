@@ -40,6 +40,9 @@ pub export var capture_storage_flip: u64 = 0;
 pub export var capture_storage_address: u64 = 0;
 pub export var capture_storage_bytes: u64 = 0;
 pub export var capture_compute_sampled_images: bool = false;
+/// PS4 GNM compat is on. Set by game-run only when a PS4 title is detected;
+/// every use of it below is PS4-gated, so the native PS5 path is unchanged.
+pub export var ps4_compat_enabled: bool = false;
 // Run generic BVH kernels (IMAGE_BVH_INTERSECT_RAY) through checked
 // software traversal: the referenced TLAS/BLAS ranges are snapshotted and an
 // unmapped node is recorded as a runtime fault rather than read. Without it
@@ -25742,6 +25745,36 @@ pub const Renderer = struct {
         );
     }
 
+    /// PS4-only first-frame fallback. Render the existing fixed-color probe
+    /// shader into the guest's own decoded color target (not the 64x64 probe
+    /// framebuffer), so the normal materialization/readback path captures it.
+    fn drawPs4FixedColor(self: *Renderer, state: *const gpu.State, draw: GuestDraw) anyerror!void {
+        const render_state = gpu.resources.decodeRenderState(state);
+        var target: ?GuestColorTarget = null;
+        for (render_state.color_targets) |candidate| {
+            const color = candidate orelse continue;
+            if (!color.isActive()) continue;
+            target = guestColorTarget(color) catch continue;
+            break;
+        }
+        const guest_target = target orelse return Error.UnsupportedColorTarget;
+        try self.beginFrameDraw();
+        try self.drawGraphicsShaders(
+            &graphics_probe_vertex_spirv,
+            &graphics_probe_fragment_spirv,
+            &.{},
+            &.{},
+            GraphicsPipelineState.default(guest_target.descriptor.width, guest_target.descriptor.height),
+            guest_target,
+            &.{},
+            null,
+            false,
+            false,
+            false,
+            draw,
+        );
+    }
+
     const PreparedTessellation = struct {
         config: gpu.tessellation.Config,
         factors: gpu.BufferDescriptor,
@@ -41042,6 +41075,16 @@ pub const Renderer = struct {
         return null;
     }
 
+    /// PS4-only: GCN programs bound through the GNM shader-set imports cannot
+    /// be decoded by the shared AGC path. With compat on, replay a bound VS/PS
+    /// pair with the fixed-color probe shader so a real guest frame lands in
+    /// the materialized render target. PS5 draws never take this branch.
+    fn wantsPs4FixedColorDraw(state: *const gpu.State) bool {
+        if (!ps4_compat_enabled) return false;
+        return graphicsVertexStage(state) != null and
+            gpu.resources.ShaderStage.pixel.programAddress(state) != null;
+    }
+
     /// Shader translation failures are keyed by program and stage. A command
     /// buffer may issue the same unsupported draw thousands of times; printing
     /// the full disassembly for each one can cost more wall time than the GPU.
@@ -41370,7 +41413,8 @@ pub const Renderer = struct {
             "[vulkan stall] end draw={d} elapsed_ms={d}\n",
             .{ self.frame_profile.draws, elapsedHostNanoseconds(profile_started) / std.time.ns_per_ms },
         );
-        if (!has_vertex and !has_fragment and !self.graphics_probe_enabled) return true;
+        const ps4_fixed_color = wantsPs4FixedColorDraw(state);
+        if (!has_vertex and !has_fragment and !self.graphics_probe_enabled and !ps4_fixed_color) return true;
 
         const direct = decodeDirectGuestDraw(packet, state);
         var indirect_spec: gpu.pm4.IndirectDrawSpec = undefined;
@@ -41571,6 +41615,21 @@ pub const Renderer = struct {
                         self.excessive_draw_reports += 1;
                     }
                     self.last_draw_error = null;
+                    continue;
+                }
+                if (ps4_fixed_color) {
+                    self.drawPs4FixedColor(state, draw) catch |err| {
+                        self.last_draw_error = err;
+                        if (self.shouldReportDrawError(err)) {
+                            std.debug.print(
+                                "[vulkan dcb] PS4 fixed-color draw failed: {s}\n",
+                                .{@errorName(err)},
+                            );
+                        }
+                        return true;
+                    };
+                    self.guest_graphics_draws += 1;
+                    self.translated_draws += 1;
                     continue;
                 }
                 if (self.capture_extended_progress_frames and
@@ -49284,6 +49343,29 @@ const smoke_compute_spirv = [_]u32{
     0x0000_0001, 0x0005_0036, 0x0000_0001, 0x0000_0003, 0x0000_0000,
     0x0000_0002, 0x0002_00f8, 0x0000_0004, 0x0001_00fd, 0x0001_0038,
 };
+
+test "PS5 draws never take the PS4 fixed-color fallback" {
+    const previous = ps4_compat_enabled;
+    defer ps4_compat_enabled = previous;
+
+    var state = gpu.State{};
+    try state.writeRegister(.shader, 0x008, 0x1234);
+    try state.writeRegister(.shader, 0x009, 0);
+    try state.writeRegister(.shader, 0x048, 0x5678);
+    try state.writeRegister(.shader, 0x049, 0);
+    try std.testing.expect(gpu.resources.ShaderStage.pixel.programAddress(&state) != null);
+
+    // PS5: even with both program registers bound, the fallback is off and the
+    // native guest-draw path is the only one that can run.
+    ps4_compat_enabled = false;
+    try std.testing.expect(!Renderer.wantsPs4FixedColorDraw(&state));
+
+    // PS4: the same state opts in; no program bound means no fallback.
+    ps4_compat_enabled = true;
+    try std.testing.expect(Renderer.wantsPs4FixedColorDraw(&state));
+    var empty = gpu.State{};
+    try std.testing.expect(!Renderer.wantsPs4FixedColorDraw(&empty));
+}
 
 test "compute local size defaults to one and preserves the programmed count" {
     var state = gpu.State{};

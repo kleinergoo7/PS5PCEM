@@ -631,6 +631,10 @@ fn run(init: std.process.Init) !bool {
             try out.print("{s}\n", .{ps4_mode.game_hook.startupLine(detected, ps4_cfg, &line_buffer)});
             try out.flush();
 
+            // PS4-only: replay bound GCN programs with the fixed-color probe
+            // shader into the guest target. Native PS5 runs leave this false.
+            vulkan.backend.ps4_compat_enabled = true;
+
             var ps4_session = ps4_mode.runtime.Session{};
             var ps4_stats = ps4_mode.bridge.PipelineStats{};
             ps4_mode.bridge.runBuffer(&ps4_session, blobs.sfo, blobs.elf, ps4_cfg, &.{}, &.{}, &.{}, &ps4_stats);

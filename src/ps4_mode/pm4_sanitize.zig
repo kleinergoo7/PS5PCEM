@@ -52,6 +52,15 @@ pub const Dimensions = struct {
 /// Worst case: 8 colour slots × 3 registers × (header + offset + value).
 pub const max_synthesized_dwords: usize = 8 * 3 * 3;
 
+/// PS/VS program address registers, written as two SET_SH_REG packets.
+pub const max_shader_reg_dwords: usize = 2 * 4;
+
+/// Guest shader pointers captured by the PS4 shader-set imports.
+pub const ShaderPrograms = struct {
+    pixel: u64 = 0,
+    vertex: u64 = 0,
+};
+
 // Direct SET_*_REG opcodes and the size of the matching shared register file.
 const opcode_set_config_reg: u8 = 0x68;
 const opcode_set_context_reg: u8 = 0x69;
@@ -139,6 +148,28 @@ pub fn synthesizeRenderTargetRegs(src: []const u32, out: []u32, dims: Dimensions
         // so the guest's PITCH applies directly and no metadata is required.
         emitContext(out, &write, 0x3b8 + @as(u32, @intCast(slot)), 0);
     }
+    return write;
+}
+
+fn emitShaderProgram(out: []u32, write: *usize, base: u32, address: u64) void {
+    // programAddress() reconstructs (low << 8) | ((high & 0xff) << 40); store
+    // bits 8..39 in the low word and bits 40..47 in the high word.
+    const low: u32 = @truncate(address >> 8);
+    const high: u32 = @as(u32, @truncate(address >> 40)) & 0xff;
+    out[write.*] = command(opcode_set_sh_reg, 3);
+    out[write.* + 1] = base;
+    out[write.* + 2] = low;
+    out[write.* + 3] = high;
+    write.* += 4;
+}
+
+/// Emit the SH program-address packets the PS4 GNM driver would have written
+/// when the title called `sceGnmSetPsShader` / `sceGnmSetVsShader`. The shared
+/// decoder reads PS at 0x008/0x009 and VS at 0x048/0x049.
+pub fn synthesizeShaderProgramRegs(programs: ShaderPrograms, out: []u32) usize {
+    var write: usize = 0;
+    if (programs.pixel != 0) emitShaderProgram(out, &write, 0x008, programs.pixel);
+    if (programs.vertex != 0) emitShaderProgram(out, &write, 0x048, programs.vertex);
     return write;
 }
 
@@ -278,6 +309,26 @@ test "synthesizes missing PS4 render-target registers from the guest's CB base" 
     // DEPTH/TILE 0x3b8 = 0 (one slice, linear).
     try std.testing.expectEqual(@as(u32, 0x3b8), out[7]);
     try std.testing.expectEqual(@as(u32, 0), out[8]);
+}
+
+test "synthesizes PS/VS program registers from recorded PS4 shader pointers" {
+    var out: [max_shader_reg_dwords]u32 = undefined;
+    const pair = ShaderPrograms{ .pixel = 0xab12_3456_0000, .vertex = 0x789a_bc00 };
+    const n = synthesizeShaderProgramRegs(pair, &out);
+    try std.testing.expectEqual(@as(usize, 8), n);
+    try std.testing.expectEqual(@as(u32, command(0x76, 3)), out[0]);
+    try std.testing.expectEqual(@as(u32, 0x008), out[1]);
+    try std.testing.expectEqual(@as(u32, 0x1234_5600), out[2]);
+    try std.testing.expectEqual(@as(u32, 0xab), out[3]);
+    try std.testing.expectEqual(@as(u32, command(0x76, 3)), out[4]);
+    try std.testing.expectEqual(@as(u32, 0x048), out[5]);
+    try std.testing.expectEqual(@as(u32, 0x78_9abc), out[6]);
+    try std.testing.expectEqual(@as(u32, 0), out[7]);
+}
+
+test "no recorded shader programs injects nothing into a native stream" {
+    var out: [max_shader_reg_dwords]u32 = undefined;
+    try std.testing.expectEqual(@as(usize, 0), synthesizeShaderProgramRegs(.{}, &out));
 }
 
 test "no CB base in the stream means no synthesized registers" {

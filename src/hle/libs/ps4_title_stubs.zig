@@ -16,12 +16,37 @@ const std = @import("std");
 const abi = @import("../abi.zig");
 const trace = @import("../trace.zig");
 const symbols = @import("../symbols.zig");
+const shader_binding = @import("ps4_mode").shader_binding;
 
 fn stubFunc() callconv(abi.guest) u64 {
     return 0;
 }
 
 const stub = trace.wrap("ps4-title-stub", &stubFunc);
+
+// PS4 shader binding: the GNM driver normally emits SH program-address packets
+// for these imports. Record the guest pointer at the PS4 boundary so the GNM
+// submit can inject those packets for the shared executor.
+fn setPsShader(shader: u64) callconv(abi.guest) void {
+    shader_binding.setPixelShader(shader);
+}
+
+fn setVsShader(shader: u64) callconv(abi.guest) void {
+    shader_binding.setVertexShader(shader);
+}
+
+const shader_exports = [_]symbols.Export{
+    .{
+        .name = "sceGnmSetPsShader",
+        .function = trace.wrap("sceGnmSetPsShader", &setPsShader),
+        .id_override = "bQVd5YzCal0",
+    },
+    .{
+        .name = "sceGnmSetVsShader",
+        .function = trace.wrap("sceGnmSetVsShader", &setVsShader),
+        .id_override = "gAhCn6UiU4Y",
+    },
+};
 
 const FuncEntry = struct { lib: []const u8, nid: []const u8 };
 const ObjEntry = struct { lib: []const u8, nid: []const u8 };
@@ -79,10 +104,8 @@ const funcs = [_]FuncEntry{
     .{ .lib = "libSceGnmDriver", .nid = "UJwNuMBcUAk" },
     .{ .lib = "libSceGnmDriver", .nid = "VJNjFtqiF5w" },
     .{ .lib = "libSceGnmDriver", .nid = "b0xyllnVY-I" },
-    .{ .lib = "libSceGnmDriver", .nid = "bQVd5YzCal0" },
     .{ .lib = "libSceGnmDriver", .nid = "bX5IbRvECXk" },
     .{ .lib = "libSceGnmDriver", .nid = "f33OrruQYbM" },
-    .{ .lib = "libSceGnmDriver", .nid = "gAhCn6UiU4Y" },
     .{ .lib = "libSceGnmDriver", .nid = "jg33rEKLfVs" },
     .{ .lib = "libSceGnmDriver", .nid = "ln33zjBrfjk" },
     .{ .lib = "libSceGnmDriver", .nid = "nF6bFRUBRAU" },
@@ -596,6 +619,9 @@ pub fn register(db: *symbols.Database, gpa: std.mem.Allocator) symbols.Error!voi
             .function = stub,
             .id_override = e.nid,
         });
+    }
+    for (shader_exports) |e| {
+        try db.add(gpa, .{ .name = "libSceGnmDriver", .version = 1 }, .{ .name = "libSceGnmDriver" }, e);
     }
     for (objects, 0..) |e, i| {
         const addr = @intFromPtr(&object_store[i * 8]);
