@@ -18,7 +18,7 @@ const window = @import("window");
 const display_mode = @import("display_mode.zig");
 const performance_mode = @import("performance_mode.zig");
 const frame_limit = @import("frame_limit.zig");
-const ps4_mode = @import("ps4_mode/root.zig");
+const ps4_mode = @import("ps4_mode");
 
 fn acquireHostMemory(context: ?*anyopaque, address: u64, size: usize, identity: u64) ?vulkan.GuestMemory.HostMapping {
     const view = runtime.firmware.libs.agc_submit.pinDirectMemory(context, address, size, identity) orelse return null;

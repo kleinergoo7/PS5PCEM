@@ -199,6 +199,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "gpu", .module = gpu },
             .{ .name = "input", .module = input },
             .{ .name = "zarchive", .module = zarchive },
+            .{ .name = "ps4_mode", .module = ps4_mode },
         },
     });
     hle.addIncludePath(libatrac9.path("C/src"));
@@ -654,6 +655,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "d3d12", .module = d3d12 },
                 .{ .name = "zarchive", .module = zarchive },
                 .{ .name = "renderdoc", .module = renderdoc },
+                .{ .name = "ps4_mode", .module = ps4_mode },
             },
         }),
     });
