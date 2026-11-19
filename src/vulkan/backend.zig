@@ -27,6 +27,7 @@ const pipeline_warmup = @import("pipeline_warmup.zig");
 const spirv_cache = rdna2.translation_cache;
 const tessellation_spirv = @import("tessellation_spirv.zig");
 const renderdoc = @import("renderdoc");
+const ps4_mode = @import("ps4_mode");
 // Kept opt-in while the live LS/HS resource path is being validated.
 pub export var native_tessellation: bool = false;
 pub export var graphics_uniform_specialization: bool = false;
@@ -25745,9 +25746,10 @@ pub const Renderer = struct {
         );
     }
 
-    /// PS4-only first-frame fallback. Render the existing fixed-color probe
-    /// shader into the guest's own decoded color target (not the 64x64 probe
-    /// framebuffer), so the normal materialization/readback path captures it.
+    /// PS4-only graphics replay. When a GCN shader has been translated, draw
+    /// through the real translated SPIR-V; otherwise replay the fixed-color
+    /// probe so the guest frame still materializes. Both use the shared draw
+    /// path and the guest's own decoded color target. PS5 never takes this.
     fn drawPs4FixedColor(self: *Renderer, state: *const gpu.State, draw: GuestDraw) anyerror!void {
         const render_state = gpu.resources.decodeRenderState(state);
         var target: ?GuestColorTarget = null;
@@ -25759,9 +25761,11 @@ pub const Renderer = struct {
         }
         const guest_target = target orelse return Error.UnsupportedColorTarget;
         try self.beginFrameDraw();
-        try self.drawGraphicsShaders(
-            &graphics_probe_vertex_spirv,
-            &graphics_probe_fragment_spirv,
+        const translated = ps4_mode.gcn_translate.translatedGraphics();
+        const use_real_shader = translated != null;
+        try self.drawGraphicsShadersWithModules(
+            if (translated) |t| t.vertex_words else &graphics_probe_vertex_spirv,
+            if (translated) |t| t.fragment_words else &graphics_probe_fragment_spirv,
             &.{},
             &.{},
             GraphicsPipelineState.default(guest_target.descriptor.width, guest_target.descriptor.height),
@@ -25769,9 +25773,10 @@ pub const Renderer = struct {
             &.{},
             null,
             false,
-            false,
+            use_real_shader,
             false,
             draw,
+            .{},
         );
     }
 
