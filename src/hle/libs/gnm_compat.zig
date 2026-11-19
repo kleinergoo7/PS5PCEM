@@ -65,23 +65,27 @@ fn sceGnmSubmitAndFlipCommandBuffers(
         // out-of-range SET_*_REG stops the queue, and a malformed body length
         // hides the real packets (including draws) behind it. Rebuild a clean
         // Type-3-only stream here, at the PS4 boundary; the shared executor's
-        // register-range check is never relaxed. Fall back to the original
-        // stream if the scratch buffer cannot be allocated.
-        const clean = std.heap.page_allocator.alloc(u32, words) catch {
+        // register-range check is never relaxed. GCN DCBs also never write the
+        // AGC context registers that describe render-target size/address-high,
+        // so synthesize those from the guest's own CB registers before handing
+        // the stream over. Fall back to the original stream if allocation fails.
+        const prefix_cap = pm4_sanitize.max_synthesized_dwords;
+        const clean = std.heap.page_allocator.alloc(u32, words + prefix_cap) catch {
             _ = agc_submit.submitDeviceStream(slice);
             submitted += 1;
             continue;
         };
         defer std.heap.page_allocator.free(clean);
+        const prefix_words = pm4_sanitize.synthesizeRenderTargetRegs(slice, clean, .{});
         var stats: pm4_sanitize.Stats = .{};
-        const clean_words = pm4_sanitize.sanitize(slice, clean, &stats);
-        if (clean_words == 0) continue;
+        const clean_words = prefix_words + pm4_sanitize.sanitize(slice, clean[prefix_words..], &stats);
+        if (clean_words == prefix_words) continue;
         if (trace.announces("sceGnmSubmitAndFlipCommandBuffers") and
             (stats.dropped_config | stats.dropped_context | stats.dropped_shader | stats.dropped_uconfig) != 0)
         {
             std.debug.print(
-                "[gnm submit] sanitized DCB {d}->{d} dwords (kept={d} cfg={d} ctx={d} sh={d} ucfg={d} skipped={d})\n",
-                .{ words, clean_words, stats.kept, stats.dropped_config, stats.dropped_context, stats.dropped_shader, stats.dropped_uconfig, stats.skipped_words },
+                "[gnm submit] sanitized DCB {d}->{d} dwords (rt-prefix={d} kept={d} cfg={d} ctx={d} sh={d} ucfg={d} skipped={d})\n",
+                .{ words, clean_words, prefix_words, stats.kept, stats.dropped_config, stats.dropped_context, stats.dropped_shader, stats.dropped_uconfig, stats.skipped_words },
             );
         }
         _ = agc_submit.submitDeviceStream(clean[0..clean_words]);

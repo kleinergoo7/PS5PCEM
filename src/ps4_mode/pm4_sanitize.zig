@@ -14,9 +14,10 @@
 //!
 //! This module re-emits only packets that are genuinely present in the guest
 //! buffer: recognised Type-3 opcodes with a body that fits, in original order.
-//! Out-of-range register packets and non-packet words are dropped. Nothing is
-//! invented, no PS5/native stream is touched, and the shared executor's
-//! register-range check is left intact.
+//! Out-of-range register packets and non-packet words are dropped. The sole
+//! addition is the PS4-specific render-target prefix below, derived from the
+//! guest's own CB registers; no PS5/native stream is touched and the shared
+//! executor's register-range check is left intact.
 
 const std = @import("std");
 
@@ -38,6 +39,18 @@ const kind_shift: u5 = 30;
 const count_shift: u5 = 16;
 const count_mask: u32 = 0x3fff;
 const opcode_shift: u5 = 8;
+
+/// Width/height used to fill the render-target dimension register when a GCN
+/// DCB omits it. 1920x1080 is the PS4 VideoOut HD output (the emulator's
+/// VideoOut window); a first frame only needs a valid extent, not the title's
+/// exact internal resolution.
+pub const Dimensions = struct {
+    width: u32 = 1920,
+    height: u32 = 1080,
+};
+
+/// Worst case: 8 colour slots × 3 registers × (header + offset + value).
+pub const max_synthesized_dwords: usize = 8 * 3 * 3;
 
 // Direct SET_*_REG opcodes and the size of the matching shared register file.
 const opcode_set_config_reg: u8 = 0x68;
@@ -65,14 +78,68 @@ fn registerFileCount(opcode: u8) ?u32 {
 /// one, and the shared walker would reject the unknown opcode anyway.
 fn isKnownOpcode(opcode: u8) bool {
     return switch (opcode) {
-        0x10, 0x11, 0x12, 0x13, 0x15, 0x16, 0x1e, 0x1f, 0x20, 0x21, 0x22, 0x23,
-        0x24, 0x25, 0x26, 0x27, 0x28, 0x2a, 0x2c, 0x2d, 0x2f, 0x30, 0x33, 0x34,
-        0x35, 0x36, 0x37, 0x38, 0x39, 0x3a, 0x3b, 0x3c, 0x3f, 0x40, 0x41, 0x42,
-        0x43, 0x45, 0x46, 0x47, 0x48, 0x49, 0x4a, 0x50, 0x51, 0x57, 0x58, 0x59,
-        0x5e, 0x5f, 0x60, 0x61, 0x63, 0x64, 0x68, 0x69, 0x6a, 0x76, 0x77, 0x79,
-        0x7a, 0x80, 0x81, 0x83, 0x84, 0x85, 0x86, 0x8e, 0x9b, 0x9f => true,
+        0x10, 0x11, 0x12, 0x13, 0x15, 0x16, 0x1e, 0x1f, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x2a, 0x2c, 0x2d, 0x2f, 0x30, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3a, 0x3b, 0x3c, 0x3f, 0x40, 0x41, 0x42, 0x43, 0x45, 0x46, 0x47, 0x48, 0x49, 0x4a, 0x50, 0x51, 0x57, 0x58, 0x59, 0x5e, 0x5f, 0x60, 0x61, 0x63, 0x64, 0x68, 0x69, 0x6a, 0x76, 0x77, 0x79, 0x7a, 0x80, 0x81, 0x83, 0x84, 0x85, 0x86, 0x8e, 0x9b, 0x9f => true,
         else => false,
     };
+}
+
+/// Emit one SET_CONTEXT_REG packet (offset + single value) into `out`.
+fn emitContext(out: []u32, write: *usize, offset: u32, value: u32) void {
+    out[write.*] = command(opcode_set_context_reg, 2);
+    out[write.* + 1] = offset;
+    out[write.* + 2] = value;
+    write.* += 3;
+}
+
+/// Find the value a guest DCB writes to context register `offset`, if any.
+/// GCN writes CB_COLORn_BASE as a single SET_CONTEXT_REG packet.
+fn writtenContext(src: []const u32, offset: u32) ?u32 {
+    var read: usize = 0;
+    while (read + 1 < src.len) : (read += 1) {
+        const header = src[read];
+        if ((header >> kind_shift) != 3) continue;
+        if (@as(u8, @truncate(header >> opcode_shift)) != opcode_set_context_reg) continue;
+        const body_len: usize = @as(usize, @intCast((header >> count_shift) & count_mask)) + 1;
+        if (read + 1 + body_len > src.len) continue;
+        const body = src[read + 1 .. read + 1 + body_len];
+        if (body.len >= 2 and (body[0] & 0xffff) == offset) return body[1];
+    }
+    return null;
+}
+
+/// Rebuild the AGC render-target registers a PS4 GCN DCB never writes.
+///
+/// The shared decoder (gpu/resources.zig decodeColorTarget) needs, per slot:
+///   BASE_HIGH 0x390+i, DIM 0x3b0+i, DEPTH/TILE 0x3b8+i.
+/// A genuine GCN DCB writes BASE/PITCH/VIEW/INFO/ATTRIB at 0x318+i*15 but
+/// carries those three fields elsewhere or leaves them zero, so every draw
+/// used to reach the backend as `color 0/0`. Supplying them here — derived
+/// from the guest's own registers and the VideoOut extent — lets the shared
+/// executor see the target without relaxing any shared code.
+///
+/// Returns the number of dwords written to `out` (always <= max_synthesized_dwords).
+pub fn synthesizeRenderTargetRegs(src: []const u32, out: []u32, dims: Dimensions) usize {
+    var write: usize = 0;
+    for (0..8) |slot| {
+        const base_offset: u32 = 0x318 + @as(u32, @intCast(slot)) * 15;
+        if (writtenContext(src, base_offset) == null) continue;
+
+        // BASE_HIGH 0x390+i = 0: PS4 GPU addresses are <= 40 bits, so the
+        // guest's 32-bit BASE (shifted <<8 by the decoder) already holds every
+        // meaningful bit; bits 40..47 are zero.
+        emitContext(out, &write, 0x390 + @as(u32, @intCast(slot)), 0);
+
+        // DIM 0x3b0+i: width in bits 14..27, height in bits 0..13. GCN keeps
+        // the extent in a different register block; use the known VideoOut
+        // framebuffer size so decodeColorTarget reports a non-degenerate target.
+        const attrib2 = ((dims.width - 1) << 14) | (dims.height - 1);
+        emitContext(out, &write, 0x3b0 + @as(u32, @intCast(slot)), attrib2);
+
+        // DEPTH/TILE 0x3b8+i = 0: one slice (depth = value+1) and linear tiling,
+        // so the guest's PITCH applies directly and no metadata is required.
+        emitContext(out, &write, 0x3b8 + @as(u32, @intCast(slot)), 0);
+    }
+    return write;
 }
 
 fn accountDrop(stats: *Stats, opcode: u8) void {
@@ -182,6 +249,44 @@ test "drops out-of-range shader and config writes, keeps valid ones" {
     try std.testing.expectEqual(@as(usize, 1), stats.dropped_shader);
     try std.testing.expectEqual(@as(usize, 1), stats.dropped_config);
     try std.testing.expectEqual(@as(u32, 0x02ff), dst[1]);
+}
+
+test "synthesizes missing PS4 render-target registers from the guest's CB base" {
+    // A GCN DCB writes BASE/PITCH/VIEW/INFO/ATTRIB at 0x318+i*15 but never the
+    // AGC register file's BASE_HIGH/DIM/DEPTH fields.
+    const src = [_]u32{
+        command(0x69, 7),
+        0x0318,
+        0x10100a00,
+        0x09f0009f,
+        0x3bff,
+        0,
+        0x28828,
+        0x14a,
+    };
+    var out: [max_synthesized_dwords]u32 = undefined;
+    const dims = Dimensions{ .width = 64, .height = 32 };
+    const n = synthesizeRenderTargetRegs(&src, &out, dims);
+    try std.testing.expectEqual(@as(usize, 9), n); // 3 packets × 3 dwords, one slot
+    // BASE_HIGH 0x390 = 0.
+    try std.testing.expectEqual(@as(u32, command(0x69, 2)), out[0]);
+    try std.testing.expectEqual(@as(u32, 0x390), out[1]);
+    try std.testing.expectEqual(@as(u32, 0), out[2]);
+    // DIM 0x3b0: height in bits 0..13, width in bits 14..27.
+    try std.testing.expectEqual(@as(u32, 0x3b0), out[4]);
+    try std.testing.expectEqual(@as(u32, ((64 - 1) << 14) | (32 - 1)), out[5]);
+    // DEPTH/TILE 0x3b8 = 0 (one slice, linear).
+    try std.testing.expectEqual(@as(u32, 0x3b8), out[7]);
+    try std.testing.expectEqual(@as(u32, 0), out[8]);
+}
+
+test "no CB base in the stream means no synthesized registers" {
+    const src = [_]u32{
+        command(0x69, 2), 0x0205, 0x1111,
+        command(0x2d, 2), 0x0004, 0x0002,
+    };
+    var out: [max_synthesized_dwords]u32 = undefined;
+    try std.testing.expectEqual(@as(usize, 0), synthesizeRenderTargetRegs(&src, &out, .{}));
 }
 
 test "skips garbage, reserved and truncated words without forwarding them" {
