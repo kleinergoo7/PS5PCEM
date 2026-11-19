@@ -15,6 +15,7 @@
 pub const sfo = @import("sfo.zig");
 pub const detector = @import("detector.zig");
 pub const gcn_header = @import("gcn_header.zig");
+pub const gcn_blob = @import("gcn_blob.zig");
 pub const gnm_packets = @import("gnm_packets.zig");
 pub const pm4_sanitize = @import("pm4_sanitize.zig");
 pub const gcn_resources = @import("gcn_resources.zig");
@@ -52,6 +53,7 @@ test {
     _ = sfo;
     _ = detector;
     _ = gcn_header;
+    _ = gcn_blob;
     _ = gnm_packets;
     _ = pm4_sanitize;
     _ = gcn_resources;
