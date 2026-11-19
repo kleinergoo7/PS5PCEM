@@ -357,11 +357,26 @@ test "dynamic scalar values do not change translated SPIR-V words" {
         gcn_decode.exp(0, 0xf, true, .{ 0, 0, 0, 0 })[1],
         0xbf81_0000,
     };
-    const first = try translateShader(std.testing.allocator, .vertex, &vs);
-    defer std.testing.allocator.free(first);
-    const second = try translateShader(std.testing.allocator, .vertex, &vs);
-    defer std.testing.allocator.free(second);
-    try std.testing.expectEqualSlices(u32, first, second);
+    var decoded = try gcn_decode.decodeToRdna2(std.testing.allocator, &vs);
+    defer decoded.deinit(std.testing.allocator);
+    const slots = try buildScalarSlots(std.testing.allocator, &decoded.program);
+    defer std.testing.allocator.free(slots);
+
+    const first_values = try std.testing.allocator.dupe(ScalarSlot, slots);
+    defer std.testing.allocator.free(first_values);
+    const second_values = try std.testing.allocator.dupe(ScalarSlot, slots);
+    defer std.testing.allocator.free(second_values);
+    for (second_values) |*slot| slot.value = 0xdead_beef;
+
+    var first_options = try buildOptions(std.testing.allocator, .vertex, &decoded.program, first_values);
+    defer first_options.deinit();
+    var second_options = try buildOptions(std.testing.allocator, .vertex, &decoded.program, second_values);
+    defer second_options.deinit();
+    var first_module = try rdna2.translateProgramSpirv(std.testing.allocator, &decoded.program, first_options.options);
+    defer first_module.deinit(std.testing.allocator);
+    var second_module = try rdna2.translateProgramSpirv(std.testing.allocator, &decoded.program, second_options.options);
+    defer second_module.deinit(std.testing.allocator);
+    try std.testing.expectEqualSlices(u32, first_module.words, second_module.words);
 }
 
 test "unsupported GCN instructions are reported, not silently dropped" {
