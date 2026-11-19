@@ -13,7 +13,7 @@ const game_hook = @import("game_hook.zig");
 
 /// How many distinct wrapper names can be counted at once. Enough for a title's
 /// MISS set while staying a few cache lines of fixed storage.
-pub const capacity: usize = 128;
+pub const capacity: usize = 256;
 
 const Slot = struct {
     name: []const u8 = &.{},
