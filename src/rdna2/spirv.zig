@@ -1097,6 +1097,10 @@ const Builder = struct {
     vertex_index_vgpr: ?u8,
     vertex_corner_vgprs: ?[2]u8,
     vertex_position_corner_override: bool,
+    /// PS4-only corner SSA values captured at seed time. Decoded GCN instructions
+    /// may overwrite the corner VGPRs before the export, so the override reads
+    /// these dedicated ids instead of the mutable register file.
+    corner_values: ?[2]Value = null,
     tessellation_inputs: ?TessellationInputs,
     tess_coord_input: u32 = 0,
     patch_id_input: u32 = 0,
@@ -5247,16 +5251,17 @@ const Builder = struct {
                 // uninitialised VGPRs as per-vertex float multipliers. Seed them
                 // with (index&1, (index>>1)&1) so a 4-vertex draw forms a quad.
                 const as_bits = try self.convert(.{ .id = result, .value_type = .sint32 }, .bits32);
+                var captured: [2]Value = undefined;
                 for (corners, 0..) |vgpr, axis| {
                     const low = try self.andBits(as_bits, if (axis == 0) 1 else 2);
                     const shifted = if (axis == 0) low else try self.shiftRightBits(low, 1);
                     const as_float = self.id();
                     try self.emit(&self.body, 124, &.{ self.float_type, as_float, shifted }); // OpBitcast
-                    self.registers[128 + @as(usize, vgpr)] = .{
-                        .id = as_float,
-                        .value_type = .float32,
-                    };
+                    const corner: Value = .{ .id = as_float, .value_type = .float32 };
+                    captured[axis] = corner;
+                    self.registers[128 + @as(usize, vgpr)] = corner;
                 }
+                self.corner_values = captured;
             } else {
                 const vgpr = self.vertex_index_vgpr orelse return Error.InvalidStageInterface;
                 self.registers[128 + @as(usize, vgpr)] = .{
@@ -6110,9 +6115,9 @@ const Builder = struct {
             out_z = converted;
         }
         var components = [4]u32{ x, y, out_z, out_w };
-        if (is_position and self.vertex_position_corner_override) if (self.vertex_corner_vgprs) |corners| {
-            const corner_x = self.registers[128 + @as(usize, corners[0])];
-            const corner_y = self.registers[128 + @as(usize, corners[1])];
+        if (is_position and self.vertex_position_corner_override) if (self.corner_values) |corners| {
+            const corner_x = corners[0];
+            const corner_y = corners[1];
             if (corner_x.id != 0 and corner_y.id != 0) {
                 components = .{
                     try self.convert(corner_x, .float32),
@@ -15241,6 +15246,123 @@ test "vertex system value and position export lower to a stage interface" {
     try std.testing.expectError(error.InvalidStageInterface, translate(std.testing.allocator, &program, .{ .stage = .vertex, .vertex_depth_transform = transform, .convert_negative_one_to_one_depth = true }));
     try std.testing.expectError(error.InvalidStageInterface, translate(std.testing.allocator, &program, .{ .stage = .vertex, .vertex_depth_transform = transform, .clip_zero_position = true }));
     try std.testing.expectError(error.InvalidStageInterface, translate(std.testing.allocator, &program, .{ .stage = .vertex, .vertex_depth_transform = .{ .scale = std.math.nan(f32), .offset = 0, .negative_one_to_one = true } }));
+}
+
+test "PS4 corner override survives VGPR clobbering before POS0 export" {
+    const decoder = @import("decoder.zig");
+    const code = [_]u32{
+        // v_mov_b32 v2, 0.25 and v_mov_b32 v3, 0.75 — the real Terraria VS
+        // writes these VGPRs after the corner seed and before the export.
+        (@as(u32, 0x3f) << 25) | (@as(u32, 2) << 17) | (@as(u32, 0x01) << 9) | 255,
+        @bitCast(@as(f32, 0.25)),
+        (@as(u32, 0x3f) << 25) | (@as(u32, 3) << 17) | (@as(u32, 0x01) << 9) | 255,
+        @bitCast(@as(f32, 0.75)),
+        0xf800_08cf, // exp pos0, v0..v3 done
+        0x0403_0201,
+        0xbf81_0000, // s_endpgm
+    };
+    var program = try decoder.decodeProgram(std.testing.allocator, &code);
+    defer program.deinit(std.testing.allocator);
+    var module = try translate(std.testing.allocator, &program, .{
+        .stage = .vertex,
+        .vertex_corner_vgprs = .{ 2, 3 },
+        .vertex_position_corner_override = true,
+    });
+    defer module.deinit(std.testing.allocator);
+
+    const words = module.words;
+
+    // Find the Position output variable (OpDecorate <id> BuiltIn Position).
+    var position_var: u32 = 0;
+    var index: usize = 5;
+    while (index < words.len) {
+        const first = words[index];
+        const op: u16 = @truncate(first);
+        const count: usize = @intCast(first >> 16);
+        if (count == 0 or index + count > words.len) break;
+        if (op == 71 and count >= 4 and words[index + 2] == 11 and words[index + 3] == 0) {
+            position_var = words[index + 1];
+        }
+        index += count;
+    }
+    try std.testing.expect(position_var != 0);
+
+    // Find the OpStore into Position and the vector it stores.
+    var position_vector: u32 = 0;
+    index = 5;
+    while (index < words.len) {
+        const first = words[index];
+        const op: u16 = @truncate(first);
+        const count: usize = @intCast(first >> 16);
+        if (count == 0 or index + count > words.len) break;
+        if (op == 62 and count >= 3 and words[index + 1] == position_var) {
+            position_vector = words[index + 2];
+        }
+        index += count;
+    }
+    try std.testing.expect(position_vector != 0);
+
+    // Follow the stored value: a vertex export may wrap the constructed vector
+    // in an OpSelect for EXEC masking.
+    var vec_id = position_vector;
+    index = 5;
+    while (index < words.len) {
+        const first = words[index];
+        const op: u16 = @truncate(first);
+        const count: usize = @intCast(first >> 16);
+        if (count == 0 or index + count > words.len) break;
+        if (op == 169 and count >= 6 and words[index + 2] == position_vector) {
+            vec_id = words[index + 4]; // OpSelect true value: the constructed vector.
+        }
+        index += count;
+    }
+
+    // Find the OpCompositeConstruct producing that vector and its 4 components.
+    var components: [4]u32 = @splat(0);
+    index = 5;
+    while (index < words.len) {
+        const first = words[index];
+        const op: u16 = @truncate(first);
+        const count: usize = @intCast(first >> 16);
+        if (count == 0 or index + count > words.len) break;
+        if (op == 80 and count >= 7 and words[index + 2] == vec_id) {
+            for (0..4) |c| components[c] = words[index + 3 + c];
+        }
+        index += count;
+    }
+    try std.testing.expect(components[0] != 0 and components[1] != 0);
+
+    // The x/y components must trace back to an OpLoad (the VertexIndex system
+    // value), not to the constants written into v2/v3 before the export.
+    // Walking the first data operand of each producing instruction is enough
+    // here: Bitcast/BitwiseAnd/ShiftRightLogical all keep their input at +3.
+    for (components[0..2]) |component| {
+        var current = component;
+        var derives_from_vertex_index = false;
+        var hops: usize = 0;
+        while (hops < 32) : (hops += 1) {
+            var found = false;
+            var j: usize = 5;
+            while (j < words.len) {
+                const first = words[j];
+                const op: u16 = @truncate(first);
+                const count: usize = @intCast(first >> 16);
+                if (count == 0 or j + count > words.len) break;
+                if (count >= 3 and words[j + 2] == current) {
+                    if (op == 61) {
+                        derives_from_vertex_index = true;
+                        break;
+                    }
+                    if (count >= 4) current = words[j + 3];
+                    found = true;
+                    break;
+                }
+                j += count;
+            }
+            if (derives_from_vertex_index or !found) break;
+        }
+        try std.testing.expect(derives_from_vertex_index);
+    }
 }
 
 test "GETPC SETPC continuation still exports position" {
