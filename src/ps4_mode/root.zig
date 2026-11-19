@@ -31,6 +31,7 @@ pub const gcn_lower = @import("gcn_lower.zig");
 pub const audio_np = @import("audio_np.zig");
 pub const submit = @import("submit.zig");
 pub const game_hook = @import("game_hook.zig");
+pub const hits = @import("hits.zig");
 
 pub const Mode = detector.Mode;
 pub const Session = runtime.Session;
@@ -61,4 +62,5 @@ test {
     _ = audio_np;
     _ = submit;
     _ = game_hook;
+    _ = hits;
 }
