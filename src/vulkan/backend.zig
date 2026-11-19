@@ -25795,6 +25795,85 @@ pub const Renderer = struct {
         return storage[0..count];
     }
 
+    /// PS4-only: minimal sampled-image descriptor for the translated Terraria
+    /// PS, derived from the settled PS T# published at the GNM submit boundary.
+    /// The captured T# is GCN-encoded; the shared stager wants an RDNA2 view,
+    /// so only the fields the 2D RGBA8 path reads are filled in.
+    fn ps4SampledImageDescriptor() ?gpu.resources.ImageDescriptor {
+        if (!@atomicLoad(bool, &ps4_compat_enabled, .monotonic)) return null;
+        const captured = ps4_mode.gcn_resources.captured() orelse return null;
+        var image: ?ps4_mode.gcn_resources.Descriptor = null;
+        for (captured.bindings[0..captured.count]) |binding| {
+            if (binding.stage != .pixel or binding.descriptor.kind != .sampled_image) continue;
+            image = binding.descriptor; // last write is the settled PS T#
+        }
+        const tex = image orelse return null;
+        // GCN thin microtile is 256B-swizzled; RDNA2 calls the same family
+        // standard_256b. Display tiling is effectively linear pitch.
+        const tile_mode: gpu.resources.TileMode = switch (tex.tiling) {
+            .thin_1d => .standard_256b,
+            .thick_1d => .standard_4kb,
+            else => .linear,
+        };
+        return std.mem.zeroInit(gpu.resources.ImageDescriptor, .{
+            .address = tex.address,
+            .width = tex.width,
+            .height = tex.height,
+            .depth_or_layers = 1,
+            .pitch = tex.pitch,
+            .unified_format = 56, // DATA_FORMAT_8_8_8_8 -> RGBA8
+            .tile_mode = tile_mode,
+            .image_type = .color_2d,
+            .dst_select = .{ 4, 5, 6, 7 }, // RDNA2 component selectors: R,G,B,A
+        });
+    }
+
+    /// PS4-only: stage the captured PS image and write it into the 2D
+    /// sampled-image bank at binding 1, element 1 — the exact slot the
+    /// translated Terraria PS samples. The caller releases the returned image
+    /// after the draw has been queued. Returns null off the PS4 path.
+    fn stagePs4GraphicsSampledImage(self: *Renderer) anyerror!?PreparedSampledImage {
+        if (!@atomicLoad(bool, &ps4_compat_enabled, .monotonic)) return null;
+        const descriptor = ps4SampledImageDescriptor() orelse return null;
+        const sampler = try gpu.resources.decodeSamplerDescriptor(&.{ 0, 0, 0, 0 });
+        const prepared = self.stageSampledImage(descriptor, sampler, 1, .two_d, null) catch |err| {
+            std.debug.print("[ps4] sampled image @0x{x} {d}x{d} staging failed: {s}\n", .{
+                descriptor.address, descriptor.width, descriptor.height, @errorName(err),
+            });
+            return null;
+        };
+        const image_info = vk.DescriptorImageInfo{
+            .sampler = prepared.sampler,
+            .image_view = prepared.view,
+            .image_layout = prepared.descriptor_layout,
+        };
+        const write = vk.WriteDescriptorSet{
+            .destination_set = self.descriptor_set,
+            .destination_binding = rdna2.spirv.sampled_image_2d_descriptor_binding,
+            .destination_array_element = 1,
+            .descriptor_count = 1,
+            .descriptor_type = vk.descriptor_type_combined_image_sampler,
+            .image_info = @ptrCast(&image_info),
+        };
+        self.device_functions.update_descriptor_sets(self.device, 1, @ptrCast(&write), 0, null);
+        self.active_descriptor_set = self.descriptor_set;
+        std.debug.print("[ps4] sampled image @0x{x} {d}x{d} -> binding 1 element 1\n", .{
+            descriptor.address, descriptor.width, descriptor.height,
+        });
+        return prepared;
+    }
+
+    fn releasePs4GraphicsSampledImage(self: *Renderer, prepared: PreparedSampledImage) void {
+        if (prepared.owns_view) self.destroyImageView(prepared.view);
+        if (prepared.owns_sampler) self.destroySampler(prepared.sampler);
+        if (prepared.owns_image) {
+            self.image_states.forgetImage(prepared.image.handle);
+            self.destroyImage(prepared.image);
+        }
+        if (prepared.storage_cache_index) |index| self.releaseStorageImage(index);
+        if (prepared.render_target_index) |index| self.releaseRenderTarget(index);
+    }
+
     /// PS4-only graphics replay. When a GCN shader has been translated, draw
     /// through the real translated SPIR-V; otherwise replay the fixed-color
     /// probe so the guest frame still materializes. Both use the shared draw
@@ -25822,6 +25901,12 @@ pub const Renderer = struct {
             ps4GraphicsScalars(.pixel, &fragment_storage)
         else
             &.{};
+        // The translated PS reads a sampled image at binding 1 / element 1.
+        // Stage it after beginFrameDraw selected this batch's descriptor set,
+        // and keep it alive until the draw has been queued.
+        var ps4_sampled: ?PreparedSampledImage = null;
+        defer if (ps4_sampled) |prepared| self.releasePs4GraphicsSampledImage(prepared);
+        if (use_real_shader) ps4_sampled = try self.stagePs4GraphicsSampledImage();
         try self.drawGraphicsShadersWithModules(
             if (translated) |t| t.vertex_words else &graphics_probe_vertex_spirv,
             if (translated) |t| t.fragment_words else &graphics_probe_fragment_spirv,
@@ -49455,6 +49540,31 @@ test "PS4 dynamic scalar upload is gated off for PS5 draws" {
     // The gate is stage-independent: PS5 never enters the PS4 fallback path.
     ps4_compat_enabled = true;
     try std.testing.expect(Renderer.wantsPs4FixedColorDraw(&state));
+}
+
+test "PS4 sampled-image staging is gated off for PS5 draws" {
+    const previous = ps4_compat_enabled;
+    defer ps4_compat_enabled = previous;
+    ps4_mode.gcn_resources.resetCapture();
+    defer ps4_mode.gcn_resources.resetCapture();
+    ps4_mode.gcn_resources.publish(ps4_mode.gcn_resources.capture(
+        &ps4_mode.terraria_frame_test.captured_dcb,
+    ));
+
+    // PS5: no image descriptor is produced, so no Vulkan descriptor write
+    // happens and the native path is untouched.
+    ps4_compat_enabled = false;
+    try std.testing.expect(Renderer.ps4SampledImageDescriptor() == null);
+
+    // PS4: the same captured DCB yields the settled PS T# view.
+    ps4_compat_enabled = true;
+    const descriptor = Renderer.ps4SampledImageDescriptor() orelse
+        return error.TestExpectedSampledImageDescriptor;
+    try std.testing.expectEqual(@as(u64, 0x10_168c8000), descriptor.address);
+    try std.testing.expectEqual(@as(u32, 1920), descriptor.width);
+    try std.testing.expectEqual(@as(u32, 1080), descriptor.height);
+    try std.testing.expectEqual(@as(u16, 56), descriptor.unified_format);
+    try std.testing.expectEqual(gpu.resources.ImageType.color_2d, descriptor.image_type);
 }
 
 test "compute local size defaults to one and preserves the programmed count" {
