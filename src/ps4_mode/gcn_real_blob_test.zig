@@ -15,6 +15,10 @@ const gcn_blob = @import("gcn_blob.zig");
 const gcn_decode = @import("gcn_decode.zig");
 const gcn_translate = @import("gcn_translate.zig");
 
+const ProgramPair = gcn_translate.ProgramPair;
+const registerShaderFor = gcn_translate.registerShaderFor;
+const translatedGraphicsFor = gcn_translate.translatedGraphicsFor;
+
 /// Full VS blob (2048-byte dump truncated to the parsed ISA extent).
 /// isa_offset = 0x104, isa_size = 88 (22 dwords).
 const vs_words = [_]u32{
@@ -66,4 +70,12 @@ test "gcn_blob.isaBytes extracts the ISA from the real VS blob header" {
     try std.testing.expectEqual(@as(u32, 88), parsed.isa_size);
     const isa = gcn_blob.isaBytes(&blob, parsed);
     try std.testing.expectEqual(@as(usize, 88), isa.len);
+}
+
+test "program-keyed translation rejects mismatched pair" {
+    const program: ProgramPair = .{ .vertex = 0x1000000a88, .pixel = 0x1000000aa4 };
+    registerShaderFor(program, .vertex, &vs_words);
+    registerShaderFor(program, .pixel, &ps_words);
+    try std.testing.expect(translatedGraphicsFor(program) != null);
+    try std.testing.expect(translatedGraphicsFor(.{ .vertex = 1, .pixel = 2 }) == null);
 }

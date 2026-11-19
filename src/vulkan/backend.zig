@@ -25750,11 +25750,12 @@ pub const Renderer = struct {
     /// a minimal sprite transform. The slot order is owned by `gcn_translate`,
     /// so the values land at the same indices `rdna2` loads at runtime.
     fn ps4GraphicsScalars(
+        program: ps4_mode.ProgramPair,
         stage: ps4_mode.gcn_translate.Stage,
         storage: []gpu.ShaderSpirvScalarRegister,
         resources: ps4_mode.gcn_resources.Resources,
     ) []const gpu.ShaderSpirvScalarRegister {
-        const slots = ps4_mode.gcn_translate.scalarSlots(stage);
+        const slots = ps4_mode.gcn_translate.scalarSlotsFor(program, stage);
         const count = @min(slots.len, storage.len);
         const user_data = resources.userData(if (stage == .vertex) .vertex else .pixel);
 
@@ -25893,16 +25894,18 @@ pub const Renderer = struct {
         }
         const guest_target = target orelse return Error.UnsupportedColorTarget;
         try self.beginFrameDraw();
-        const translated = ps4_mode.gcn_translate.translatedGraphics();
+        const programs = ps4_mode.shader_binding.programs();
+        const program: ps4_mode.ProgramPair = .{ .vertex = programs.vertex, .pixel = programs.pixel };
+        const translated = ps4_mode.gcn_translate.translatedGraphicsFor(program);
         const use_real_shader = translated != null;
         var vertex_storage: [64]gpu.ShaderSpirvScalarRegister = undefined;
         var fragment_storage: [64]gpu.ShaderSpirvScalarRegister = undefined;
         const vertex_scalars: []const gpu.ShaderSpirvScalarRegister = if (use_real_shader)
-            ps4GraphicsScalars(.vertex, &vertex_storage, resources)
+            ps4GraphicsScalars(program, .vertex, &vertex_storage, resources)
         else
             &.{};
         const fragment_scalars: []const gpu.ShaderSpirvScalarRegister = if (use_real_shader)
-            ps4GraphicsScalars(.pixel, &fragment_storage, resources)
+            ps4GraphicsScalars(program, .pixel, &fragment_storage, resources)
         else
             &.{};
         // The translated PS reads a sampled image at binding 1 / element 1.

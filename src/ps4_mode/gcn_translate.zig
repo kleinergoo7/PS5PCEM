@@ -11,6 +11,9 @@
 const std = @import("std");
 const rdna2 = @import("rdna2");
 const gcn_decode = @import("gcn_decode.zig");
+const gcn_resources = @import("gcn_resources.zig");
+
+pub const ProgramPair = gcn_resources.ProgramPair;
 
 pub const Stage = enum { vertex, pixel };
 
@@ -188,65 +191,147 @@ fn buildOptions(allocator: std.mem.Allocator, stage: Stage, program: *const rdna
     return builder;
 }
 
-// Registered shader state. `registerShader` owns copies of both the ISA and
-// the translated words; changing either stage invalidates its translation.
+// Registered shader state. One bounded entry per bound GNM program pair; each
+// entry owns copies of both stage ISAs and, once both are present, the
+// translated SPIR-V words and dynamic scalar layouts. Changing either stage
+// invalidates and rebuilds that pair's translation.
 var lock: std.atomic.Mutex = .unlocked;
 
 fn lockGlobal() void {
     while (!lock.tryLock()) std.atomic.spinLoopHint();
 }
-var vertex_isa: ?[]u32 = null;
-var pixel_isa: ?[]u32 = null;
-var vertex_spirv: ?[]u32 = null;
-var pixel_spirv: ?[]u32 = null;
-var vertex_slots: []ScalarSlot = &.{};
-var pixel_slots: []ScalarSlot = &.{};
+
+const max_registrations = 8;
+
+const ShaderTranslation = struct {
+    program: ProgramPair = .{},
+    used: bool = false,
+    vertex_isa: ?[]u32 = null,
+    pixel_isa: ?[]u32 = null,
+    vertex_spirv: ?[]u32 = null,
+    pixel_spirv: ?[]u32 = null,
+    vertex_slots: []ScalarSlot = &.{},
+    pixel_slots: []ScalarSlot = &.{},
+
+    fn freeTranslation(self: *ShaderTranslation, allocator: std.mem.Allocator) void {
+        if (self.vertex_spirv) |words| allocator.free(words);
+        if (self.pixel_spirv) |words| allocator.free(words);
+        if (self.vertex_slots.len != 0) allocator.free(self.vertex_slots);
+        if (self.pixel_slots.len != 0) allocator.free(self.pixel_slots);
+        self.vertex_spirv = null;
+        self.pixel_spirv = null;
+        self.vertex_slots = &.{};
+        self.pixel_slots = &.{};
+    }
+
+    fn deinit(self: *ShaderTranslation, allocator: std.mem.Allocator) void {
+        if (self.vertex_isa) |words| allocator.free(words);
+        if (self.pixel_isa) |words| allocator.free(words);
+        self.freeTranslation(allocator);
+        self.* = .{};
+    }
+};
+
+var registry: [max_registrations]ShaderTranslation = [_]ShaderTranslation{.{}} ** max_registrations;
+var next_slot: usize = 0;
 var diagnostic: ?Diagnostic = null;
 
-pub fn registerShader(stage: Stage, words: []const u32) void {
+fn findEntry(program: ProgramPair) ?usize {
+    for (&registry, 0..) |*entry, i| {
+        if (entry.used and entry.program.vertex == program.vertex and entry.program.pixel == program.pixel) return i;
+    }
+    return null;
+}
+
+/// Register one stage's ISA for an exact GNM program pair. When both stages of
+/// that pair are present the pair is (re)translated; a single stage alone never
+/// produces a usable translation.
+pub fn registerShaderFor(program: ProgramPair, stage: Stage, words: []const u32) void {
     const allocator = std.heap.page_allocator;
     const copy = allocator.dupe(u32, words) catch return;
 
     lockGlobal();
     defer lock.unlock();
 
-    const isa_slot = if (stage == .vertex) &vertex_isa else &pixel_isa;
-    const spirv_slot = if (stage == .vertex) &vertex_spirv else &pixel_spirv;
+    const index = findEntry(program) orelse blk: {
+        var free_slot: ?usize = null;
+        for (&registry, 0..) |*entry, i| {
+            if (!entry.used) {
+                free_slot = i;
+                break;
+            }
+        }
+        const slot = free_slot orelse next_slot;
+        next_slot = (slot + 1) % max_registrations;
+        registry[slot].deinit(allocator); // recycle a fresh or evicted slot
+        registry[slot].program = program;
+        registry[slot].used = true;
+        break :blk slot;
+    };
+    var entry = &registry[index];
+
+    const isa_slot = if (stage == .vertex) &entry.vertex_isa else &entry.pixel_isa;
     if (isa_slot.*) |old| allocator.free(old);
     isa_slot.* = copy;
-    if (spirv_slot.*) |old| {
-        allocator.free(old);
-        spirv_slot.* = null;
-    }
-    const slot_slot = if (stage == .vertex) &vertex_slots else &pixel_slots;
-    if (slot_slot.*.len != 0) allocator.free(slot_slot.*);
-    slot_slot.* = &.{};
 
+    // A change to either stage invalidates the whole pair's translation.
+    entry.freeTranslation(allocator);
     diagnostic = null;
-    var slots: []ScalarSlot = &.{};
-    const translated = translateShaderSlots(allocator, if (stage == .vertex) .vertex else .pixel, copy, &slots) catch |err| {
-        diagnostic = .{ .stage = if (stage == .vertex) .vertex else .pixel, .reason = @errorName(err) };
+    if (entry.vertex_isa == null or entry.pixel_isa == null) return;
+
+    var vertex_slots: []ScalarSlot = &.{};
+    const vertex_words = translateShaderSlots(allocator, .vertex, entry.vertex_isa.?, &vertex_slots) catch |err| {
+        diagnostic = .{ .stage = .vertex, .reason = @errorName(err) };
         return;
     };
-    spirv_slot.* = translated;
-    slot_slot.* = slots;
+    var pixel_slots: []ScalarSlot = &.{};
+    const pixel_words = translateShaderSlots(allocator, .pixel, entry.pixel_isa.?, &pixel_slots) catch |err| {
+        allocator.free(vertex_words);
+        if (vertex_slots.len != 0) allocator.free(vertex_slots);
+        diagnostic = .{ .stage = .pixel, .reason = @errorName(err) };
+        return;
+    };
+
+    entry.vertex_spirv = vertex_words;
+    entry.pixel_spirv = pixel_words;
+    entry.vertex_slots = vertex_slots;
+    entry.pixel_slots = pixel_slots;
 }
 
-/// Dynamic scalar layout for the last successfully registered stage. The draw
-/// path fills values in this exact order before `writeGraphicsScalarValues`.
+/// Test helper: register against the zero program pair.
+pub fn registerShader(stage: Stage, words: []const u32) void {
+    registerShaderFor(.{}, stage, words);
+}
+
+/// Dynamic scalar layout for an exact program pair/stage. The draw path fills
+/// values in this exact order before `writeGraphicsScalarValues`.
+pub fn scalarSlotsFor(program: ProgramPair, stage: Stage) []const ScalarSlot {
+    lockGlobal();
+    defer lock.unlock();
+    const index = findEntry(program) orelse return &.{};
+    const entry = &registry[index];
+    return if (stage == .vertex) entry.vertex_slots else entry.pixel_slots;
+}
+
+/// Test helper over the zero program pair.
 pub fn scalarSlots(stage: Stage) []const ScalarSlot {
-    lockGlobal();
-    defer lock.unlock();
-    return if (stage == .vertex) vertex_slots else pixel_slots;
+    return scalarSlotsFor(.{}, stage);
 }
 
-/// Returns the translated stage outputs, or null until both a real vertex and
-/// pixel shader have been registered and translated successfully.
-pub fn translatedGraphics() ?TranslatedGraphics {
+/// Returns the translated stage outputs for an exact program pair, or null
+/// unless both stages for that pair are present and translated successfully.
+pub fn translatedGraphicsFor(program: ProgramPair) ?TranslatedGraphics {
     lockGlobal();
     defer lock.unlock();
-    if (vertex_spirv == null or pixel_spirv == null) return null;
-    return .{ .vertex_words = vertex_spirv.?, .fragment_words = pixel_spirv.? };
+    const index = findEntry(program) orelse return null;
+    const entry = &registry[index];
+    if (entry.vertex_spirv == null or entry.pixel_spirv == null) return null;
+    return .{ .vertex_words = entry.vertex_spirv.?, .fragment_words = entry.pixel_spirv.? };
+}
+
+/// Test helper over the zero program pair.
+pub fn translatedGraphics() ?TranslatedGraphics {
+    return translatedGraphicsFor(.{});
 }
 
 pub fn lastDiagnostic() ?Diagnostic {

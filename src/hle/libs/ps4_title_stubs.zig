@@ -56,6 +56,14 @@ fn stageFromIsa(words: []const u32) ?ps4_mode.gcn_translate.Stage {
     return null;
 }
 
+/// The exact VS/PS program pair the guest has currently bound. Shader ISA
+/// registrations are keyed by this pair so the draw can look up the matching
+/// translation instead of whichever blob a scan happened to find first.
+fn boundProgram() ps4_mode.ProgramPair {
+    const programs = shader_binding.programs();
+    return .{ .vertex = programs.vertex, .pixel = programs.pixel };
+}
+
 fn registerRealShaderAt(address: u64) bool {
     var bytes: [2048]u8 = undefined;
     if (!agc_submit.readGuestMemory(null, address, &bytes)) return false;
@@ -67,7 +75,7 @@ fn registerRealShaderAt(address: u64) bool {
     if (count > words.len) return false;
     for (0..count) |i| words[i] = std.mem.readInt(u32, isa[i * 4 ..][0..4], .little);
     const stage = stageFromIsa(words[0..count]) orelse return false;
-    ps4_mode.gcn_translate.registerShader(stage, words[0..count]);
+    ps4_mode.gcn_translate.registerShaderFor(boundProgram(), stage, words[0..count]);
     return ps4_mode.gcn_translate.lastDiagnostic() == null;
 }
 
@@ -94,7 +102,7 @@ fn tryRegisterRealShaders() void {
         for (0..count) |i| words[i] = std.mem.readInt(u32, isa[i * 4 ..][0..4], .little);
         const stage = stageFromIsa(words[0..count]) orelse continue;
         if ((stage == .vertex and vs_ok) or (stage == .pixel and ps_ok)) continue;
-        ps4_mode.gcn_translate.registerShader(stage, words[0..count]);
+        ps4_mode.gcn_translate.registerShaderFor(boundProgram(), stage, words[0..count]);
         if (ps4_mode.gcn_translate.lastDiagnostic() != null) continue;
         if (stage == .vertex) vs_ok = true else ps_ok = true;
         if (vs_ok and ps_ok) break;
