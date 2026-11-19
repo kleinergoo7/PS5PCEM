@@ -49361,7 +49361,13 @@ test "PS5 draws never take the PS4 fixed-color fallback" {
     try std.testing.expect(gpu.resources.ShaderStage.pixel.programAddress(&state) != null);
 
     // PS5: even with both program registers bound, the fallback is off and the
-    // native guest-draw path is the only one that can run.
+    // native guest-draw path is the only one that can run. Captured PS4 GCN
+    // resources never pull a PS5 draw into the fallback either.
+    ps4_mode.gcn_resources.publish(ps4_mode.gcn_resources.capture(
+        &ps4_mode.terraria_frame_test.captured_dcb,
+    ));
+    defer ps4_mode.gcn_resources.resetCapture();
+    try std.testing.expect(ps4_mode.gcn_resources.captured() != null);
     ps4_compat_enabled = false;
     try std.testing.expect(!Renderer.wantsPs4FixedColorDraw(&state));
 

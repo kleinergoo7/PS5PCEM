@@ -141,6 +141,37 @@ pub const Resources = struct {
     }
 };
 
+/// PS4-only submit-boundary capture. The GNM driver calls `publish` with the
+/// raw DCB at submit; the PS4 draw reads `captured` to bind T#/S#/V# resources.
+/// A mutex and value copy keep this safe for the multi-threaded command queue.
+var captured_lock: std.atomic.Mutex = .unlocked;
+var captured_resources: Resources = .{};
+var captured_valid: bool = false;
+
+/// Publish the resources decoded from one submitted DCB. PS4 submit boundary.
+pub fn publish(res: Resources) void {
+    while (!captured_lock.tryLock()) std.atomic.spinLoopHint();
+    defer captured_lock.unlock();
+    captured_resources = res;
+    captured_valid = true;
+}
+
+/// Latest captured resources, or null before the first PS4 submission.
+pub fn captured() ?Resources {
+    while (!captured_lock.tryLock()) std.atomic.spinLoopHint();
+    defer captured_lock.unlock();
+    if (!captured_valid) return null;
+    return captured_resources;
+}
+
+/// Clear captured state (PS4 session reset / tests).
+pub fn resetCapture() void {
+    while (!captured_lock.tryLock()) std.atomic.spinLoopHint();
+    defer captured_lock.unlock();
+    captured_resources = .{};
+    captured_valid = false;
+}
+
 /// GCN T# tiling_index → the only four layouts image_layout.zig models.
 fn mapTiling(index: u8) image_layout.Tiling {
     return switch (index) {
@@ -428,6 +459,23 @@ test "format helpers decode GCN V#/T#/S#/pointer descriptors" {
     try std.testing.expectEqual(ResourceKind.raw_address, p.kind);
     try std.testing.expectEqual(@as(u64, 0x10_1009cbb0), p.address);
     try std.testing.expectEqual(null, format(&.{ 0x1, 0x2, 0x3 }));
+}
+
+test "publish/captured/reset expose the latest DCB resources at the submit boundary" {
+    resetCapture();
+    defer resetCapture();
+    try std.testing.expect(captured() == null);
+
+    const res = capture(dcb);
+    publish(res);
+    const got = captured() orelse return error.TestExpectedResources;
+    try std.testing.expectEqual(@as(usize, 13), got.count);
+    // The settled PS USER_DATA row is copied by value, not shared with `res`.
+    try std.testing.expectEqual(@as(u32, 0x10168c80), got.pixel_user_data[4]);
+    try std.testing.expect(hasBinding(&got, .pixel, 0x10, .sampled_image, 0x10_168c8000));
+
+    resetCapture();
+    try std.testing.expect(captured() == null);
 }
 
 test "capture ignores SH packets outside USER_DATA rows and malformed packets" {
