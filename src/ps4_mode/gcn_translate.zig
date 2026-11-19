@@ -19,6 +19,12 @@ pub const TranslatedGraphics = struct {
     fragment_words: []const u32,
 };
 
+/// PS4-only dynamic scalar layout. One slot per SGPR the GCN program reads plus
+/// one slot per SMEM destination word, in a deterministic order. The draw path
+/// uploads values in exactly this order; the writer loads slot N from
+/// `dynamic_scalar_binding.value_base + N`.
+pub const ScalarSlot = rdna2.spirv.ScalarRegister;
+
 pub const Error = error{
     NoShader,
     UnsupportedInstruction,
@@ -33,6 +39,17 @@ pub const Diagnostic = struct {
 /// Translate a raw GCN word stream into owned SPIR-V words. Unsupported
 /// instructions are reported as an error instead of being silently dropped.
 pub fn translateShader(allocator: std.mem.Allocator, stage: Stage, words: []const u32) Error![]u32 {
+    return translateShaderSlots(allocator, stage, words, null);
+}
+
+/// Same as `translateShader`, but also returns the owned dynamic scalar layout
+/// used by `options.scalar_registers`. The draw path consumes this layout.
+fn translateShaderSlots(
+    allocator: std.mem.Allocator,
+    stage: Stage,
+    words: []const u32,
+    slots_out: ?*[]ScalarSlot,
+) Error![]u32 {
     var seen = gcn_decode.decode(words);
     while (try seen.next()) |inst| {
         if (inst.tag() == .unsupported) return error.UnsupportedInstruction;
@@ -50,12 +67,63 @@ pub fn translateShader(allocator: std.mem.Allocator, stage: Stage, words: []cons
         }
     }
 
-    var options = try buildOptions(allocator, stage, &decoded.program);
+    const slots = try buildScalarSlots(allocator, &decoded.program);
+    var handed_off = false;
+    defer if (!handed_off) allocator.free(slots);
+
+    var options = try buildOptions(allocator, stage, &decoded.program, slots);
     defer options.deinit();
 
     var module = try rdna2.translateProgramSpirv(allocator, &decoded.program, options.options);
     defer module.deinit(allocator);
-    return try allocator.dupe(u32, module.words);
+    const spirv_words = try allocator.dupe(u32, module.words);
+    if (slots_out) |out| {
+        out.* = slots;
+        handed_off = true;
+    }
+    return spirv_words;
+}
+
+/// Collect SGPR provenance for the decoded program. SMEM destination words get
+/// `producer_pc` so `rdna2` replaces the load with a dynamic scalar load; every
+/// other SGPR read gets an entry-time slot. Values are placeholders — the real
+/// values are uploaded per draw.
+fn buildScalarSlots(allocator: std.mem.Allocator, program: *const rdna2.Program) Error![]ScalarSlot {
+    var slots: std.ArrayList(ScalarSlot) = .empty;
+    errdefer slots.deinit(allocator);
+
+    // Pass 1: SMEM destinations, in program order. `rdna2` requires every word
+    // of a multi-dword load to share the producer PC.
+    for (program.instructions.items) |inst| {
+        if (inst.family != .smem) continue;
+        const dst = switch (inst.dst.kind) {
+            .sgpr => inst.dst.reg,
+            else => continue,
+        };
+        const count: usize = @max(inst.data_words, 1);
+        if (dst + count > 128) continue;
+        for (0..count) |word| {
+            try slots.append(allocator, .{
+                .register = @intCast(dst + word),
+                .value = 0,
+                .producer_pc = inst.pc,
+            });
+        }
+    }
+
+    // Pass 2: entry-time SGPR reads not already produced by an SMEM load.
+    var covered: [128]bool = @splat(false);
+    for (slots.items) |slot| covered[slot.register] = true;
+    for (program.instructions.items) |inst| {
+        var sources = inst.sources();
+        for (sources.slice()) |source| {
+            if (source.kind != .sgpr or source.reg >= 128) continue;
+            if (covered[source.reg]) continue;
+            covered[source.reg] = true;
+            try slots.append(allocator, .{ .register = source.reg, .value = 0 });
+        }
+    }
+    return try slots.toOwnedSlice(allocator);
 }
 
 /// PS4 resource/options builder. Milestone 1 derives sampled images and vertex
@@ -73,7 +141,7 @@ const OptionsBuilder = struct {
     }
 };
 
-fn buildOptions(allocator: std.mem.Allocator, stage: Stage, program: *const rdna2.Program) Error!OptionsBuilder {
+fn buildOptions(allocator: std.mem.Allocator, stage: Stage, program: *const rdna2.Program, slots: []const ScalarSlot) Error!OptionsBuilder {
     var builder = OptionsBuilder{ .allocator = allocator };
     errdefer builder.deinit();
 
@@ -98,11 +166,24 @@ fn buildOptions(allocator: std.mem.Allocator, stage: Stage, program: *const rdna
     // Two interpolated PS inputs (TEXCOORD0/COLOR0) is the sprite-shader
     // convention; the writer infers parameter_mask/color_export_mask from the
     // decoded VINTRP and EXP instructions themselves.
+    // PS4-only: SGPR-backed values are host-updated per draw instead of baked
+    // into OpConstant. Binding 34 is the backend's dedicated dynamic scalar
+    // storage buffer (2 + maximum_storage_images); the fragment stage uses a
+    // disjoint value_base so writeGraphicsScalarValues can fill both stages.
+    const fragment_words_per_stage: u32 = 512 * 16 + 128 * 2;
     builder.options = .{
         .stage = if (stage == .vertex) .vertex else .fragment,
         .sampled_images = builder.images.items,
         .storage_buffers = builder.buffers.items,
         .fragment_inputs = .{ .allocated = 0b11, .enabled = 0b11 },
+        .scalar_registers = slots,
+        .vertex_corner_vgprs = if (stage == .vertex) .{ 2, 3 } else null,
+        .vertex_position_corner_override = stage == .vertex,
+        .dynamic_scalar_binding = if (slots.len != 0) .{
+            .binding = 2 + rdna2.spirv.maximum_storage_images,
+            .value_base = if (stage == .vertex) 0 else fragment_words_per_stage,
+        } else null,
+        .specialized_scalar_prefix_end = std.math.maxInt(u32),
     };
     return builder;
 }
@@ -118,6 +199,8 @@ var vertex_isa: ?[]u32 = null;
 var pixel_isa: ?[]u32 = null;
 var vertex_spirv: ?[]u32 = null;
 var pixel_spirv: ?[]u32 = null;
+var vertex_slots: []ScalarSlot = &.{};
+var pixel_slots: []ScalarSlot = &.{};
 var diagnostic: ?Diagnostic = null;
 
 pub fn registerShader(stage: Stage, words: []const u32) void {
@@ -135,13 +218,26 @@ pub fn registerShader(stage: Stage, words: []const u32) void {
         allocator.free(old);
         spirv_slot.* = null;
     }
+    const slot_slot = if (stage == .vertex) &vertex_slots else &pixel_slots;
+    if (slot_slot.*.len != 0) allocator.free(slot_slot.*);
+    slot_slot.* = &.{};
 
     diagnostic = null;
-    const translated = translateShader(allocator, if (stage == .vertex) .vertex else .pixel, copy) catch |err| {
+    var slots: []ScalarSlot = &.{};
+    const translated = translateShaderSlots(allocator, if (stage == .vertex) .vertex else .pixel, copy, &slots) catch |err| {
         diagnostic = .{ .stage = if (stage == .vertex) .vertex else .pixel, .reason = @errorName(err) };
         return;
     };
     spirv_slot.* = translated;
+    slot_slot.* = slots;
+}
+
+/// Dynamic scalar layout for the last successfully registered stage. The draw
+/// path fills values in this exact order before `writeGraphicsScalarValues`.
+pub fn scalarSlots(stage: Stage) []const ScalarSlot {
+    lockGlobal();
+    defer lock.unlock();
+    return if (stage == .vertex) vertex_slots else pixel_slots;
 }
 
 /// Returns the translated stage outputs, or null until both a real vertex and
@@ -210,6 +306,62 @@ test "vertex exports translate through the shared SPIR-V writer" {
     const words = try translateShader(std.testing.allocator, .vertex, &vs);
     defer std.testing.allocator.free(words);
     try std.testing.expect(words.len > 0); // vertex stage emits position + PARAM outputs
+}
+
+test "translated VS loads SGPR scalars dynamically from the dedicated binding" {
+    // v_mov_b32 v0, s8 followed by a POS0 export: s8 must become an
+    // OpAccessChain + OpLoad from binding 34, not an OpConstant.
+    const vs = [_]u32{
+        gcn_decode.vop1(1, 0, 8),
+        gcn_decode.exp(0, 0xf, true, .{ 0, 0, 0, 0 })[0],
+        gcn_decode.exp(0, 0xf, true, .{ 0, 0, 0, 0 })[1],
+        0xbf81_0000,
+    };
+    const words = try translateShader(std.testing.allocator, .vertex, &vs);
+    defer std.testing.allocator.free(words);
+
+    try std.testing.expect(containsOpcode(words, 65)); // OpAccessChain
+    try std.testing.expect(containsOpcode(words, 61)); // OpLoad
+    var found_binding = false;
+    for (words, 0..) |word, i| {
+        if (i + 3 >= words.len) break;
+        if (word == 0x0004_0047 and words[i + 2] == 2 + rdna2.spirv.maximum_storage_images and words[i + 3] == 0) {
+            found_binding = true;
+        }
+    }
+    try std.testing.expect(found_binding);
+
+    // The PS4 sprite transform seeds POS0 from Vulkan VertexIndex corners.
+    var found_vertex_index = false;
+    for (words, 0..) |word, i| {
+        if (i + 3 >= words.len) break;
+        if (word == 0x0004_0047 and words[i + 2] == 11 and words[i + 3] == 42) found_vertex_index = true;
+    }
+    try std.testing.expect(found_vertex_index);
+
+    // Slot order is stable: the same GCN program always yields the same layout.
+    var decoded = try gcn_decode.decodeToRdna2(std.testing.allocator, &vs);
+    defer decoded.deinit(std.testing.allocator);
+    const slots = try buildScalarSlots(std.testing.allocator, &decoded.program);
+    defer std.testing.allocator.free(slots);
+    try std.testing.expect(slots.len > 0);
+    try std.testing.expectEqual(@as(u32, 8), slots[0].register);
+}
+
+test "dynamic scalar values do not change translated SPIR-V words" {
+    // The host uploads values into the scalar buffer per draw; translation is
+    // independent of them, matching rdna2's dynamic-scalar contract.
+    const vs = [_]u32{
+        gcn_decode.vop1(1, 0, 8),
+        gcn_decode.exp(0, 0xf, true, .{ 0, 0, 0, 0 })[0],
+        gcn_decode.exp(0, 0xf, true, .{ 0, 0, 0, 0 })[1],
+        0xbf81_0000,
+    };
+    const first = try translateShader(std.testing.allocator, .vertex, &vs);
+    defer std.testing.allocator.free(first);
+    const second = try translateShader(std.testing.allocator, .vertex, &vs);
+    defer std.testing.allocator.free(second);
+    try std.testing.expectEqualSlices(u32, first, second);
 }
 
 test "unsupported GCN instructions are reported, not silently dropped" {

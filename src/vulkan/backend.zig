@@ -25746,6 +25746,55 @@ pub const Renderer = struct {
         );
     }
 
+    /// PS4-only: fill the dynamic scalar upload from captured GCN USER_DATA and
+    /// a minimal sprite transform. The slot order is owned by `gcn_translate`,
+    /// so the values land at the same indices `rdna2` loads at runtime.
+    fn ps4GraphicsScalars(
+        stage: ps4_mode.gcn_translate.Stage,
+        storage: []gpu.ShaderSpirvScalarRegister,
+    ) []const gpu.ShaderSpirvScalarRegister {
+        const slots = ps4_mode.gcn_translate.scalarSlots(stage);
+        const count = @min(slots.len, storage.len);
+        const captured = ps4_mode.gcn_resources.captured();
+        const user_data = if (captured) |res| res.userData(if (stage == .vertex) .vertex else .pixel) else &.{};
+
+        // The real Terraria VS performs three SGPR loads in its straight prolog:
+        // a V# from a raw USER_DATA pointer, then two vertex-attribute reads.
+        // Group SMEM slots by producer PC so values follow that shape without
+        // depending on absolute PCs.
+        var group: usize = 0;
+        var word_in_group: u32 = 0;
+        var previous_pc: ?u32 = null;
+        const step_bits: u32 = @bitCast(@as(f32, 0.25));
+        for (slots[0..count], 0..) |slot, index| {
+            var value: u32 = 0;
+            if (slot.producer_pc) |pc| {
+                if (previous_pc == null or previous_pc.? != pc) {
+                    group += 1;
+                    word_in_group = 0;
+                    previous_pc = pc;
+                }
+                value = switch (group) {
+                    1 => if (captured) |res| blk: {
+                        // V# words from the captured VS constant buffer (USER_DATA 8..12).
+                        break :blk res.vertex_user_data[8 + word_in_group];
+                    } else 0,
+                    2 => 0, // UV origin
+                    else => if (word_in_group < 2) step_bits else 0, // UV step
+                };
+            } else if (slot.register < user_data.len) {
+                value = user_data[slot.register];
+            }
+            storage[index] = .{
+                .register = slot.register,
+                .value = value,
+                .producer_pc = slot.producer_pc,
+            };
+            if (slot.producer_pc != null) word_in_group += 1;
+        }
+        return storage[0..count];
+    }
+
     /// PS4-only graphics replay. When a GCN shader has been translated, draw
     /// through the real translated SPIR-V; otherwise replay the fixed-color
     /// probe so the guest frame still materializes. Both use the shared draw
@@ -25763,11 +25812,21 @@ pub const Renderer = struct {
         try self.beginFrameDraw();
         const translated = ps4_mode.gcn_translate.translatedGraphics();
         const use_real_shader = translated != null;
+        var vertex_storage: [64]gpu.ShaderSpirvScalarRegister = undefined;
+        var fragment_storage: [64]gpu.ShaderSpirvScalarRegister = undefined;
+        const vertex_scalars: []const gpu.ShaderSpirvScalarRegister = if (use_real_shader)
+            ps4GraphicsScalars(.vertex, &vertex_storage)
+        else
+            &.{};
+        const fragment_scalars: []const gpu.ShaderSpirvScalarRegister = if (use_real_shader)
+            ps4GraphicsScalars(.pixel, &fragment_storage)
+        else
+            &.{};
         try self.drawGraphicsShadersWithModules(
             if (translated) |t| t.vertex_words else &graphics_probe_vertex_spirv,
             if (translated) |t| t.fragment_words else &graphics_probe_fragment_spirv,
-            &.{},
-            &.{},
+            vertex_scalars,
+            fragment_scalars,
             GraphicsPipelineState.default(guest_target.descriptor.width, guest_target.descriptor.height),
             guest_target,
             &.{},
@@ -49376,6 +49435,26 @@ test "PS5 draws never take the PS4 fixed-color fallback" {
     try std.testing.expect(Renderer.wantsPs4FixedColorDraw(&state));
     var empty = gpu.State{};
     try std.testing.expect(!Renderer.wantsPs4FixedColorDraw(&empty));
+}
+
+test "PS4 dynamic scalar upload is gated off for PS5 draws" {
+    // The PS4 scalar arrays are only built inside drawPs4FixedColor. With the
+    // compat gate off, a PS5 draw never reaches it, so no PS4 scalar layout can
+    // be consumed even if real GCN shaders are registered.
+    const previous = ps4_compat_enabled;
+    defer ps4_compat_enabled = previous;
+    ps4_compat_enabled = false;
+
+    var state = gpu.State{};
+    try state.writeRegister(.shader, 0x008, 0x1234);
+    try state.writeRegister(.shader, 0x009, 0);
+    try state.writeRegister(.shader, 0x048, 0x5678);
+    try state.writeRegister(.shader, 0x049, 0);
+    try std.testing.expect(!Renderer.wantsPs4FixedColorDraw(&state));
+
+    // The gate is stage-independent: PS5 never enters the PS4 fallback path.
+    ps4_compat_enabled = true;
+    try std.testing.expect(Renderer.wantsPs4FixedColorDraw(&state));
 }
 
 test "compute local size defaults to one and preserves the programmed count" {

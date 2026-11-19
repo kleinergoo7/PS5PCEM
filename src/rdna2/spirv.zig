@@ -459,6 +459,11 @@ pub const Options = struct {
     /// shader starts. Other graphics system values remain explicit future
     /// stage-interface work rather than silently receiving zero.
     vertex_index_vgpr: ?u8 = null,
+    /// PS4-only: seed two VGPRs with the float quad corners (index&1, index>>1)
+    /// derived from VertexIndex. Default null so every native path is unchanged.
+    vertex_corner_vgprs: ?[2]u8 = null,
+    /// PS4-only: export POS0 directly from those corners as a screen-space quad.
+    vertex_position_corner_override: bool = false,
     tessellation_inputs: ?TessellationInputs = null,
     /// Converts a guest -W..W position export to Vulkan's 0..W clip-depth
     /// convention. Leave clear when PA_CL_CLIP_CNTL selects DX clip space.
@@ -1090,6 +1095,8 @@ const Builder = struct {
     label: u32,
     stage: Stage,
     vertex_index_vgpr: ?u8,
+    vertex_corner_vgprs: ?[2]u8,
+    vertex_position_corner_override: bool,
     tessellation_inputs: ?TessellationInputs,
     tess_coord_input: u32 = 0,
     patch_id_input: u32 = 0,
@@ -1290,6 +1297,8 @@ const Builder = struct {
             .label = 0,
             .stage = options.stage,
             .vertex_index_vgpr = options.vertex_index_vgpr,
+            .vertex_corner_vgprs = options.vertex_corner_vgprs,
+            .vertex_position_corner_override = options.vertex_position_corner_override,
             .tessellation_inputs = options.tessellation_inputs,
             .convert_negative_one_to_one_depth = options.convert_negative_one_to_one_depth,
             .vertex_depth_transform = options.vertex_depth_transform,
@@ -1415,7 +1424,7 @@ const Builder = struct {
             try self.emit(&self.declarations, 59, &.{ block_pointer, self.gds_memory, 12 }); // OpVariable
         }
 
-        if (options.vertex_index_vgpr != null and options.stage != .vertex) {
+        if ((options.vertex_index_vgpr != null or options.vertex_corner_vgprs != null) and options.stage != .vertex) {
             return Error.InvalidStageInterface;
         }
         if (options.tessellation_inputs) |tess| {
@@ -1507,7 +1516,7 @@ const Builder = struct {
                     try self.emit(&self.declarations, 59, &.{ coord_pointer, self.tess_coord_input, 1 });
                     try self.emit(&self.declarations, 59, &.{ patch_pointer, self.patch_id_input, 1 });
                 }
-                if (options.vertex_index_vgpr != null) {
+                if (options.vertex_index_vgpr != null or options.vertex_corner_vgprs != null) {
                     const input_pointer = self.id();
                     self.vertex_index_input = self.id();
                     try self.emit(&self.annotations, 71, &.{ self.vertex_index_input, 11, 42 }); // BuiltIn VertexIndex
@@ -5233,11 +5242,29 @@ const Builder = struct {
         if (self.vertex_index_input != 0) {
             const result = self.id();
             try self.emit(&self.body, 61, &.{ self.signed_type, result, self.vertex_index_input }); // OpLoad
-            const vgpr = self.vertex_index_vgpr orelse return Error.InvalidStageInterface;
-            self.registers[128 + @as(usize, vgpr)] = .{
-                .id = try self.convert(.{ .id = result, .value_type = .sint32 }, .bits32),
-                .value_type = .bits32,
-            };
+            if (self.vertex_corner_vgprs) |corners| {
+                // PS4-only sprite transform: the real Terraria VS consumes two
+                // uninitialised VGPRs as per-vertex float multipliers. Seed them
+                // with (index&1, (index>>1)&1) so a 4-vertex draw forms a quad.
+                const as_bits = try self.convert(.{ .id = result, .value_type = .sint32 }, .bits32);
+                for (corners, 0..) |vgpr, axis| {
+                    const low = try self.andBits(as_bits, if (axis == 0) 1 else 2);
+                    const shifted = if (axis == 0) low else try self.shiftRightBits(low, 1);
+                    const as_float = self.id();
+                    try self.emit(&self.body, 124, &.{ self.float_type, as_float, shifted }); // OpBitcast
+                    self.registers[128 + @as(usize, vgpr)] = .{
+                        .id = as_float,
+                        .value_type = .float32,
+                    };
+                }
+            } else {
+                const vgpr = self.vertex_index_vgpr orelse return Error.InvalidStageInterface;
+                self.registers[128 + @as(usize, vgpr)] = .{
+                    .id = try self.convert(.{ .id = result, .value_type = .sint32 }, .bits32),
+                    .value_type = .bits32,
+                };
+            }
+            const vgpr = self.vertex_index_vgpr orelse 255;
 
             // The merged NGG/export ABI receives the vertex and instance ids
             // in v5/v8. An ordinary VS uses v0 and may use v5 as a temporary,
@@ -6083,6 +6110,18 @@ const Builder = struct {
             out_z = converted;
         }
         var components = [4]u32{ x, y, out_z, out_w };
+        if (is_position and self.vertex_position_corner_override) if (self.vertex_corner_vgprs) |corners| {
+            const corner_x = self.registers[128 + @as(usize, corners[0])];
+            const corner_y = self.registers[128 + @as(usize, corners[1])];
+            if (corner_x.id != 0 and corner_y.id != 0) {
+                components = .{
+                    try self.convert(corner_x, .float32),
+                    try self.convert(corner_y, .float32),
+                    zero,
+                    one,
+                };
+            }
+        };
         if (self.stage == .fragment and inst.export_target < self.color_export_mappings.len) {
             components = remapColorExportComponents(
                 components,
