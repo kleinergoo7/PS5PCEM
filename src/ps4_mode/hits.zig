@@ -26,6 +26,7 @@ var slots: [capacity]Slot = [_]Slot{.{}} ** capacity;
 /// `game_hook` before any PS4 wrapper runs. Read once on first use; `setEnabled`
 /// overrides it (tests, or a caller that already parsed the flag).
 var enabled: ?bool = null;
+var total_records: u64 = 0;
 
 fn isEnabled() bool {
     return enabled orelse blk: {
@@ -43,6 +44,8 @@ pub fn setEnabled(value: bool) void {
 /// free slot. Beyond capacity the hit is dropped rather than displacing data.
 pub fn record(name: []const u8) void {
     if (name.len == 0 or !isEnabled()) return;
+    total_records +%= 1;
+    if (total_records % 25_000 == 0) printReport();
     for (&slots) |*slot| {
         if (std.mem.eql(u8, slot.name, name)) {
             slot.count +%= 1;
@@ -70,9 +73,19 @@ pub fn report(buf: []u8) []const u8 {
     return buf[0..used];
 }
 
+/// Render one report line set to stderr (diagnostic mode only). Kept here so
+/// the PS4 hit table can be inspected without touching shared trace code.
+pub fn printReport() void {
+    var buf: [capacity * 48]u8 = undefined;
+    const text = report(&buf);
+    if (text.len == 0) return;
+    std.debug.print("[ps4_mode] wrapper hits (total={d}):\n{s}", .{ total_records, text });
+}
+
 /// Forget all counts so a later report starts from an empty table.
 pub fn reset() void {
     for (&slots) |*slot| slot.* = .{};
+    total_records = 0;
 }
 
 test "two records of one name report count 2, and reset clears it" {

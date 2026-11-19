@@ -9,18 +9,58 @@
 //! into the existing AGC command-stream machinery; what lives here is only
 //! the PS4-facing boundary: accept, validate, and hand over.
 //!
-//! All entry points are currently accept-and-report: they validate trivially
-//! invalid input (null buffers) and return success so titles progress past
-//! driver init into real command emission, which the packet pipeline lowers.
+//! `sceGnmSubmitAndFlipCommandBuffers` is the one hot path: PS4 GNM command
+//! buffers are GCN-era PM4, which the shared executor already walks. The PS4
+//! descriptor layout {addr[], size[]} is decoded here, then each buffer is
+//! handed to `agc_submit.submitDeviceStream` unchanged. Nothing in the shared
+//! executor knows this came from a PS4 title.
 
 const std = @import("std");
 const abi = @import("../abi.zig");
 const trace = @import("../trace.zig");
 const errno = @import("../errno.zig");
 const symbols = @import("../symbols.zig");
+const agc_submit = @import("agc_submit.zig");
+const kernel_memory = @import("kernel_memory.zig");
+const hits = @import("ps4_mode").hits;
 
-/// Submit readiness: always ready; the shared scheduler serializes anyway.
-fn sceGnmSubmitAndFlipCommandBuffers(_: u32, _: u64, _: u32, _: u64) callconv(abi.guest) i32 {
+/// Submit a PS4 GNM command buffer set through the shared AGC executor.
+///
+/// PS4 signature: (dcb_count, dcb_gpu_addrs[], dcb_sizes_bytes[],
+///                 flip_count, flip_gpu_addrs[], flip_sizes_bytes[]).
+/// The guest arrays are fixed-layout: pointers are 64-bit, sizes 32-bit.
+/// Invalid descriptors are skipped rather than faulting the emulator; the
+/// shared executor accepts everything else and reports its own outcome.
+fn sceGnmSubmitAndFlipCommandBuffers(
+    dcb_count: u32,
+    dcb_addrs: u64,
+    dcb_sizes: u64,
+    flip_count: u32,
+    flip_addrs: u64,
+    flip_sizes: u64,
+) callconv(abi.guest) i32 {
+    _ = flip_count;
+    _ = flip_addrs;
+    _ = flip_sizes;
+    hits.record("sceGnmSubmitAndFlipCommandBuffers");
+    if (dcb_addrs == 0 or dcb_sizes == 0) return errno.ok;
+    const addrs: [*]const u64 = @ptrFromInt(dcb_addrs);
+    const sizes: [*]const u32 = @ptrFromInt(dcb_sizes);
+    var submitted: u32 = 0;
+    var i: usize = 0;
+    while (i < dcb_count) : (i += 1) {
+        const addr = addrs[i];
+        const bytes = sizes[i];
+        if (addr == 0 or bytes == 0 or (bytes & 3) != 0) continue;
+        if (!kernel_memory.isGuestRangeAccessible(addr, bytes)) continue;
+        const words: usize = bytes / 4;
+        const stream: [*]const u32 = @ptrFromInt(addr);
+        _ = agc_submit.submitDeviceStream(stream[0..words]);
+        submitted += 1;
+    }
+    if (trace.announces("sceGnmSubmitAndFlipCommandBuffers")) {
+        std.debug.print("[gnm submit] dcbs={d} submitted={d}\n", .{ dcb_count, submitted });
+    }
     return errno.ok;
 }
 
