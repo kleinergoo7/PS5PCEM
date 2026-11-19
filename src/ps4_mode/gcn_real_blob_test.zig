@@ -475,6 +475,38 @@ test "real VS POS0 reads the staged V# indexed by the draw's sequential VertexIn
     try std.testing.expect(has_vertex_index);
 }
 
+test "V# fetch reconstruction is gated to the exact Terraria VS signature" {
+    // The real captured VS matches the narrow prolog signature and is injected.
+    try std.testing.expect(gcn_decode.isTerrariaVertexShader(&ps_words));
+
+    // A different synthetic VS that also exports POS0 must NOT be injected: no
+    // MUBUF fetch, no VertexIndex seed, so its own POS0 data flow is untouched.
+    const other_vs = [_]u32{
+        gcn_decode.vop2(0x08, 4, 4, 0x102), // v_mul_f32 v4, v4, 1.0
+        gcn_decode.exp(0x0c, 0xf, true, .{ 4, 4, 4, 4 })[0],
+        gcn_decode.exp(0x0c, 0xf, true, .{ 4, 4, 4, 4 })[1],
+        0xbf81_0000,
+    };
+    try std.testing.expect(!gcn_decode.isTerrariaVertexShader(&other_vs));
+    var decoded = try gcn_decode.decodeToRdna2(std.testing.allocator, &other_vs);
+    defer decoded.deinit(std.testing.allocator);
+    for (decoded.program.instructions.items) |inst|
+        try std.testing.expect(inst.opcode != .buffer_load_format_xyzw);
+
+    const other_program: ProgramPair = .{ .vertex = 0x1000000e88, .pixel = 0x1000000ea4 };
+    registerShaderFor(other_program, .vertex, &other_vs);
+    registerShaderFor(other_program, .pixel, &ps_words);
+    const spirv = translatedGraphicsFor(other_program).?.vertex_words;
+    var has_vertex_index = false;
+    var i: usize = 5;
+    while (i + 3 < spirv.len) {
+        const wc: usize = spirv[i] >> 16;
+        if (wc >= 4 and (spirv[i] & 0xffff) == 71 and spirv[i + 2] == 11 and spirv[i + 3] == 42) has_vertex_index = true;
+        i += @max(wc, 1);
+    }
+    try std.testing.expect(!has_vertex_index);
+}
+
 test "vertexDataSourceFor reports null with a diagnostic when no VS V# exists" {
     const empty: gcn_resources.Resources = .{};
     try std.testing.expect(vertexDataSourceFor(empty) == null);

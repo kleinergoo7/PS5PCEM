@@ -529,13 +529,30 @@ pub fn decodeToRdna2(allocator: std.mem.Allocator, words: []const u32) Error!Rdn
     return .{ .program = program, .normalized = owned };
 }
 
+/// Distinctive packed bit-twiddle prolog of the one captured Terraria VS whose
+/// attribute fetch is missing from the dump (words 2..8 of the 16-word ISA).
+/// Shared so the PS4 translator gates the reconstruction — and its v4
+/// VertexIndex seed — to this shader alone, never to an arbitrary POS0 VS.
+pub const terraria_vs_prolog = [_]u32{
+    0x3602_0081, 0x3402_0281, 0x3600_00c2, 0x4a02_02c1,
+    0x4a00_00c1, 0x7e02_0b01, 0x7e00_0b00,
+};
+
+/// True only for the exact captured Terraria VS (enough words plus the prolog
+/// signature). Used to gate the PS4-only V# fetch reconstruction.
+pub fn isTerrariaVertexShader(words: []const u32) bool {
+    if (words.len < 2 + terraria_vs_prolog.len) return false;
+    return std.mem.eql(u32, words[2 .. 2 + terraria_vs_prolog.len], &terraria_vs_prolog);
+}
+
 /// PS4 vertex front-end. Terraria's captured VS exports POS0 directly from
 /// VGPRs whose original attribute fetch is absent from the dumped ISA (its
 /// prolog words are packed bit-twiddles the GCN decoder cannot map). Supply the
 /// fetch from the guest V# the backend stages at descriptor 0: a four-component
 /// MUBUF indexed by VertexIndex (v4) into v0..v3, inserted immediately before
 /// the POS0 export. The positions are real bytes from the captured V#, never
-/// synthesized quad corners.
+/// synthesized quad corners. Callers must gate this with
+/// `isTerrariaVertexShader`; other VS programs use `decodeToRdna2`.
 pub fn decodeVertexToRdna2(allocator: std.mem.Allocator, words: []const u32) Error!Rdna2Program {
     const fetch = [2]u32{
         0xe00c_2000, // MUBUF op 0x03 (load_format_xyzw), idxen, offset 0

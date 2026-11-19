@@ -95,7 +95,10 @@ fn translateShaderSlots(
         if (inst.tag() == .unsupported) return error.UnsupportedInstruction;
     }
 
-    var decoded = if (stage == .vertex)
+    // Only the exact captured Terraria VS gets the reconstructed V# fetch;
+    // every other PS4 VS keeps its own POS0 data flow untouched.
+    const terraria_vs = stage == .vertex and gcn_decode.isTerrariaVertexShader(words);
+    var decoded = if (terraria_vs)
         try gcn_decode.decodeVertexToRdna2(allocator, words)
     else
         try gcn_decode.decodeToRdna2(allocator, words);
@@ -114,7 +117,7 @@ fn translateShaderSlots(
     var handed_off = false;
     defer if (!handed_off) allocator.free(slots);
 
-    var options = try buildOptions(allocator, stage, &decoded.program, slots, fragment_inputs, vertex_source);
+    var options = try buildOptions(allocator, stage, &decoded.program, slots, fragment_inputs, vertex_source, terraria_vs);
     defer options.deinit();
 
     var module = try rdna2.translateProgramSpirv(allocator, &decoded.program, options.options);
@@ -190,7 +193,7 @@ const OptionsBuilder = struct {
 /// translation without a measured source and strides its V# differently.
 const ps4_vertex_v_stride_fallback: u32 = 16;
 
-fn buildOptions(allocator: std.mem.Allocator, stage: Stage, program: *const rdna2.Program, slots: []const ScalarSlot, fragment_inputs: ?FragmentInputs, vertex_source: ?VertexDataSource) Error!OptionsBuilder {
+fn buildOptions(allocator: std.mem.Allocator, stage: Stage, program: *const rdna2.Program, slots: []const ScalarSlot, fragment_inputs: ?FragmentInputs, vertex_source: ?VertexDataSource, terraria_vs: bool) Error!OptionsBuilder {
     var builder = OptionsBuilder{ .allocator = allocator };
     errdefer builder.deinit();
 
@@ -251,10 +254,10 @@ fn buildOptions(allocator: std.mem.Allocator, stage: Stage, program: *const rdna
         // writer's override option stays default-off and native-identical.
         .vertex_corner_vgprs = null,
         .vertex_position_corner_override = false,
-        // The inserted V# fetch is indexed by v4. DRAW_INDEX_AUTO count=4 is
-        // replayed as four sequential vertices, so VertexIndex 0..3 addresses
-        // the four real vertex records.
-        .vertex_index_vgpr = if (stage == .vertex) 4 else null,
+        // Only the reconstructed Terraria fetch is indexed by v4; DRAW_INDEX_AUTO
+        // count=4 is replayed as four sequential vertices. Other VS programs
+        // keep v4 for their own purposes.
+        .vertex_index_vgpr = if (terraria_vs) 4 else null,
         .dynamic_scalar_binding = if (slots.len != 0) .{
             .binding = 2 + rdna2.spirv.maximum_storage_images,
             .value_base = if (stage == .vertex) 0 else fragment_words_per_stage,
@@ -553,14 +556,14 @@ test "translated VS loads SGPR scalars dynamically from the dedicated binding" {
     }
     try std.testing.expect(found_binding);
 
-    // The PS4 VS declares VertexIndex only to index the reconstructed V# fetch;
-    // the old quad-corner seed (AND/shift/bitcast into POS0) is gone.
+    // This hand-built VS lacks the Terraria prolog signature, so neither the
+    // old quad-corner seed nor the reconstructed v4 V# index is applied.
     var found_vertex_index = false;
     for (words, 0..) |word, i| {
         if (i + 3 >= words.len) break;
         if (word == 0x0004_0047 and words[i + 2] == 11 and words[i + 3] == 42) found_vertex_index = true;
     }
-    try std.testing.expect(found_vertex_index);
+    try std.testing.expect(!found_vertex_index);
 
     // Slot order is stable: the same GCN program always yields the same layout.
     var decoded = try gcn_decode.decodeToRdna2(std.testing.allocator, &vs);
@@ -591,9 +594,9 @@ test "dynamic scalar values do not change translated SPIR-V words" {
     defer std.testing.allocator.free(second_values);
     for (second_values) |*slot| slot.value = 0xdead_beef;
 
-    var first_options = try buildOptions(std.testing.allocator, .vertex, &decoded.program, first_values, null, null);
+    var first_options = try buildOptions(std.testing.allocator, .vertex, &decoded.program, first_values, null, null, false);
     defer first_options.deinit();
-    var second_options = try buildOptions(std.testing.allocator, .vertex, &decoded.program, second_values, null, null);
+    var second_options = try buildOptions(std.testing.allocator, .vertex, &decoded.program, second_values, null, null, false);
     defer second_options.deinit();
     var first_module = try rdna2.translateProgramSpirv(std.testing.allocator, &decoded.program, first_options.options);
     defer first_module.deinit(std.testing.allocator);
