@@ -14,11 +14,179 @@ const std = @import("std");
 const gcn_blob = @import("gcn_blob.zig");
 const gcn_decode = @import("gcn_decode.zig");
 const gcn_translate = @import("gcn_translate.zig");
+const gcn_resources = @import("gcn_resources.zig");
 
 const ProgramPair = gcn_translate.ProgramPair;
 const registerShaderFor = gcn_translate.registerShaderFor;
 const translatedGraphicsFor = gcn_translate.translatedGraphicsFor;
 const fragmentInputsFor = gcn_translate.fragmentInputsFor;
+const vertexDataSourceFor = gcn_translate.vertexDataSourceFor;
+const capture = gcn_resources.capture;
+const real_terraria_dcb = @import("terraria_frame_test.zig").captured_dcb;
+
+/// Pair used by the PS4 vertex-path check. `vs_words` is registered as VS (the
+/// writer maps EXP target 0 to BuiltIn Position) and `ps_words` as PS.
+const program: ProgramPair = .{ .vertex = 0x1000000a88, .pixel = 0x1000000aa4 };
+
+/// True when the synthetic `VertexIndex & 1 / >> 1` -> float quad-corner pattern
+/// (seeded by the rdna2 writer's vertex_corner_vgprs option) is present.
+fn syntheticCornerSequence(words: []const u32) bool {
+    var masked: [256]u32 = undefined;
+    var nmasked: usize = 0;
+    var i: usize = 5;
+    while (i < words.len) {
+        const wc: usize = words[i] >> 16;
+        const op: u32 = words[i] & 0xffff;
+        if (wc >= 5 and i + wc <= words.len) {
+            // OpBitwiseAnd(199) by 1/2 or OpShiftRightLogical(194) by 1: the
+            // constants the quad-corner seed uses, unlike descriptor masks.
+            const amount = words[i + 4];
+            const corner_op = (op == 199 and (amount == 1 or amount == 2)) or (op == 194 and amount == 1);
+            if (corner_op and nmasked < masked.len) {
+                masked[nmasked] = words[i + 2]; // result id of the mask/shift
+                nmasked += 1;
+            }
+        }
+        i += @max(wc, 1);
+    }
+    if (nmasked == 0) return false;
+    i = 5;
+    while (i < words.len) {
+        const wc: usize = words[i] >> 16;
+        if (wc >= 4 and i + wc <= words.len and (words[i] & 0xffff) == 124) { // OpBitcast
+            for (masked[0..nmasked]) |id| if (words[i + 3] == id) return true;
+        }
+        i += @max(wc, 1);
+    }
+    return false;
+}
+
+fn tracesToStorageLoad(start: u32, producers: []const ?[4]u32, sb_load: []const bool, depth: usize) bool {
+    if (start >= producers.len) return false;
+    if (sb_load[start]) return true;
+    if (depth > 24) return false;
+    if (producers[start]) |ops| {
+        for (ops) |op| {
+            if (op != 0 and tracesToStorageLoad(op, producers, sb_load, depth + 1)) return true;
+        }
+    }
+    return false;
+}
+
+/// The POS0 store may be wrapped in an OpSelect for the exec mask. Walk back
+/// to the OpCompositeConstruct it feeds and check that construct's components.
+fn positionCompositeTracesToStorageLoad(start: u32, producers: []const ?[4]u32, is_composite: []const bool, sb_load: []const bool, depth: usize) bool {
+    if (start >= producers.len or depth > 24) return false;
+    if (is_composite[start]) {
+        if (producers[start]) |components| {
+            for (components) |component| {
+                if (component != 0 and tracesToStorageLoad(component, producers, sb_load, 0)) return true;
+            }
+        }
+    }
+    if (producers[start]) |ops| {
+        for (ops) |op| {
+            if (op != 0 and positionCompositeTracesToStorageLoad(op, producers, is_composite, sb_load, depth + 1)) return true;
+        }
+    }
+    return false;
+}
+
+/// True when the value stored to BuiltIn Position traces back through SSA
+/// producers to an OpLoad of a storage-buffer-backed pointer — i.e. guest
+/// vertex bytes staged into the storage buffer feed POS0, not a synthesized
+/// corner or a host constant.
+fn positionTracesToStorageBufferLoad(words: []const u32) bool {
+    const max_id = 1024;
+    var sb_var: [max_id]bool = @splat(false);
+    var sb_ptr: [max_id]bool = @splat(false);
+    var sb_load: [max_id]bool = @splat(false);
+    var is_composite: [max_id]bool = @splat(false);
+    var producers: [max_id]?[4]u32 = @splat(null);
+
+    var i: usize = 5;
+    while (i < words.len) {
+        const wc: usize = words[i] >> 16;
+        const op: u32 = words[i] & 0xffff;
+        if (wc == 0 or i + wc > words.len) { i += 1; continue; }
+        const result = if (wc >= 3) words[i + 2] else 0;
+        if (result < max_id) {
+            switch (op) {
+                59 => {
+                    if (wc >= 4 and words[i + 3] == 12) sb_var[result] = true; // OpVariable StorageBuffer
+                },
+                65 => {
+                    if (wc >= 4) { // OpAccessChain
+                        const base = words[i + 3];
+                        if (base < max_id and (sb_var[base] or sb_ptr[base])) sb_ptr[result] = true;
+                    }
+                },
+                61 => {
+                    if (wc >= 4) { // OpLoad
+                        const ptr = words[i + 3];
+                        if (ptr < max_id and (sb_ptr[ptr] or sb_var[ptr])) sb_load[result] = true;
+                    }
+                },
+                else => {},
+            }
+            if (op == 80) is_composite[result] = true; // OpCompositeConstruct
+            if (wc >= 4) {
+                var operands: [4]u32 = .{ 0, 0, 0, 0 };
+                var n: usize = 0;
+                for (words[i + 3 .. @min(i + wc, i + 7)]) |operand| {
+                    if (n < 4) { operands[n] = operand; n += 1; }
+                }
+                producers[result] = operands;
+            }
+        }
+        i += wc;
+    }
+    // Multi-level access chains declared out of order.
+    for (0..2) |_| {
+        i = 5;
+        while (i < words.len) {
+            const wc: usize = words[i] >> 16;
+            if (wc >= 4 and i + wc <= words.len and (words[i] & 0xffff) == 65) {
+                const result = words[i + 2];
+                const base = words[i + 3];
+                if (result < max_id and base < max_id and (sb_var[base] or sb_ptr[base])) sb_ptr[result] = true;
+            }
+            i += @max(wc, 1);
+        }
+    }
+
+    var position_var: u32 = 0;
+    i = 5;
+    while (i + 3 < words.len) {
+        const wc: usize = words[i] >> 16;
+        if (wc >= 4 and (words[i] & 0xffff) == 71 and words[i + 2] == 11 and words[i + 3] == 0) { // BuiltIn Position
+            const id = words[i + 1];
+            var j: usize = 5;
+            while (j + 3 < words.len) {
+                const jwc: usize = words[j] >> 16;
+                if (jwc >= 4 and (words[j] & 0xffff) == 59 and words[j + 2] == id and words[j + 3] == 3) {
+                    position_var = id;
+                    break;
+                }
+                j += @max(jwc, 1);
+            }
+            if (position_var != 0) break;
+        }
+        i += @max(wc, 1);
+    }
+    if (position_var == 0) return false;
+
+    var stored: u32 = 0;
+    i = 5;
+    while (i < words.len) {
+        const wc: usize = words[i] >> 16;
+        if (wc >= 3 and i + wc <= words.len and (words[i] & 0xffff) == 62 and words[i + 1] == position_var) stored = words[i + 2]; // OpStore
+        i += @max(wc, 1);
+    }
+    if (stored == 0) return false;
+
+    return positionCompositeTracesToStorageLoad(stored, &producers, &is_composite, &sb_load, 0);
+}
 
 /// Full VS blob (2048-byte dump truncated to the parsed ISA extent).
 /// isa_offset = 0x104, isa_size = 88 (22 dwords).
@@ -74,7 +242,6 @@ test "gcn_blob.isaBytes extracts the ISA from the real VS blob header" {
 }
 
 test "program-keyed translation rejects mismatched pair" {
-    const program: ProgramPair = .{ .vertex = 0x1000000a88, .pixel = 0x1000000aa4 };
     registerShaderFor(program, .vertex, &vs_words);
     registerShaderFor(program, .pixel, &ps_words);
     try std.testing.expect(translatedGraphicsFor(program) != null);
@@ -231,13 +398,13 @@ test "real PS fragment inputs come from VS PARAM exports and VINTRP attrs" {
     // the runtime classifies by EXP target (ps4_title_stubs.stageFromIsa): the
     // blob exporting POS0 (0x0c) / PARAM0 (0x20) is the VS, and the blob
     // exporting MRT0 (0x00) with an image sample is the PS.
-    const program: ProgramPair = .{ .vertex = 0x1000000b88, .pixel = 0x1000000ba4 };
-    registerShaderFor(program, .vertex, &ps_words);
-    registerShaderFor(program, .pixel, &vs_words);
-    const inputs = fragmentInputsFor(program).?;
+    const local_program: ProgramPair = .{ .vertex = 0x1000000b88, .pixel = 0x1000000ba4 };
+    registerShaderFor(local_program, .vertex, &ps_words);
+    registerShaderFor(local_program, .pixel, &vs_words);
+    const inputs = fragmentInputsFor(local_program).?;
     try std.testing.expectEqual(@as(u32, 1), inputs.allocated); // VS PARAM0 -> bit 0
     try std.testing.expectEqual(inputs.allocated, inputs.enabled);
-    const graphics = translatedGraphicsFor(program) orelse return error.TestExpectedGraphics;
+    const graphics = translatedGraphicsFor(local_program) orelse return error.TestExpectedGraphics;
     // Positive: the VS PARAM0 Input at Location 0 feeds the image-sample UV.
     try std.testing.expect(inputFeedsImageSampleCoordinate(graphics.fragment_words, 0));
     // Secondary guard: no two-constant fallback UV.
@@ -251,14 +418,32 @@ test "input-fed UV is PS4-gated: standalone pixel translation has no such Input"
 }
 
 test "VINTRP attr without a VS PARAM export reports null, never a guessed input" {
-    const program: ProgramPair = .{ .vertex = 0x1000000c88, .pixel = 0x1000000ca4 };
+    const local_program: ProgramPair = .{ .vertex = 0x1000000c88, .pixel = 0x1000000ca4 };
     const ps_with_vintrp = [_]u32{
         gcn_decode.vintrp(false, 0, 0, 0), // consumes attr 0
         gcn_decode.vintrp(true, 1, 0, 0),
         0xbf81_0000,
     };
-    registerShaderFor(program, .vertex, &[_]u32{0xbf81_0000}); // no PARAM exports
-    registerShaderFor(program, .pixel, &ps_with_vintrp);
-    try std.testing.expect(fragmentInputsFor(program) == null);
+    registerShaderFor(local_program, .vertex, &[_]u32{0xbf81_0000}); // no PARAM exports
+    registerShaderFor(local_program, .pixel, &ps_with_vintrp);
+    try std.testing.expect(fragmentInputsFor(local_program) == null);
+    try std.testing.expect(gcn_translate.lastDiagnostic() != null);
+}
+
+test "no synthetic corner fallback in PS4 vertex path" {
+    registerShaderFor(program, .vertex, &vs_words);
+    registerShaderFor(program, .pixel, &ps_words);
+    const res = capture(&real_terraria_dcb).draws[0];
+    const src = vertexDataSourceFor(res).?;
+    try std.testing.expect(src.address != 0);
+    try std.testing.expect(src.size_bytes > 0);
+    const spirv = translatedGraphicsFor(program).?.vertex_words;
+    try std.testing.expect(!syntheticCornerSequence(spirv));
+    try std.testing.expect(positionTracesToStorageBufferLoad(spirv));
+}
+
+test "vertexDataSourceFor reports null with a diagnostic when no VS V# exists" {
+    const empty: gcn_resources.Resources = .{};
+    try std.testing.expect(vertexDataSourceFor(empty) == null);
     try std.testing.expect(gcn_translate.lastDiagnostic() != null);
 }

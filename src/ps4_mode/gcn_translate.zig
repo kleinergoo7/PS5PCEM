@@ -27,6 +27,33 @@ pub const TranslatedGraphics = struct {
 /// exports are always both allocated and enabled.
 pub const FragmentInputs = struct { allocated: u32, enabled: u32 };
 
+/// Guest vertex bytes backing the VS: the base, length and element stride of a
+/// captured GCN V# descriptor. The backend stages exactly this range into the
+/// storage buffer declared by `buildOptions`; nothing is synthesized.
+pub const VertexDataSource = struct { address: u64, size_bytes: u32, stride: u32 };
+
+/// Select the VS V# with the smallest nonzero stride whose base is a plausible
+/// guest address. V# descriptors come from the captured SET_SH_REG stream, so a
+/// settled binding with a nonzero base is the guest-readable source. Returns
+/// null with a diagnostic when none exists — never fabricate vertex positions.
+pub fn vertexDataSourceFor(res: gcn_resources.Resources) ?VertexDataSource {
+    var best: ?VertexDataSource = null;
+    for (res.bindings[0..res.count]) |binding| {
+        if (binding.stage != .vertex or binding.descriptor.kind != .constant_buffer) continue;
+        if (binding.descriptor.address < 0x1000 or binding.descriptor.size_bytes == 0) continue;
+        const words = res.words(binding);
+        const stride: u32 = (words[1] >> 16) & 0x3fff;
+        if (stride == 0) continue;
+        const size: u32 = @truncate(@min(binding.descriptor.size_bytes, std.math.maxInt(u32)));
+        if (size == 0) continue;
+        if (best == null or stride < best.?.stride) {
+            best = .{ .address = binding.descriptor.address, .size_bytes = size, .stride = stride };
+        }
+    }
+    if (best == null) diagnostic = .{ .stage = .vertex, .reason = "no usable VS V# descriptor" };
+    return best;
+}
+
 /// PS4-only dynamic scalar layout. One slot per SGPR the GCN program reads plus
 /// one slot per SMEM destination word, in a deterministic order. The draw path
 /// uploads values in exactly this order; the writer loads slot N from
@@ -152,9 +179,29 @@ const OptionsBuilder = struct {
     }
 };
 
+/// Element stride of Terraria's captured VS V# (word1[29:16] at USER_DATA 0x54).
+/// `vertexDataSourceFor` measures this from the live per-draw descriptor; the
+/// translator only needs the matching element size to declare the slot.
+/// shortcut: fixed to Terraria's 16-byte V#, upgrade if another PS4 title's VS
+/// strides its V# differently and relies on a real MUBUF at this element.
+const ps4_vertex_v_stride: u32 = 16;
+
 fn buildOptions(allocator: std.mem.Allocator, stage: Stage, program: *const rdna2.Program, slots: []const ScalarSlot, fragment_inputs: ?FragmentInputs) Error!OptionsBuilder {
     var builder = OptionsBuilder{ .allocator = allocator };
     errdefer builder.deinit();
+
+    // PS4 vertex path: declare element 0 for the guest VS V# bytes staged by the
+    // backend. `use_vertex_index = false` because DRAW_INDEX_AUTO count=4 is
+    // replayed as four sequential vertices; no synthetic corner positions are
+    // seeded. s127 keeps this diagnostic binding clear of real MUBUF resources.
+    if (stage == .vertex) {
+        try builder.buffers.append(allocator, .{
+            .resource_sgpr = 127,
+            .descriptor_index = 0,
+            .stride = ps4_vertex_v_stride,
+            .use_vertex_index = false,
+        });
+    }
 
     for (program.instructions.items) |inst| {
         if (inst.opcode == .image_sample) {
@@ -168,8 +215,8 @@ fn buildOptions(allocator: std.mem.Allocator, stage: Stage, program: *const rdna
             try builder.buffers.append(allocator, .{
                 .resource_sgpr = inst.src1.reg,
                 .descriptor_index = @intCast(builder.buffers.items.len),
-                .stride = 4,
-                .use_vertex_index = true,
+                .stride = if (stage == .vertex) ps4_vertex_v_stride else 4,
+                .use_vertex_index = false,
             });
         }
     }
@@ -200,8 +247,11 @@ fn buildOptions(allocator: std.mem.Allocator, stage: Stage, program: *const rdna
         else
             null,
         .scalar_registers = slots,
-        .vertex_corner_vgprs = if (stage == .vertex) .{ 2, 3 } else null,
-        .vertex_position_corner_override = stage == .vertex,
+        // PS4 no longer seeds float quad corners from VertexIndex: POS0 comes
+        // from guest V#-derived values staged by the backend. The shared
+        // writer's override option stays default-off and native-identical.
+        .vertex_corner_vgprs = null,
+        .vertex_position_corner_override = false,
         .dynamic_scalar_binding = if (slots.len != 0) .{
             .binding = 2 + rdna2.spirv.maximum_storage_images,
             .value_base = if (stage == .vertex) 0 else fragment_words_per_stage,
@@ -492,13 +542,14 @@ test "translated VS loads SGPR scalars dynamically from the dedicated binding" {
     }
     try std.testing.expect(found_binding);
 
-    // The PS4 sprite transform seeds POS0 from Vulkan VertexIndex corners.
+    // PS4 no longer seeds POS0 from Vulkan VertexIndex corners; guest V# data
+    // replaces the synthetic quad. No VertexIndex input is declared.
     var found_vertex_index = false;
     for (words, 0..) |word, i| {
         if (i + 3 >= words.len) break;
         if (word == 0x0004_0047 and words[i + 2] == 11 and words[i + 3] == 42) found_vertex_index = true;
     }
-    try std.testing.expect(found_vertex_index);
+    try std.testing.expect(!found_vertex_index);
 
     // Slot order is stable: the same GCN program always yields the same layout.
     var decoded = try gcn_decode.decodeToRdna2(std.testing.allocator, &vs);

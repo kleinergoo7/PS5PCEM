@@ -25874,6 +25874,17 @@ pub const Renderer = struct {
         if (prepared.render_target_index) |index| self.releaseRenderTarget(index);
     }
 
+    /// PS4-only: stage this draw's captured VS V# bytes into storage-buffer
+    /// element 0 — the slot `gcn_translate.buildOptions` declares for the
+    /// vertex stage. Returns null off the PS4 path or without a usable V#; no
+    /// positions are fabricated. The guest-buffer cache owns release after the
+    /// queued draw.
+    fn stagePs4GraphicsVertex(self: *Renderer, resources: ps4_mode.gcn_resources.Resources) anyerror!?StagedBuffer {
+        if (!@atomicLoad(bool, &ps4_compat_enabled, .monotonic)) return null;
+        const src = ps4_mode.gcn_translate.vertexDataSourceFor(resources) orelse return null;
+        return try self.stageGuestStorageBuffer(src.address, src.size_bytes);
+    }
+
     /// PS4-only graphics replay. When a GCN shader has been translated, draw
     /// through the real translated SPIR-V; otherwise replay the fixed-color
     /// probe so the guest frame still materializes. Both use the shared draw
@@ -25914,6 +25925,11 @@ pub const Renderer = struct {
         var ps4_sampled: ?PreparedSampledImage = null;
         defer if (ps4_sampled) |prepared| self.releasePs4GraphicsSampledImage(prepared);
         if (use_real_shader) ps4_sampled = try self.stagePs4GraphicsSampledImage(resources);
+        // Stage the real VS V# bytes at element 0 for the translated PS4 vertex
+        // shader. DRAW_INDEX_AUTO count=4 is replayed as four sequential
+        // vertices by the shared draw path; the guest-buffer cache retires the
+        // staged range after the draw is queued.
+        if (use_real_shader) _ = try self.stagePs4GraphicsVertex(resources);
         try self.drawGraphicsShadersWithModules(
             if (translated) |t| t.vertex_words else &graphics_probe_vertex_spirv,
             if (translated) |t| t.fragment_words else &graphics_probe_fragment_spirv,
@@ -49579,6 +49595,30 @@ test "PS4 sampled-image staging is gated off for PS5 draws" {
     try std.testing.expectEqual(@as(u32, 1080), descriptor.height);
     try std.testing.expectEqual(@as(u16, 56), descriptor.unified_format);
     try std.testing.expectEqual(gpu.resources.ImageType.color_2d, descriptor.image_type);
+}
+
+test "PS4 vertex staging is gated off for PS5 draws" {
+    const previous = ps4_compat_enabled;
+    defer ps4_compat_enabled = previous;
+    ps4_mode.gcn_resources.resetCapture();
+    defer ps4_mode.gcn_resources.resetCapture();
+    ps4_mode.gcn_resources.publish(ps4_mode.gcn_resources.capture(
+        &ps4_mode.terraria_frame_test.captured_dcb,
+    ));
+    const resources = ps4_mode.gcn_resources.nextDrawResources() orelse
+        return error.TestExpectedResources;
+
+    // PS5: no vertex staging runs, so no guest vertex bytes are bound.
+    ps4_compat_enabled = false;
+    var renderer: Renderer = undefined;
+    try std.testing.expect(try Renderer.stagePs4GraphicsVertex(&renderer, resources) == null);
+
+    // PS4: the same captured DCB yields the real VS V# source.
+    ps4_compat_enabled = true;
+    const src = ps4_mode.gcn_translate.vertexDataSourceFor(resources) orelse
+        return error.TestExpectedVertexDataSource;
+    try std.testing.expect(src.address != 0);
+    try std.testing.expect(src.size_bytes > 0);
 }
 
 test "compute local size defaults to one and preserves the programmed count" {
