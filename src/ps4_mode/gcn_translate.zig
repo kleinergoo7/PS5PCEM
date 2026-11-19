@@ -54,11 +54,23 @@ pub fn vertexDataSourceFor(res: gcn_resources.Resources) ?VertexDataSource {
     return best;
 }
 
-/// USER_DATA word index backing the registered PS's sampled image. GNM writes
-/// each T# as a contiguous 8-word SET_SH_REG block at USER_DATA base + index,
-/// and patches the MIMG resource operand to name that same word index. So the
-/// decoded `Mimg.tsgpr` (equivalently `SampledImageBinding.resource_sgpr`) is
-/// the slot the shader actually samples. Returns null without a registered PS
+/// USER_DATA word index for an absolute PS GCN SGPR number. GNM's PS USER_DATA
+/// row starts at SGPR 0x0c, so the row index is SGPR minus that base. Null means
+/// the SGPR lies outside the row (or past its 16 words).
+fn psUserIndexFromSgpr(sgpr: u32) ?u8 {
+    const base = gcn_resources.Stage.pixel.userDataBase();
+    if (sgpr < base) return null;
+    const index = sgpr - base;
+    if (index >= gcn_resources.user_data_words) return null;
+    return @intCast(index);
+}
+
+/// USER_DATA word index backing the registered PS's sampled image. The decoded
+/// MIMG resource SGPR (equivalently `SampledImageBinding.resource_sgpr`) is
+/// normalized to an absolute GCN SGPR, then converted through the PS USER_DATA
+/// base. Terraria's captured blob encodes the operand relative to that row
+/// (SRSRC=1 -> SGPR 4, while GNM binds the T# at SGPR 0x10); an operand already
+/// in absolute SGPR space is used as-is. Returns null without a registered PS
 /// or when that PS samples no image.
 pub fn sampledImageUserIndexFor(program: ProgramPair) ?u8 {
     lockGlobal();
@@ -71,9 +83,13 @@ pub fn sampledImageUserIndexFor(program: ProgramPair) ?u8 {
         const inst = maybe orelse break;
         switch (inst) {
             .image_sample => |sample| {
-                const word_index = sample.tsgpr;
-                if (word_index >= gcn_resources.user_data_words) return null;
-                return @intCast(word_index);
+                const base = gcn_resources.Stage.pixel.userDataBase();
+                const resource_sgpr = sample.tsgpr;
+                const gcn_sgpr = if (resource_sgpr < base)
+                    resource_sgpr + base
+                else
+                    resource_sgpr;
+                return psUserIndexFromSgpr(gcn_sgpr);
             },
             else => {},
         }

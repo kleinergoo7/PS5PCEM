@@ -529,3 +529,18 @@ test "PS image samples the USER_DATA slot of its own draw" {
     try std.testing.expectEqual(@as(u64, 0x10170c0000), @as(u64, first.userData(.pixel)[index]) << 8);
     try std.testing.expectEqual(@as(u64, 0x10168c8000), @as(u64, second.userData(.pixel)[index]) << 8);
 }
+
+test "PS sampled-image slot subtracts the USER_DATA base from an absolute SGPR" {
+    // An MIMG resource operand naming absolute SGPR 0x10 resolves to USER_DATA
+    // index 4 (0x10 - 0x0c), not to the raw SGPR number.
+    const absolute: ProgramPair = .{ .vertex = 0x1000000f88, .pixel = 0x1000000fa4 };
+    const sgpr_10 = gcn_decode.mimg(0x20, 0xf, 4, 0, 4, 3); // SRSRC field 4 -> 0x10
+    registerShaderFor(absolute, .pixel, &sgpr_10);
+    try std.testing.expectEqual(@as(u8, 4), sampledImageUserIndexFor(absolute).?);
+
+    // A second absolute SGPR maps to a different index, so the result is not a
+    // constant or a coincidence with Terraria's row-relative value.
+    const sgpr_14 = gcn_decode.mimg(0x20, 0xf, 4, 0, 5, 3); // SRSRC field 5 -> 0x14
+    registerShaderFor(absolute, .pixel, &sgpr_14);
+    try std.testing.expectEqual(@as(u8, 8), sampledImageUserIndexFor(absolute).?);
+}
