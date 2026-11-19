@@ -116,6 +116,13 @@ fn writtenContext(src: []const u32, offset: u32) ?u32 {
     return null;
 }
 
+/// Guest address of the first GCN colour target, for PS4 scanout presentation.
+/// The decoder shifts CB_COLOR0_BASE left by 8; BASE_HIGH is synthesized as 0.
+pub fn colorTargetAddress(src: []const u32) ?u64 {
+    const base = writtenContext(src, 0x318) orelse return null;
+    return @as(u64, base) << 8;
+}
+
 /// Rebuild the AGC render-target registers a PS4 GCN DCB never writes.
 ///
 /// The shared decoder (gpu/resources.zig decodeColorTarget) needs, per slot:
@@ -309,6 +316,21 @@ test "synthesizes missing PS4 render-target registers from the guest's CB base" 
     // DEPTH/TILE 0x3b8 = 0 (one slice, linear).
     try std.testing.expectEqual(@as(u32, 0x3b8), out[7]);
     try std.testing.expectEqual(@as(u32, 0), out[8]);
+}
+
+test "colorTargetAddress recovers the guest base from CB_COLOR0_BASE" {
+    const src = [_]u32{
+        command(0x69, 7),
+        0x0318,
+        0x10100a00,
+        0x09f0009f,
+        0x3bff,
+        0,
+        0x28828,
+        0x14a,
+    };
+    try std.testing.expectEqual(@as(u64, 0x10100a0000), colorTargetAddress(&src).?);
+    try std.testing.expectEqual(null, colorTargetAddress(&[_]u32{ command(0x69, 2), 0x0210, 0 }));
 }
 
 test "synthesizes PS/VS program registers from recorded PS4 shader pointers" {

@@ -24,9 +24,48 @@ const symbols = @import("../symbols.zig");
 const agc_submit = @import("agc_submit.zig");
 const kernel_memory = @import("kernel_memory.zig");
 const kernel_event_queue = @import("kernel_event_queue.zig");
+const video_out = @import("../video_out.zig");
+const kernel_runtime = @import("kernel_runtime.zig");
 const ps4_mode = @import("ps4_mode");
 const hits = ps4_mode.hits;
 const pm4_sanitize = ps4_mode.pm4_sanitize;
+
+/// PS4 titles submit DCBs without a flip packet or a registered scanout set,
+/// so the shared renderer has nothing to present and the window stays black.
+/// Publish the guest colour target as a VideoOut buffer once, then drive the
+/// shared flip path at display cadence. Only called from PS4 submit exports.
+var scanout_registered = false;
+var last_scanout_flip_ns: u64 = 0;
+
+fn presentPs4Scanout(address: u64) void {
+    if (!scanout_registered) {
+        if (video_out.resolve(1, 0) == null) {
+            const buffers = [_]video_out.Buffer{.{
+                .data = @ptrFromInt(address),
+                .metadata = null,
+                .reserved = .{ null, null },
+            }};
+            const attribute = video_out.BufferAttribute2{
+                .width = 1920,
+                .height = 1080,
+                .pitch_in_pixels = 1920,
+                .pixel_format = 0x8100_0000_0000_0000,
+            };
+            _ = video_out.registerBuffers(0, 0, &buffers, attribute, 0) catch null;
+        }
+        scanout_registered = video_out.resolve(1, 0) != null;
+    }
+    if (!scanout_registered) return;
+    const now = kernel_runtime.processTimeCounter();
+    if (now -| last_scanout_flip_ns < 16 * std.time.ns_per_ms) return;
+    last_scanout_flip_ns = now;
+    _ = agc_submit.presentFlip(.{
+        .video_out_handle = 1,
+        .display_buffer_index = 0,
+        .mode = 0,
+        .argument = @bitCast(@as(i64, @intCast(now & 0x7fff_ffff_ffff_ffff))),
+    });
+}
 
 /// Submit a PS4 GNM command buffer set through the shared AGC executor.
 ///
@@ -39,18 +78,16 @@ fn sceGnmSubmitAndFlipCommandBuffers(
     dcb_count: u32,
     dcb_addrs: u64,
     dcb_sizes: u64,
-    flip_count: u32,
-    flip_addrs: u64,
-    flip_sizes: u64,
+    _: u32,
+    _: u64,
+    _: u64,
 ) callconv(abi.guest) i32 {
-    _ = flip_count;
-    _ = flip_addrs;
-    _ = flip_sizes;
     hits.record("sceGnmSubmitAndFlipCommandBuffers");
     if (dcb_addrs == 0 or dcb_sizes == 0) return errno.ok;
     const addrs: [*]const u64 = @ptrFromInt(dcb_addrs);
     const sizes: [*]const u32 = @ptrFromInt(dcb_sizes);
     var submitted: u32 = 0;
+    var scanout_address: u64 = 0;
     var i: usize = 0;
     while (i < dcb_count) : (i += 1) {
         const addr = addrs[i];
@@ -60,6 +97,7 @@ fn sceGnmSubmitAndFlipCommandBuffers(
         const words: usize = bytes / 4;
         const stream: [*]const u32 = @ptrFromInt(addr);
         const slice = stream[0..words];
+        if (scanout_address == 0) scanout_address = pm4_sanitize.colorTargetAddress(slice) orelse 0;
 
         // PS4 GCN PM4 is not walkable by the shared RDNA2 parser as-is: an
         // out-of-range SET_*_REG stops the queue, and a malformed body length
@@ -104,6 +142,7 @@ fn sceGnmSubmitAndFlipCommandBuffers(
         // setup DCB carries no FLIP/RELEASE_MEM packet for the shared path to
         // publish that edge, so deliver it here at the PS4 boundary.
         _ = kernel_event_queue.triggerVideoOutFlip(0);
+        if (scanout_address != 0) presentPs4Scanout(scanout_address);
     }
     if (trace.announces("sceGnmSubmitAndFlipCommandBuffers")) {
         std.debug.print("[gnm submit] dcbs={d} submitted={d}\n", .{ dcb_count, submitted });
