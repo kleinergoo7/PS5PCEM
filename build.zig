@@ -184,6 +184,9 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/ps4_mode/root.zig"),
         .target = target,
         .optimize = optimize,
+        // The GCN→SPIR-V translator reuses the shared rdna2 writer; the rest
+        // of ps4_mode remains std-only.
+        .imports = &.{.{ .name = "rdna2", .module = mod }},
     });
 
     // Firmware emulation: identifier derivation, the symbol registry, and the
