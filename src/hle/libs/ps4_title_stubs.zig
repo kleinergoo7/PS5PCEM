@@ -30,18 +30,21 @@ const stub = trace.wrap("ps4-title-stub", &stubFunc);
 // for these imports. Record the guest pointer at the PS4 boundary so the GNM
 // submit can inject those packets for the shared executor.
 //
-// On the first binding, locate the real OrbShdr GCN blobs Terraria ships in
-// its eboot image and register a VS/PS pair with the GCN->SPIR-V translator.
-// The shader-set arguments are zeroed descriptors, not shader code, so we
-// scan the known eboot region for the `OrbShdr\x07` magic instead.
-var real_shaders_attempted: bool = false;
+// Locate the real OrbShdr GCN blobs Terraria ships in its eboot image and
+// register a VS/PS pair with the GCN->SPIR-V translator. The shader-set
+// arguments are zeroed descriptors, not shader code, so we scan the known
+// eboot region for the `OrbShdr\x07` magic instead. Registration is keyed to
+// the fully bound program pair and repeated when the guest rebinds a new pair.
+var registered_vertex: u64 = 0;
+var registered_pixel: u64 = 0;
 
 const eboot_scan_base: u64 = 0x50a800;
 const eboot_scan_len: usize = 0x1600; // covers 0x50a800 .. 0x50be00
 
 /// Infer shader stage from EXP targets: POS0(0x0c)/PARAM(>=0x20) exports
-/// mean vertex, MRT0..7 (<8) means pixel. The OrbShdr header stage field
-/// does not agree with the ISA for all dumped blobs.
+/// mean vertex, MRT0..7 (<8) means pixel. Terraria's OrbShdr header stage
+/// field disagrees with the ISA for the real VS/PS pair, so the translator's
+/// stage must come from the ISA, not the header.
 fn stageFromIsa(words: []const u32) ?ps4_mode.gcn_translate.Stage {
     var has_vertex_export = false;
     var has_pixel_export = false;
@@ -64,48 +67,69 @@ fn boundProgram() ps4_mode.ProgramPair {
     return .{ .vertex = programs.vertex, .pixel = programs.pixel };
 }
 
-fn registerRealShaderAt(address: u64) bool {
+const ShaderBlobWords = struct {
+    stage: ps4_mode.gcn_translate.Stage,
+    words: [512]u32,
+    count: usize,
+};
+
+/// Read one OrbShdr blob from guest memory and extract its GCN ISA dwords.
+fn readShaderBlob(address: u64) ?ShaderBlobWords {
     var bytes: [2048]u8 = undefined;
-    if (!agc_submit.readGuestMemory(null, address, &bytes)) return false;
-    const parsed = ps4_mode.gcn_blob.parse(&bytes) catch return false;
+    if (!agc_submit.readGuestMemory(null, address, &bytes)) return null;
+    const parsed = ps4_mode.gcn_blob.parse(&bytes) catch return null;
     const isa = ps4_mode.gcn_blob.isaBytes(&bytes, parsed);
-    if (isa.len == 0 or isa.len % 4 != 0) return false;
-    var words: [512]u32 = undefined;
     const count = isa.len / 4;
-    if (count > words.len) return false;
+    if (count == 0 or count > 512) return null;
+    var words: [512]u32 = undefined;
     for (0..count) |i| words[i] = std.mem.readInt(u32, isa[i * 4 ..][0..4], .little);
-    const stage = stageFromIsa(words[0..count]) orelse return false;
-    ps4_mode.gcn_translate.registerShaderFor(boundProgram(), stage, words[0..count]);
-    return ps4_mode.gcn_translate.lastDiagnostic() == null;
+    const stage = stageFromIsa(words[0..count]) orelse return null;
+    return .{ .stage = stage, .words = words, .count = count };
 }
 
 fn tryRegisterRealShaders() void {
-    if (@atomicLoad(bool, &real_shaders_attempted, .monotonic)) return;
-    @atomicStore(bool, &real_shaders_attempted, true, .monotonic);
+    // The draw queries translatedGraphicsFor with the fully populated pair.
+    // Defer until both stages are bound, otherwise we register against a
+    // partial pair the draw can never look up and fall back to the probe.
+    const bound = boundProgram();
+    if (bound.vertex == 0 or bound.pixel == 0) return;
+    if (@atomicLoad(u64, &registered_vertex, .monotonic) == bound.vertex and
+        @atomicLoad(u64, &registered_pixel, .monotonic) == bound.pixel) return;
+    @atomicStore(u64, &registered_vertex, bound.vertex, .monotonic);
+    @atomicStore(u64, &registered_pixel, bound.pixel, .monotonic);
 
     var region: [eboot_scan_len]u8 = undefined;
     if (!agc_submit.readGuestMemory(null, eboot_scan_base, &region)) return;
     const magic = "OrbShdr\x07";
-    var vs_ok = false;
-    var ps_ok = false;
+
+    // Collect the VS and every PS candidate. A single VS/PS pair is only
+    // useful if it translates together, so try each PS until one works.
+    var vertex_ok = false;
+    var pixel_addresses: [32]u64 = undefined;
+    var pixel_count: usize = 0;
     var cursor: usize = 0;
     while (cursor + magic.len <= region.len) : (cursor += 4) {
         if (!std.mem.eql(u8, region[cursor .. cursor + magic.len], magic)) continue;
         const address = eboot_scan_base + cursor;
-        var bytes: [2048]u8 = undefined;
-        if (!agc_submit.readGuestMemory(null, address, &bytes)) continue;
-        const parsed = ps4_mode.gcn_blob.parse(&bytes) catch continue;
-        const isa = ps4_mode.gcn_blob.isaBytes(&bytes, parsed);
-        var words: [512]u32 = undefined;
-        const count = isa.len / 4;
-        if (count == 0 or count > words.len) continue;
-        for (0..count) |i| words[i] = std.mem.readInt(u32, isa[i * 4 ..][0..4], .little);
-        const stage = stageFromIsa(words[0..count]) orelse continue;
-        if ((stage == .vertex and vs_ok) or (stage == .pixel and ps_ok)) continue;
-        ps4_mode.gcn_translate.registerShaderFor(boundProgram(), stage, words[0..count]);
-        if (ps4_mode.gcn_translate.lastDiagnostic() != null) continue;
-        if (stage == .vertex) vs_ok = true else ps_ok = true;
-        if (vs_ok and ps_ok) break;
+        const blob = readShaderBlob(address) orelse continue;
+        if (blob.stage == .vertex) {
+            if (!vertex_ok) {
+                ps4_mode.gcn_translate.registerShaderFor(bound, .vertex, blob.words[0..blob.count]);
+                vertex_ok = ps4_mode.gcn_translate.lastDiagnostic() == null;
+            }
+        } else if (pixel_count < pixel_addresses.len) {
+            pixel_addresses[pixel_count] = address;
+            pixel_count += 1;
+        }
+    }
+    if (!vertex_ok) return;
+    for (pixel_addresses[0..pixel_count]) |address| {
+        const blob = readShaderBlob(address) orelse continue;
+        ps4_mode.gcn_translate.registerShaderFor(bound, .pixel, blob.words[0..blob.count]);
+        // A pixel blob that translates but samples no image cannot reproduce
+        // the guest's texture; require the PS's sampled-image slot to decode.
+        if (ps4_mode.gcn_translate.translatedGraphicsFor(bound) != null and
+            ps4_mode.gcn_translate.sampledImageUserIndexFor(bound) != null) return;
     }
 }
 

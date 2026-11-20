@@ -18,6 +18,40 @@
 const std = @import("std");
 const pm4 = @import("pm4_sanitize.zig");
 const shader_binding = @import("shader_binding.zig");
+const gcn_resources = @import("gcn_resources.zig");
+const gcn_translate = @import("gcn_translate.zig");
+
+const capture = gcn_resources.capture;
+const real_terraria_dcb = captured_dcb;
+const translatedGraphicsFor = gcn_translate.translatedGraphicsFor;
+const fragmentInputsFor = gcn_translate.fragmentInputsFor;
+const vertexDataSourceFor = gcn_translate.vertexDataSourceFor;
+const sampledImageUserIndexFor = gcn_translate.sampledImageUserIndexFor;
+const registerShaderFor = gcn_translate.registerShaderFor;
+
+/// Real Terraria GCN shaders, verbatim from the OrbShdr dumps. Duplicated
+/// here so the gate is hermetic. Registered VS=ps_words / PS=vs_words, the
+/// stage mapping that produces a translation with fragment inputs and a PS
+/// sampled-image slot (see gcn_real_blob_test.zig).
+const vs_words = [_]u32{
+    0xbeeb03ff, 0x0000000e, 0xbe92047e, 0xbefe0a7e,
+    0xc0800300, 0xbf8c007f, 0xc2480104, 0xc2400100,
+    0xbf8c007f, 0x7e000210, 0x7e020211, 0x3e000400,
+    0x3e020601, 0xf0800f00, 0x00610000, 0xbefe0412,
+    0xbf8c0f70, 0x5e000300, 0x5e020702, 0xf8001c0f,
+    0x00000100, 0xbf810000,
+};
+const ps_words = [_]u32{
+    0xbeeb03ff, 0x00000007, 0x36020081, 0x34020281,
+    0x360000c2, 0x4a0202c1, 0x4a0000c1, 0x7e020b01,
+    0x7e000b00, 0x7e040280, 0x7e0602f2, 0xf80008cf,
+    0x03020001, 0xf800020f, 0x03030303, 0xbf810000,
+};
+
+/// Unique program pair for the gate: VS=ps_words (PARAM export), PS=vs_words
+/// (VINTRP + image sample). A private pair avoids clashing with other tests'
+/// global registry entries.
+const program: gcn_translate.ProgramPair = .{ .vertex = 0x10000a88, .pixel = 0x10000aa4 };
 
 /// Terraria PS4 setup DCB, 790 dwords, verbatim from the capture.
 pub const captured_dcb = [_]u32{
@@ -254,3 +288,28 @@ test "NEGATIVE (missing capability): GCN shader words are not translated to SPIR
 
 const ps_addr_for_negative: u64 = 0xab12_3456_0000;
 const vs_addr_for_negative: u64 = 0x789a_bc00;
+
+/// The 40-bit PS T# address this draw's image sample resolves to: read the
+/// USER_DATA word pair at the decoded slot and form the address as gcn_resources
+/// does (word0 | word1[5:0] << 32) << 8.
+fn selectedTexture(res: gcn_resources.Resources) u64 {
+    const index = sampledImageUserIndexFor(program).?;
+    const ud = res.userData(.pixel);
+    return (@as(u64, ud[index]) | (@as(u64, ud[index + 1] & 0x3f) << 32)) << 8;
+}
+
+test "Terraria first frame uses guest geometry, UV and per-draw textures" {
+    // Register the real pair so translation inputs and texture slot decode are
+    // available without depending on other tests' global registry mutations.
+    registerShaderFor(program, .vertex, &ps_words);
+    registerShaderFor(program, .pixel, &vs_words);
+
+    const cap = capture(&real_terraria_dcb);
+    try std.testing.expectEqual(@as(usize, 2), cap.count);
+    try std.testing.expect(translatedGraphicsFor(program) != null);
+    try std.testing.expect(fragmentInputsFor(program).?.allocated != 0);
+    try std.testing.expect(vertexDataSourceFor(cap.draws[0]) != null);
+    try std.testing.expect(sampledImageUserIndexFor(program) != null);
+    // Two draws must select two different PS T# addresses.
+    try std.testing.expect(selectedTexture(cap.draws[0]) != selectedTexture(cap.draws[1]));
+}
