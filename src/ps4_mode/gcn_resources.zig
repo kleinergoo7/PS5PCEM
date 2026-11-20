@@ -170,10 +170,11 @@ pub fn publish(cap: Capture) void {
     while (!captured_lock.tryLock()) std.atomic.spinLoopHint();
     defer captured_lock.unlock();
     if (capture_len == capture_queue.len) {
-        // Ring full: drop the oldest capture and its draw cursor.
-        capture_head = (capture_head + 1) % capture_queue.len;
-        capture_len -= 1;
-        capture_draw_cursor = 0;
+        // Ring full: drop the NEW capture, never the oldest. Dropping the oldest
+        // resets capture_draw_cursor, so a submit rate above the draw rate makes
+        // every draw re-read the first (early-setup) snapshot forever — later
+        // DCBs that carry the real PS constant pointer are never bound.
+        return;
     }
     const tail = (capture_head + capture_len) % capture_queue.len;
     capture_queue[tail] = cap;

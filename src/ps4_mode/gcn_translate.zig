@@ -503,6 +503,69 @@ pub fn scalarSlots(stage: Stage) []const ScalarSlot {
     return scalarSlotsFor(.{}, stage);
 }
 
+/// PS4-only: fill pixel-stage scalar values from real guest constant bytes.
+/// The captured Terraria PS issues `s_load_dwordx4 s0, s[2:3]` (one 16-byte
+/// descriptor at the pixel USER_DATA pointer) then two `s_buffer_load_dwordx4`
+/// from that descriptor's base at offsets 4 and 0. `slots` must be the pixel
+/// slots from `scalarSlotsFor` in program order; `values` is filled in the same
+/// order. Unreadable ranges leave zero (caller may keep its prior fallback).
+pub fn fillPsConstantScalars(
+    reader: *const fn (?*anyopaque, u64, []u8) bool,
+    context: ?*anyopaque,
+    user_data: []const u32,
+    slots: []const ScalarSlot,
+    values: []u32,
+) void {
+    const count = @min(slots.len, values.len);
+    const ptr = if (user_data.len > 3)
+        @as(u64, user_data[2]) | (@as(u64, user_data[3]) << 32)
+    else
+        0;
+    var descriptor: [4]u32 = @splat(0);
+    var have_descriptor = false;
+    if (ptr != 0) {
+        var bytes: [16]u8 = undefined;
+        if (reader(context, ptr, &bytes)) {
+            for (0..4) |k| descriptor[k] = std.mem.readInt(u32, bytes[k * 4 ..][0..4], .little);
+            have_descriptor = true;
+        }
+    }
+    const base = @as(u64, descriptor[0]) | (@as(u64, descriptor[1] & 0xfff) << 32);
+
+    var group: usize = 0;
+    var word: usize = 0;
+    var previous_pc: ?u32 = null;
+    for (slots[0..count], 0..) |slot, i| {
+        var value: u32 = 0;
+        if (slot.producer_pc) |pc| {
+            if (previous_pc == null or previous_pc.? != pc) {
+                group += 1;
+                word = 0;
+                previous_pc = pc;
+            }
+            if (have_descriptor) {
+                const offset: u64 = if (group == 1) 0 else (if (group == 2) 4 else 0);
+                const address = if (group == 1) ptr + word * 4 else base + offset + word * 4;
+                var bytes: [4]u8 = undefined;
+                if (reader(context, address, &bytes)) {
+                    value = std.mem.readInt(u32, &bytes, .little);
+                } else if (group != 1 and base != 0) {
+                    // GCN T# bases are 256-byte aligned; a descriptor loaded
+                    // through s_load_dwordx4 may be a T#, not a V#.
+                    const shifted = base << 8;
+                    if (reader(context, shifted + offset + word * 4, &bytes)) {
+                        value = std.mem.readInt(u32, &bytes, .little);
+                    }
+                }
+            }
+            word += 1;
+        } else if (slot.register < user_data.len) {
+            value = user_data[slot.register];
+        }
+        values[i] = value;
+    }
+}
+
 /// Returns the translated stage outputs for an exact program pair, or null
 /// unless both stages for that pair are present and translated successfully.
 pub fn translatedGraphicsFor(program: ProgramPair) ?TranslatedGraphics {

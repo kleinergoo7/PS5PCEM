@@ -565,6 +565,50 @@ test "real VS ISA decodes arithmetic, not s_nop; translation has no guessed MUBU
     }
 }
 
+test "PS SMRD scalars are filled from guest bytes at the real USER_DATA pointer" {
+    // Live DCBs bind pixel USER_DATA[2:3] = 0x1000104c / 0x10, i.e. pointer
+    // 0x101000104c. The four dwords there are the descriptor the PS loads.
+    const Entry = struct { addr: u64, value: u32 };
+    const entries = [_]Entry{
+        .{ .addr = 0x1010_0010_4c, .value = 0x1111_1111 },
+        .{ .addr = 0x1010_0010_50, .value = 0x2222_2222 },
+        .{ .addr = 0x1010_0010_54, .value = 0x3333_3333 },
+        .{ .addr = 0x1010_0010_58, .value = 0x4444_4444 },
+    };
+    const FakeMemory = struct {
+        fn read(ctx: ?*anyopaque, address: u64, bytes: []u8) bool {
+            const list: *const []const Entry = @ptrCast(@alignCast(ctx.?));
+            if (bytes.len % 4 != 0 or address % 4 != 0) return false;
+            for (0..bytes.len / 4) |i| {
+                const want = address + i * 4;
+                var hit = false;
+                for (list.*) |e| {
+                    if (e.addr == want) {
+                        std.mem.writeInt(u32, bytes[i * 4 ..][0..4], e.value, .little);
+                        hit = true;
+                        break;
+                    }
+                }
+                if (!hit) return false;
+            }
+            return true;
+        }
+    };
+    var user_data: [16]u32 = @splat(0);
+    user_data[2] = 0x1000_104c;
+    user_data[3] = 0x10;
+    const slots = [_]gcn_translate.ScalarSlot{
+        .{ .register = 0, .value = 0, .producer_pc = 0x10 },
+        .{ .register = 1, .value = 0, .producer_pc = 0x10 },
+        .{ .register = 2, .value = 0, .producer_pc = 0x10 },
+        .{ .register = 3, .value = 0, .producer_pc = 0x10 },
+    };
+    var values: [4]u32 = @splat(0);
+    var entries_slice: []const Entry = &entries;
+    gcn_translate.fillPsConstantScalars(FakeMemory.read, @ptrCast(&entries_slice), &user_data, &slots, &values);
+    try std.testing.expectEqual([4]u32{ 0x1111_1111, 0x2222_2222, 0x3333_3333, 0x4444_4444 }, values);
+}
+
 test "PS sampled-image slot subtracts the USER_DATA base from an absolute SGPR" {
     // An MIMG resource operand naming absolute SGPR 0x10 resolves to USER_DATA
     // index 4 (0x10 - 0x0c), not to the raw SGPR number.

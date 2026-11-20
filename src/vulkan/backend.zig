@@ -25754,10 +25754,24 @@ pub const Renderer = struct {
         stage: ps4_mode.gcn_translate.Stage,
         storage: []gpu.ShaderSpirvScalarRegister,
         resources: ps4_mode.gcn_resources.Resources,
+        memory: ?GuestMemory,
     ) []const gpu.ShaderSpirvScalarRegister {
         const slots = ps4_mode.gcn_translate.scalarSlotsFor(program, stage);
         const count = @min(slots.len, storage.len);
         const user_data = resources.userData(if (stage == .vertex) .vertex else .pixel);
+
+        // PS4-only: when the real PS constant pointer is bound, read its SMRD
+        // scalar values from guest bytes instead of the heuristic fallback.
+        var real_values: [64]u32 = @splat(0);
+        const ps_pointer = @as(u64, resources.pixel_user_data[2]) |
+            (@as(u64, resources.pixel_user_data[3]) << 32);
+        var use_real = false;
+        if (stage == .pixel and ps_pointer != 0) {
+            if (memory) |m| {
+                ps4_mode.gcn_translate.fillPsConstantScalars(m.read, m.context, user_data, slots[0..count], real_values[0..count]);
+                use_real = true;
+            }
+        }
 
         // The real Terraria VS performs three SGPR loads in its straight prolog:
         // a V# from a raw USER_DATA pointer, then two vertex-attribute reads.
@@ -25769,7 +25783,9 @@ pub const Renderer = struct {
         const step_bits: u32 = @bitCast(@as(f32, 0.25));
         for (slots[0..count], 0..) |slot, index| {
             var value: u32 = 0;
-            if (slot.producer_pc) |pc| {
+            if (use_real) {
+                value = real_values[index];
+            } else if (slot.producer_pc) |pc| {
                 if (previous_pc == null or previous_pc.? != pc) {
                     group += 1;
                     word_in_group = 0;
@@ -25914,11 +25930,11 @@ pub const Renderer = struct {
         var vertex_storage: [64]gpu.ShaderSpirvScalarRegister = undefined;
         var fragment_storage: [64]gpu.ShaderSpirvScalarRegister = undefined;
         const vertex_scalars: []const gpu.ShaderSpirvScalarRegister = if (use_real_shader)
-            ps4GraphicsScalars(program, .vertex, &vertex_storage, resources)
+            ps4GraphicsScalars(program, .vertex, &vertex_storage, resources, self.guest_memory)
         else
             &.{};
         const fragment_scalars: []const gpu.ShaderSpirvScalarRegister = if (use_real_shader)
-            ps4GraphicsScalars(program, .pixel, &fragment_storage, resources)
+            ps4GraphicsScalars(program, .pixel, &fragment_storage, resources, self.guest_memory)
         else
             &.{};
         // The translated PS reads a sampled image at binding 1 / element 1.
