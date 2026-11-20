@@ -63,6 +63,10 @@ pub const Tag = enum {
     image_sample,
     exp,
     s_waitcnt,
+    v_and_b32,
+    v_lshlrev_b32,
+    v_add_i32,
+    v_cvt_f32_i32,
     unsupported,
 };
 
@@ -187,6 +191,10 @@ pub const Instruction = union(enum) {
     image_sample: Mimg,
     exp: Exp,
     s_waitcnt: Simple,
+    v_and_b32: Vop2,
+    v_lshlrev_b32: Vop2,
+    v_add_i32: Vop2,
+    v_cvt_f32_i32: Vop1,
     unsupported: Unsupported,
 
     pub fn tag(self: Instruction) Tag {
@@ -340,19 +348,25 @@ pub const Iterator = struct {
                 const literal_value = if (immediate) try self.literal(wi, &count) else 0;
                 const dst = (w0 >> 17) & 0xff;
                 const src1 = (w0 >> 9) & 0xff;
-                // Real Terraria blobs contain packed-convert / bit-twiddle
-                // VOP2/VOP1 ops the RDNA2 writer has no equivalent for. They
-                // are not needed for the exports/texture sample, so lower
-                // them to s_nop and keep the instruction's dword footprint.
+                // The only VOP2 family without a writer equivalent is the
+                // packed half convert (0x2f). Integer logic and the signed
+                // int->float convert the Terraria VS uses are all supported.
                 const is_noop = switch (fam) {
-                    .vop2 => switch (id) {
-                        0x1a, 0x1b, 0x25, 0x2f => true, // lshlrev, and, ?, cvt_pkrtz_f16
-                        else => false,
-                    },
-                    .vop1 => vop1_op == 0x05, // v_cvt_f32_u32
+                    .vop2 => id == 0x2f,
                     else => false,
                 };
-                try self.append(if (is_noop) 0xbf80_0000 else w0);
+                // GCN v_lshlrev_b32 is VDST = VSRC1 << (SRC0&31); RDNA2 has
+                // v_lshl_b32 (VDST = SRC0 << (SRC1&31)) but its 8-bit src1
+                // field cannot hold the inline shift constant. Normalize to
+                // a VOP3 v_lshl_b32 (opcode 0x119) with a 9-bit inline src1.
+                // count stays 1: this consumes one guest word, emits two.
+                const is_lshlrev = fam == .vop2 and id == 0x1a;
+                if (is_lshlrev) {
+                    try self.append((0x34 << 26) | (0x119 << 16) | dst);
+                    try self.append((@as(u32, 256) + src1) | (src0 << 9));
+                } else {
+                    try self.append(if (is_noop) 0xbf80_0000 else w0);
+                }
                 if (immediate) try self.append(literal_value);
                 const base = Base{ .pc = pc, .word_count = count };
                 if (is_noop) break :blk Instruction{ .s_waitcnt = .{ .base = base } };
@@ -364,12 +378,16 @@ pub const Iterator = struct {
                         0x08 => .{ .v_mul_f32 = .{ .base = base, .op = id, .dst = dst, .src0 = src0, .src1 = src1, .literal = immediate } },
                         0x0f => .{ .v_min_f32 = .{ .base = base, .op = id, .dst = dst, .src0 = src0, .src1 = src1, .literal = immediate } },
                         0x10 => .{ .v_max_f32 = .{ .base = base, .op = id, .dst = dst, .src0 = src0, .src1 = src1, .literal = immediate } },
+                        0x1a => .{ .v_lshlrev_b32 = .{ .base = base, .op = id, .dst = dst, .src0 = src0, .src1 = src1, .literal = immediate } },
+                        0x1b => .{ .v_and_b32 = .{ .base = base, .op = id, .dst = dst, .src0 = src0, .src1 = src1, .literal = immediate } },
                         0x1f => .{ .v_mac_f32 = .{ .base = base, .op = id, .dst = dst, .src0 = src0, .src1 = src1, .literal = immediate } },
+                        0x25 => .{ .v_add_i32 = .{ .base = base, .op = id, .dst = dst, .src0 = src0, .src1 = src1, .literal = immediate } },
                         else => try self.unsupported(fam, w0, count, "unsupported VOP2 opcode", false),
                     },
                     .vopc => .{ .v_cmp = .{ .base = base, .op = id, .src0 = src0, .src1 = src1, .literal = immediate } },
                     .vop1 => switch (vop1_op) {
                         0x01 => .{ .v_mov_b32 = .{ .base = base, .op = vop1_op, .dst = dst, .src0 = src0, .literal = immediate } },
+                        0x05 => .{ .v_cvt_f32_i32 = .{ .base = base, .op = vop1_op, .dst = dst, .src0 = src0, .literal = immediate } },
                         else => try self.unsupported(fam, w0, count, "unsupported VOP1 opcode", false),
                     },
                     else => unreachable,
@@ -545,40 +563,13 @@ pub fn isTerrariaVertexShader(words: []const u32) bool {
     return std.mem.eql(u32, words[2 .. 2 + terraria_vs_prolog.len], &terraria_vs_prolog);
 }
 
-/// PS4 vertex front-end. Terraria's captured VS exports POS0 directly from
-/// VGPRs whose original attribute fetch is absent from the dumped ISA (its
-/// prolog words are packed bit-twiddles the GCN decoder cannot map). Supply the
-/// fetch from the guest V# the backend stages at descriptor 0: a four-component
-/// MUBUF indexed by VertexIndex (v4) into v0..v3, inserted immediately before
-/// the POS0 export. The positions are real bytes from the captured V#, never
-/// synthesized quad corners. Callers must gate this with
-/// `isTerrariaVertexShader`; other VS programs use `decodeToRdna2`.
+/// PS4 vertex front-end. The captured Terraria VS computes POS0 entirely from
+/// the vertex index in v0 with VOP2/VOP1 inline-constant arithmetic (a
+/// fullscreen-quad corner generator); it has no memory load. The earlier
+/// reconstructed V# fetch overwrote v0..v3 before POS0 and is gone. Kept as a
+/// thin alias so existing callers share the single real decode path.
 pub fn decodeVertexToRdna2(allocator: std.mem.Allocator, words: []const u32) Error!Rdna2Program {
-    const fetch = [2]u32{
-        0xe00c_2000, // MUBUF op 0x03 (load_format_xyzw), idxen, offset 0
-        0x7d01_0004, // SOFFSET=null, srsrc=1 (V# -> RDNA2 s4), dst=v0, vaddr=v4
-    };
-    var normalized: std.ArrayList(u32) = .empty;
-    errdefer normalized.deinit(allocator);
-    var it = decodeWithAllocator(allocator, words);
-    it.normalized = &normalized;
-    var injected = false;
-    while (true) {
-        const before = normalized.items.len;
-        const inst = (try it.next()) orelse break;
-        if (!injected) {
-            switch (inst) {
-                .exp => |e| if (e.target == 0x0c) {
-                    try normalized.insertSlice(allocator, before, &fetch);
-                    injected = true;
-                },
-                else => {},
-            }
-        }
-    }
-    const owned = try normalized.toOwnedSlice(allocator);
-    const program = rdna2.decodeProgram(allocator, owned) catch return Error.UnsupportedInstruction;
-    return .{ .program = program, .normalized = owned };
+    return decodeToRdna2(allocator, words);
 }
 
 // ---- encoding helpers (used by tests and by future shader captures) ----

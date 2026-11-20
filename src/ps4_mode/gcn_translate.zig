@@ -138,8 +138,9 @@ fn translateShaderSlots(
         if (inst.tag() == .unsupported) return error.UnsupportedInstruction;
     }
 
-    // Only the exact captured Terraria VS gets the reconstructed V# fetch;
-    // every other PS4 VS keeps its own POS0 data flow untouched.
+    // The captured Terraria VS is identified so the vertex-index built-in can
+    // seed v0, the register its real ISA reads. Its POS0 needs no injected
+    // fetch: the guest bit-twiddles v0 into fullscreen-quad corners itself.
     const terraria_vs = stage == .vertex and gcn_decode.isTerrariaVertexShader(words);
     var decoded = if (terraria_vs)
         try gcn_decode.decodeVertexToRdna2(allocator, words)
@@ -297,10 +298,11 @@ fn buildOptions(allocator: std.mem.Allocator, stage: Stage, program: *const rdna
         // writer's override option stays default-off and native-identical.
         .vertex_corner_vgprs = null,
         .vertex_position_corner_override = false,
-        // Only the reconstructed Terraria fetch is indexed by v4; DRAW_INDEX_AUTO
+        // The real Terraria VS reads the vertex index from v0. The old guessed
+        // MUBUF used v4 as its address; that fetch is gone. DRAW_INDEX_AUTO
         // count=4 is replayed as four sequential vertices. Other VS programs
-        // keep v4 for their own purposes.
-        .vertex_index_vgpr = if (terraria_vs) 4 else null,
+        // have their own index register and keep the default (no seed).
+        .vertex_index_vgpr = if (terraria_vs) 0 else null,
         .dynamic_scalar_binding = if (slots.len != 0) .{
             .binding = 2 + rdna2.spirv.maximum_storage_images,
             .value_base = if (stage == .vertex) 0 else fragment_words_per_stage,

@@ -11,6 +11,7 @@
 //! vertex/fragment SPIR-V, instead of only the hand-encoded fixtures.
 
 const std = @import("std");
+const rdna2 = @import("rdna2");
 const gcn_blob = @import("gcn_blob.zig");
 const gcn_decode = @import("gcn_decode.zig");
 const gcn_translate = @import("gcn_translate.zig");
@@ -443,24 +444,23 @@ test "no synthetic corner fallback in PS4 vertex path" {
     registerShaderFor(program, .pixel, &vs_words);
     const spirv = translatedGraphicsFor(program).?.vertex_words;
     try std.testing.expect(!syntheticCornerSequence(spirv));
-    try std.testing.expect(positionTracesToStorageBufferLoad(spirv));
+    // POS0 is computed from the vertex-index built-in by guest VOP2/VOP1
+    // arithmetic, not from a staged V# load and not from a synthetic corner.
+    try std.testing.expect(!positionTracesToStorageBufferLoad(spirv));
 }
 
-test "real VS POS0 reads the staged V# indexed by the draw's sequential VertexIndex" {
-    // The classification-accurate VS (ps_words) must contain the reconstructed
-    // four-component V# fetch, indexed by v4 (the sequential VertexIndex), not
-    // a synthetic quad corner.
-    var decoded = try gcn_decode.decodeVertexToRdna2(std.testing.allocator, &ps_words);
+test "real VS POS0 derives fullscreen-quad corners from the VertexIndex in v0" {
+    // The classification-accurate VS (ps_words) bit-twiddles v0 into POS0:
+    // x = ((v0&1)<<1)-1, y = (v0&-2)-1, z=0, w=1. No memory fetch is involved.
+    var decoded = try gcn_decode.decodeToRdna2(std.testing.allocator, &ps_words);
     defer decoded.deinit(std.testing.allocator);
-    var fetch_count: usize = 0;
-    for (decoded.program.instructions.items) |inst| {
-        if (inst.opcode != .buffer_load_format_xyzw) continue;
-        fetch_count += 1;
-        try std.testing.expect(inst.index_enable);
-        try std.testing.expectEqual(@as(u32, 4), inst.src0.reg); // vaddr = v4
-        try std.testing.expectEqual(@as(u32, 4), inst.src1.reg); // V# at descriptor 0
-    }
-    try std.testing.expectEqual(@as(usize, 1), fetch_count);
+    var ops = std.ArrayList(rdna2.Opcode).empty;
+    defer ops.deinit(std.testing.allocator);
+    for (decoded.program.instructions.items) |inst| try ops.append(std.testing.allocator, inst.opcode);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(rdna2.Opcode, ops.items, &[_]rdna2.Opcode{.v_and_b32}));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(rdna2.Opcode, ops.items, &[_]rdna2.Opcode{.v_lshl_b32}));
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(rdna2.Opcode, ops.items, &[_]rdna2.Opcode{.v_add_nc_u32}));
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(rdna2.Opcode, ops.items, &[_]rdna2.Opcode{.v_cvt_f32_i32}));
 
     const res = capture(&real_terraria_dcb).draws[0];
     gcn_translate.registerShaderForWithVertexSource(program, .vertex, &ps_words, vertexDataSourceFor(res));
@@ -528,6 +528,41 @@ test "PS image samples the USER_DATA slot of its own draw" {
     const second = nextDrawResources().?;
     try std.testing.expectEqual(@as(u64, 0x10170c0000), @as(u64, first.userData(.pixel)[index]) << 8);
     try std.testing.expectEqual(@as(u64, 0x10168c8000), @as(u64, second.userData(.pixel)[index]) << 8);
+}
+
+test "real VS ISA decodes arithmetic, not s_nop; translation has no guessed MUBUF" {
+    // ps_words is the classification-accurate VS (EXP POS0 0x0c / PARAM0 0x20).
+    // Its nine arithmetic instructions derive POS0 from the vertex index using
+    // inline constants; none is a memory load and none may be lowered to nop.
+    const insts = try gcn_decode.decodeAll(std.testing.allocator, &ps_words);
+    defer std.testing.allocator.free(insts);
+
+    // Words 2..8 (after the two-word SOP1 prolog) must survive as real ops.
+    const want = [_]gcn_decode.Tag{
+        gcn_decode.Tag.s_mov_b32,       // prolog marker + literal
+        gcn_decode.Tag.v_and_b32,       // v1 = 1 & v0
+        gcn_decode.Tag.v_lshlrev_b32,   // v1 = v1 << 1
+        gcn_decode.Tag.v_and_b32,       // v0 = -2 & v0
+        gcn_decode.Tag.v_add_i32,       // v1 = -1 + v1
+        gcn_decode.Tag.v_add_i32,       // v0 = -1 + v0
+        gcn_decode.Tag.v_cvt_f32_i32,   // v1 = (float)(int)v1
+        gcn_decode.Tag.v_cvt_f32_i32,   // v0 = (float)(int)v0
+        gcn_decode.Tag.v_mov_b32,       // v2 = 0
+        gcn_decode.Tag.v_mov_b32,       // v3 = 1.0
+        gcn_decode.Tag.exp,             // POS0
+        gcn_decode.Tag.exp,             // PARAM0
+        gcn_decode.Tag.s_endpgm,
+    };
+    try std.testing.expectEqual(want.len, insts.len);
+    for (want, insts) |expected, inst| try std.testing.expectEqual(expected, inst.tag());
+
+    // The real VS path must not inject a guessed V# fetch: the normalized
+    // program contains no memory instruction at all.
+    var decoded = try gcn_decode.decodeToRdna2(std.testing.allocator, &ps_words);
+    defer decoded.deinit(std.testing.allocator);
+    for (decoded.program.instructions.items) |inst| {
+        try std.testing.expect(inst.family != .mubuf and inst.family != .smem);
+    }
 }
 
 test "PS sampled-image slot subtracts the USER_DATA base from an absolute SGPR" {
