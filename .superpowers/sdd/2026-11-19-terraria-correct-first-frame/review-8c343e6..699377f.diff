@@ -1,0 +1,476 @@
+# Review package: 8c343e6..699377f
+
+## Commits
+699377f fix(ps4): source Terraria VS positions from the staged V#
+
+## Files changed
+ src/ps4_mode/gcn_decode.zig         | 35 +++++++++++++++
+ src/ps4_mode/gcn_real_blob_test.zig | 37 +++++++++++++++-
+ src/ps4_mode/gcn_translate.zig      | 85 +++++++++++++++++++++----------------
+ 3 files changed, 118 insertions(+), 39 deletions(-)
+
+## Diff
+diff --git a/src/ps4_mode/gcn_decode.zig b/src/ps4_mode/gcn_decode.zig
+index 99f91d8..abc678e 100644
+--- a/src/ps4_mode/gcn_decode.zig
++++ b/src/ps4_mode/gcn_decode.zig
+@@ -522,20 +522,55 @@ pub fn decodeToRdna2(allocator: std.mem.Allocator, words: []const u32) Error!Rdn
+     var normalized: std.ArrayList(u32) = .empty;
+     errdefer normalized.deinit(allocator);
+     var it = decodeWithAllocator(allocator, words);
+     it.normalized = &normalized;
+     while (try it.next()) |_| {}
+     const owned = try normalized.toOwnedSlice(allocator);
+     const program = rdna2.decodeProgram(allocator, owned) catch return Error.UnsupportedInstruction;
+     return .{ .program = program, .normalized = owned };
+ }
+ 
++/// PS4 vertex front-end. Terraria's captured VS exports POS0 directly from
++/// VGPRs whose original attribute fetch is absent from the dumped ISA (its
++/// prolog words are packed bit-twiddles the GCN decoder cannot map). Supply the
++/// fetch from the guest V# the backend stages at descriptor 0: a four-component
++/// MUBUF indexed by VertexIndex (v4) into v0..v3, inserted immediately before
++/// the POS0 export. The positions are real bytes from the captured V#, never
++/// synthesized quad corners.
++pub fn decodeVertexToRdna2(allocator: std.mem.Allocator, words: []const u32) Error!Rdna2Program {
++    const fetch = [2]u32{
++        0xe00c_2000, // MUBUF op 0x03 (load_format_xyzw), idxen, offset 0
++        0x7d01_0004, // SOFFSET=null, srsrc=1 (V# -> RDNA2 s4), dst=v0, vaddr=v4
++    };
++    var normalized: std.ArrayList(u32) = .empty;
++    errdefer normalized.deinit(allocator);
++    var it = decodeWithAllocator(allocator, words);
++    it.normalized = &normalized;
++    var injected = false;
++    while (true) {
++        const before = normalized.items.len;
++        const inst = (try it.next()) orelse break;
++        if (!injected) {
++            switch (inst) {
++                .exp => |e| if (e.target == 0x0c) {
++                    try normalized.insertSlice(allocator, before, &fetch);
++                    injected = true;
++                },
++                else => {},
++            }
++        }
++    }
++    const owned = try normalized.toOwnedSlice(allocator);
++    const program = rdna2.decodeProgram(allocator, owned) catch return Error.UnsupportedInstruction;
++    return .{ .program = program, .normalized = owned };
++}
++
+ // ---- encoding helpers (used by tests and by future shader captures) ----
+ 
+ pub fn vop2(op: u32, dst: u32, src1: u32, src0: u32) u32 {
+     return (op << 25) | (dst << 17) | (src1 << 9) | src0;
+ }
+ pub fn vop1(op: u32, dst: u32, src0: u32) u32 {
+     return 0x7e00_0000 | (dst << 17) | (op << 9) | src0;
+ }
+ pub fn vintrp(p2: bool, dst: u32, attr: u32, src: u32) u32 {
+     return 0xc800_0000 | (dst << 18) | (@as(u32, @intFromBool(p2)) << 16) | (attr << 10) | src;
+diff --git a/src/ps4_mode/gcn_real_blob_test.zig b/src/ps4_mode/gcn_real_blob_test.zig
+index a00ee5f..5a548db 100644
+--- a/src/ps4_mode/gcn_real_blob_test.zig
++++ b/src/ps4_mode/gcn_real_blob_test.zig
+@@ -424,26 +424,59 @@ test "VINTRP attr without a VS PARAM export reports null, never a guessed input"
+         gcn_decode.vintrp(true, 1, 0, 0),
+         0xbf81_0000,
+     };
+     registerShaderFor(local_program, .vertex, &[_]u32{0xbf81_0000}); // no PARAM exports
+     registerShaderFor(local_program, .pixel, &ps_with_vintrp);
+     try std.testing.expect(fragmentInputsFor(local_program) == null);
+     try std.testing.expect(gcn_translate.lastDiagnostic() != null);
+ }
+ 
+ test "no synthetic corner fallback in PS4 vertex path" {
+-    registerShaderFor(program, .vertex, &vs_words);
+-    registerShaderFor(program, .pixel, &ps_words);
++    // Correct stage mapping: ps_words exports POS0/PARAM0 (VS); vs_words
++    // exports MRT0 with an image sample (PS).
+     const res = capture(&real_terraria_dcb).draws[0];
+     const src = vertexDataSourceFor(res).?;
+     try std.testing.expect(src.address != 0);
+     try std.testing.expect(src.size_bytes > 0);
++    gcn_translate.registerShaderForWithVertexSource(program, .vertex, &ps_words, src);
++    registerShaderFor(program, .pixel, &vs_words);
+     const spirv = translatedGraphicsFor(program).?.vertex_words;
+     try std.testing.expect(!syntheticCornerSequence(spirv));
+     try std.testing.expect(positionTracesToStorageBufferLoad(spirv));
+ }
+ 
++test "real VS POS0 reads the staged V# indexed by the draw's sequential VertexIndex" {
++    // The classification-accurate VS (ps_words) must contain the reconstructed
++    // four-component V# fetch, indexed by v4 (the sequential VertexIndex), not
++    // a synthetic quad corner.
++    var decoded = try gcn_decode.decodeVertexToRdna2(std.testing.allocator, &ps_words);
++    defer decoded.deinit(std.testing.allocator);
++    var fetch_count: usize = 0;
++    for (decoded.program.instructions.items) |inst| {
++        if (inst.opcode != .buffer_load_format_xyzw) continue;
++        fetch_count += 1;
++        try std.testing.expect(inst.index_enable);
++        try std.testing.expectEqual(@as(u32, 4), inst.src0.reg); // vaddr = v4
++        try std.testing.expectEqual(@as(u32, 4), inst.src1.reg); // V# at descriptor 0
++    }
++    try std.testing.expectEqual(@as(usize, 1), fetch_count);
++
++    const res = capture(&real_terraria_dcb).draws[0];
++    gcn_translate.registerShaderForWithVertexSource(program, .vertex, &ps_words, vertexDataSourceFor(res));
++    registerShaderFor(program, .pixel, &vs_words);
++    const spirv = translatedGraphicsFor(program).?.vertex_words;
++    // BuiltIn VertexIndex (decoration 11 / value 42) is present in the VS.
++    var has_vertex_index = false;
++    var i: usize = 5;
++    while (i + 3 < spirv.len) {
++        const wc: usize = spirv[i] >> 16;
++        if (wc >= 4 and (spirv[i] & 0xffff) == 71 and spirv[i + 2] == 11 and spirv[i + 3] == 42) has_vertex_index = true;
++        i += @max(wc, 1);
++    }
++    try std.testing.expect(has_vertex_index);
++}
++
+ test "vertexDataSourceFor reports null with a diagnostic when no VS V# exists" {
+     const empty: gcn_resources.Resources = .{};
+     try std.testing.expect(vertexDataSourceFor(empty) == null);
+     try std.testing.expect(gcn_translate.lastDiagnostic() != null);
+ }
+diff --git a/src/ps4_mode/gcn_translate.zig b/src/ps4_mode/gcn_translate.zig
+index b54165a..3dff1d0 100644
+--- a/src/ps4_mode/gcn_translate.zig
++++ b/src/ps4_mode/gcn_translate.zig
+@@ -67,56 +67,61 @@ pub const Error = error{
+ } || std.mem.Allocator.Error || rdna2.Error || rdna2.spirv.Error;
+ 
+ pub const Diagnostic = struct {
+     stage: Stage,
+     reason: []const u8,
+ };
+ 
+ /// Translate a raw GCN word stream into owned SPIR-V words. Unsupported
+ /// instructions are reported as an error instead of being silently dropped.
+ pub fn translateShader(allocator: std.mem.Allocator, stage: Stage, words: []const u32) Error![]u32 {
+-    return translateShaderSlots(allocator, stage, words, null, null);
++    return translateShaderSlots(allocator, stage, words, null, null, null);
+ }
+ 
+ /// Same as `translateShader`, but also returns the owned dynamic scalar layout
+ /// used by `options.scalar_registers`. The draw path consumes this layout.
+-/// `fragment_inputs` is the paired VS/PS interface; a standalone translation
+-/// leaves it null and keeps the legacy all-inputs default.
++/// `fragment_inputs` is the paired VS/PS interface; `vertex_source` is the
++/// measured V# that supplies the PS4 vertex fetch. Standalone translations
++/// leave both null and keep the legacy all-inputs / fixed-stride default.
+ fn translateShaderSlots(
+     allocator: std.mem.Allocator,
+     stage: Stage,
+     words: []const u32,
+     slots_out: ?*[]ScalarSlot,
+     fragment_inputs: ?FragmentInputs,
++    vertex_source: ?VertexDataSource,
+ ) Error![]u32 {
+     var seen = gcn_decode.decode(words);
+     while (try seen.next()) |inst| {
+         if (inst.tag() == .unsupported) return error.UnsupportedInstruction;
+     }
+ 
+-    var decoded = try gcn_decode.decodeToRdna2(allocator, words);
++    var decoded = if (stage == .vertex)
++        try gcn_decode.decodeVertexToRdna2(allocator, words)
++    else
++        try gcn_decode.decodeToRdna2(allocator, words);
+     defer decoded.deinit(allocator);
+ 
+     // Real Terraria vertex shaders use IMAGE_SAMPLE with implicit LOD for
+     // vertex texture fetches. The shared writer only permits level-zero /
+     // explicit LOD in the vertex stage, and GCN VTF is LOD 0 by definition.
+     if (stage == .vertex) {
+         for (decoded.program.instructions.items) |*inst| {
+             if (inst.opcode == .image_sample) inst.image_sample_flags.level_zero = true;
+         }
+     }
+ 
+     const slots = try buildScalarSlots(allocator, &decoded.program);
+     var handed_off = false;
+     defer if (!handed_off) allocator.free(slots);
+ 
+-    var options = try buildOptions(allocator, stage, &decoded.program, slots, fragment_inputs);
++    var options = try buildOptions(allocator, stage, &decoded.program, slots, fragment_inputs, vertex_source);
+     defer options.deinit();
+ 
+     var module = try rdna2.translateProgramSpirv(allocator, &decoded.program, options.options);
+     defer module.deinit(allocator);
+     const spirv_words = try allocator.dupe(u32, module.words);
+     if (slots_out) |out| {
+         out.* = slots;
+         handed_off = true;
+     }
+     return spirv_words;
+@@ -172,58 +177,52 @@ const OptionsBuilder = struct {
+     images: std.ArrayList(rdna2.spirv.SampledImageBinding) = .empty,
+     buffers: std.ArrayList(rdna2.spirv.StorageBufferBinding) = .empty,
+     options: rdna2.spirv.Options = undefined,
+ 
+     fn deinit(self: *OptionsBuilder) void {
+         self.images.deinit(self.allocator);
+         self.buffers.deinit(self.allocator);
+     }
+ };
+ 
+-/// Element stride of Terraria's captured VS V# (word1[29:16] at USER_DATA 0x54).
+-/// `vertexDataSourceFor` measures this from the live per-draw descriptor; the
+-/// translator only needs the matching element size to declare the slot.
+-/// shortcut: fixed to Terraria's 16-byte V#, upgrade if another PS4 title's VS
+-/// strides its V# differently and relies on a real MUBUF at this element.
+-const ps4_vertex_v_stride: u32 = 16;
++/// Fallback element stride when no V# was measured (standalone translations).
++/// The registered PS4 path passes the real stride from `vertexDataSourceFor`.
++/// shortcut: Terraria's captured V# is 16 bytes; upgrade if a PS4 title reaches
++/// translation without a measured source and strides its V# differently.
++const ps4_vertex_v_stride_fallback: u32 = 16;
+ 
+-fn buildOptions(allocator: std.mem.Allocator, stage: Stage, program: *const rdna2.Program, slots: []const ScalarSlot, fragment_inputs: ?FragmentInputs) Error!OptionsBuilder {
++fn buildOptions(allocator: std.mem.Allocator, stage: Stage, program: *const rdna2.Program, slots: []const ScalarSlot, fragment_inputs: ?FragmentInputs, vertex_source: ?VertexDataSource) Error!OptionsBuilder {
+     var builder = OptionsBuilder{ .allocator = allocator };
+     errdefer builder.deinit();
+ 
+-    // PS4 vertex path: declare element 0 for the guest VS V# bytes staged by the
+-    // backend. `use_vertex_index = false` because DRAW_INDEX_AUTO count=4 is
+-    // replayed as four sequential vertices; no synthetic corner positions are
+-    // seeded. s127 keeps this diagnostic binding clear of real MUBUF resources.
+-    if (stage == .vertex) {
+-        try builder.buffers.append(allocator, .{
+-            .resource_sgpr = 127,
+-            .descriptor_index = 0,
+-            .stride = ps4_vertex_v_stride,
+-            .use_vertex_index = false,
+-        });
+-    }
++    // The PS4 VS front-end inserts a MUBUF that reads POS0 from descriptor 0.
++    // Its stride is the measured V# stride when the caller has one; the host
++    // staging uses the same source, so the addressed record is real guest data,
++    // not a synthetic corner.
++    const vertex_stride = if (vertex_source) |src| src.stride else ps4_vertex_v_stride_fallback;
+ 
+     for (program.instructions.items) |inst| {
+         if (inst.opcode == .image_sample) {
+             try builder.images.append(allocator, .{
+                 .resource_sgpr = inst.src1.reg,
+                 .sampler_sgpr = inst.src2.reg,
+                 .descriptor_index = rdna2.spirv.sampled_image_2d_descriptor_binding,
+                 .dimension = .two_d,
+             });
+         } else if (inst.opcode == .buffer_load_format_xyzw or inst.opcode == .buffer_load_format_xy) {
+             try builder.buffers.append(allocator, .{
+                 .resource_sgpr = inst.src1.reg,
+                 .descriptor_index = @intCast(builder.buffers.items.len),
+-                .stride = if (stage == .vertex) ps4_vertex_v_stride else 4,
+-                .use_vertex_index = false,
++                .stride = if (stage == .vertex) vertex_stride else 4,
++                // PS4 VS: the guest prolog computes a sequential index from the
++                // VertexIndex built-in (v4); do not override it on any stage.
++                .use_vertex_index = stage != .vertex,
+             });
+         }
+     }
+ 
+     // The pixel stage uses the interface derived from the paired VS PARAM
+     // exports and VINTRP attrs. A standalone translation (no registered pair)
+     // keeps the legacy all-inputs default; the writer still infers
+     // parameter_mask/color_export_mask from decoded VINTRP and EXP.
+     // PS4-only: SGPR-backed values are host-updated per draw instead of baked
+     // into OpConstant. Binding 34 is the backend's dedicated dynamic scalar
+@@ -245,20 +244,24 @@ fn buildOptions(allocator: std.mem.Allocator, stage: Stage, program: *const rdna
+         .ps4_sample_coordinate_location = if (derived_inputs != null and inputs.allocated != 0)
+             @intCast(@ctz(inputs.allocated))
+         else
+             null,
+         .scalar_registers = slots,
+         // PS4 no longer seeds float quad corners from VertexIndex: POS0 comes
+         // from guest V#-derived values staged by the backend. The shared
+         // writer's override option stays default-off and native-identical.
+         .vertex_corner_vgprs = null,
+         .vertex_position_corner_override = false,
++        // The inserted V# fetch is indexed by v4. DRAW_INDEX_AUTO count=4 is
++        // replayed as four sequential vertices, so VertexIndex 0..3 addresses
++        // the four real vertex records.
++        .vertex_index_vgpr = if (stage == .vertex) 4 else null,
+         .dynamic_scalar_binding = if (slots.len != 0) .{
+             .binding = 2 + rdna2.spirv.maximum_storage_images,
+             .value_base = if (stage == .vertex) 0 else fragment_words_per_stage,
+         } else null,
+         .specialized_scalar_prefix_end = std.math.maxInt(u32),
+     };
+     return builder;
+ }
+ 
+ // Registered shader state. One bounded entry per bound GNM program pair; each
+@@ -275,20 +278,21 @@ const max_registrations = 8;
+ 
+ const ShaderTranslation = struct {
+     program: ProgramPair = .{},
+     used: bool = false,
+     vertex_isa: ?[]u32 = null,
+     pixel_isa: ?[]u32 = null,
+     vertex_spirv: ?[]u32 = null,
+     pixel_spirv: ?[]u32 = null,
+     vertex_slots: []ScalarSlot = &.{},
+     pixel_slots: []ScalarSlot = &.{},
++    vertex_source: ?VertexDataSource = null,
+ 
+     fn freeTranslation(self: *ShaderTranslation, allocator: std.mem.Allocator) void {
+         if (self.vertex_spirv) |words| allocator.free(words);
+         if (self.pixel_spirv) |words| allocator.free(words);
+         if (self.vertex_slots.len != 0) allocator.free(self.vertex_slots);
+         if (self.pixel_slots.len != 0) allocator.free(self.pixel_slots);
+         self.vertex_spirv = null;
+         self.pixel_spirv = null;
+         self.vertex_slots = &.{};
+         self.pixel_slots = &.{};
+@@ -358,24 +362,25 @@ fn fragmentInputsFromIsa(vertex_isa: []const u32, pixel_isa: []const u32) ?Fragm
+ /// either stage is missing or a VINTRP attribute has no VS PARAM export.
+ pub fn fragmentInputsFor(program: ProgramPair) ?FragmentInputs {
+     lockGlobal();
+     defer lock.unlock();
+     const index = findEntry(program) orelse return null;
+     const entry = &registry[index];
+     if (entry.vertex_isa == null or entry.pixel_isa == null) return null;
+     return fragmentInputsFromIsa(entry.vertex_isa.?, entry.pixel_isa.?);
+ }
+ 
+-/// Register one stage's ISA for an exact GNM program pair. When both stages of
+-/// that pair are present the pair is (re)translated; a single stage alone never
+-/// produces a usable translation.
+-pub fn registerShaderFor(program: ProgramPair, stage: Stage, words: []const u32) void {
++/// Register one stage's ISA for an exact GNM program pair, supplying the
++/// measured VS V# so the translator's element stride matches the bytes the
++/// backend stages. When both stages are present the pair is (re)translated; a
++/// single stage alone never produces a usable translation.
++pub fn registerShaderForWithVertexSource(program: ProgramPair, stage: Stage, words: []const u32, vertex_source: ?VertexDataSource) void {
+     const allocator = std.heap.page_allocator;
+     const copy = allocator.dupe(u32, words) catch return;
+ 
+     lockGlobal();
+     defer lock.unlock();
+ 
+     const index = findEntry(program) orelse blk: {
+         var free_slot: ?usize = null;
+         for (&registry, 0..) |*entry, i| {
+             if (!entry.used) {
+@@ -388,49 +393,55 @@ pub fn registerShaderFor(program: ProgramPair, stage: Stage, words: []const u32)
+         registry[slot].deinit(allocator); // recycle a fresh or evicted slot
+         registry[slot].program = program;
+         registry[slot].used = true;
+         break :blk slot;
+     };
+     var entry = &registry[index];
+ 
+     const isa_slot = if (stage == .vertex) &entry.vertex_isa else &entry.pixel_isa;
+     if (isa_slot.*) |old| allocator.free(old);
+     isa_slot.* = copy;
++    if (stage == .vertex) entry.vertex_source = vertex_source;
+ 
+     // A change to either stage invalidates the whole pair's translation.
+     entry.freeTranslation(allocator);
+     diagnostic = null;
+     if (entry.vertex_isa == null or entry.pixel_isa == null) return;
+ 
+     // A mismatch declares no inputs (with a diagnostic) instead of reverting
+     // to the guessed all-inputs default.
+     const fragment_inputs = fragmentInputsFromIsa(entry.vertex_isa.?, entry.pixel_isa.?) orelse
+         FragmentInputs{ .allocated = 0, .enabled = 0 };
+     var vertex_slots: []ScalarSlot = &.{};
+-    const vertex_words = translateShaderSlots(allocator, .vertex, entry.vertex_isa.?, &vertex_slots, null) catch |err| {
++    const vertex_words = translateShaderSlots(allocator, .vertex, entry.vertex_isa.?, &vertex_slots, null, entry.vertex_source) catch |err| {
+         diagnostic = .{ .stage = .vertex, .reason = @errorName(err) };
+         return;
+     };
+     var pixel_slots: []ScalarSlot = &.{};
+-    const pixel_words = translateShaderSlots(allocator, .pixel, entry.pixel_isa.?, &pixel_slots, fragment_inputs) catch |err| {
++    const pixel_words = translateShaderSlots(allocator, .pixel, entry.pixel_isa.?, &pixel_slots, fragment_inputs, null) catch |err| {
+         allocator.free(vertex_words);
+         if (vertex_slots.len != 0) allocator.free(vertex_slots);
+         diagnostic = .{ .stage = .pixel, .reason = @errorName(err) };
+         return;
+     };
+ 
+     entry.vertex_spirv = vertex_words;
+     entry.pixel_spirv = pixel_words;
+     entry.vertex_slots = vertex_slots;
+     entry.pixel_slots = pixel_slots;
+ }
+ 
++/// Register one stage without a measured V# (standalone translation).
++pub fn registerShaderFor(program: ProgramPair, stage: Stage, words: []const u32) void {
++    registerShaderForWithVertexSource(program, stage, words, null);
++}
++
+ /// Test helper: register against the zero program pair.
+ pub fn registerShader(stage: Stage, words: []const u32) void {
+     registerShaderFor(.{}, stage, words);
+ }
+ 
+ /// Dynamic scalar layout for an exact program pair/stage. The draw path fills
+ /// values in this exact order before `writeGraphicsScalarValues`.
+ pub fn scalarSlotsFor(program: ProgramPair, stage: Stage) []const ScalarSlot {
+     lockGlobal();
+     defer lock.unlock();
+@@ -535,28 +546,28 @@ test "translated VS loads SGPR scalars dynamically from the dedicated binding" {
+     try std.testing.expect(containsOpcode(words, 61)); // OpLoad
+     var found_binding = false;
+     for (words, 0..) |word, i| {
+         if (i + 3 >= words.len) break;
+         if (word == 0x0004_0047 and words[i + 2] == 2 + rdna2.spirv.maximum_storage_images and words[i + 3] == 0) {
+             found_binding = true;
+         }
+     }
+     try std.testing.expect(found_binding);
+ 
+-    // PS4 no longer seeds POS0 from Vulkan VertexIndex corners; guest V# data
+-    // replaces the synthetic quad. No VertexIndex input is declared.
++    // The PS4 VS declares VertexIndex only to index the reconstructed V# fetch;
++    // the old quad-corner seed (AND/shift/bitcast into POS0) is gone.
+     var found_vertex_index = false;
+     for (words, 0..) |word, i| {
+         if (i + 3 >= words.len) break;
+         if (word == 0x0004_0047 and words[i + 2] == 11 and words[i + 3] == 42) found_vertex_index = true;
+     }
+-    try std.testing.expect(!found_vertex_index);
++    try std.testing.expect(found_vertex_index);
+ 
+     // Slot order is stable: the same GCN program always yields the same layout.
+     var decoded = try gcn_decode.decodeToRdna2(std.testing.allocator, &vs);
+     defer decoded.deinit(std.testing.allocator);
+     const slots = try buildScalarSlots(std.testing.allocator, &decoded.program);
+     defer std.testing.allocator.free(slots);
+     try std.testing.expect(slots.len > 0);
+     try std.testing.expectEqual(@as(u32, 8), slots[0].register);
+ }
+ 
+@@ -573,23 +584,23 @@ test "dynamic scalar values do not change translated SPIR-V words" {
+     defer decoded.deinit(std.testing.allocator);
+     const slots = try buildScalarSlots(std.testing.allocator, &decoded.program);
+     defer std.testing.allocator.free(slots);
+ 
+     const first_values = try std.testing.allocator.dupe(ScalarSlot, slots);
+     defer std.testing.allocator.free(first_values);
+     const second_values = try std.testing.allocator.dupe(ScalarSlot, slots);
+     defer std.testing.allocator.free(second_values);
+     for (second_values) |*slot| slot.value = 0xdead_beef;
+ 
+-    var first_options = try buildOptions(std.testing.allocator, .vertex, &decoded.program, first_values, null);
++    var first_options = try buildOptions(std.testing.allocator, .vertex, &decoded.program, first_values, null, null);
+     defer first_options.deinit();
+-    var second_options = try buildOptions(std.testing.allocator, .vertex, &decoded.program, second_values, null);
++    var second_options = try buildOptions(std.testing.allocator, .vertex, &decoded.program, second_values, null, null);
+     defer second_options.deinit();
+     var first_module = try rdna2.translateProgramSpirv(std.testing.allocator, &decoded.program, first_options.options);
+     defer first_module.deinit(std.testing.allocator);
+     var second_module = try rdna2.translateProgramSpirv(std.testing.allocator, &decoded.program, second_options.options);
+     defer second_module.deinit(std.testing.allocator);
+     try std.testing.expectEqualSlices(u32, first_module.words, second_module.words);
+ }
+ 
+ test "unsupported GCN instructions are reported, not silently dropped" {
+     const with_ds = [_]u32{ 0xd800_0000, 0x0000_0000, 0xbf81_0000 };

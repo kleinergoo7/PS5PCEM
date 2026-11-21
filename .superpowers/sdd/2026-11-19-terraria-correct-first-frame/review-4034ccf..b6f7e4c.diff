@@ -1,0 +1,418 @@
+# Review package: 4034ccf..b6f7e4c
+
+## Commits
+b6f7e4c feat(ps4): derive PS fragment inputs from GCN VINTRP and VS PARAM exports
+
+## Files changed
+ src/ps4_mode/gcn_real_blob_test.zig | 82 ++++++++++++++++++++++++++++++++
+ src/ps4_mode/gcn_translate.zig      | 94 ++++++++++++++++++++++++++++++++-----
+ 2 files changed, 165 insertions(+), 11 deletions(-)
+
+## Diff
+diff --git a/src/ps4_mode/gcn_real_blob_test.zig b/src/ps4_mode/gcn_real_blob_test.zig
+index 7780657..7d031bb 100644
+--- a/src/ps4_mode/gcn_real_blob_test.zig
++++ b/src/ps4_mode/gcn_real_blob_test.zig
+@@ -11,20 +11,21 @@
+ //! vertex/fragment SPIR-V, instead of only the hand-encoded fixtures.
+ 
+ const std = @import("std");
+ const gcn_blob = @import("gcn_blob.zig");
+ const gcn_decode = @import("gcn_decode.zig");
+ const gcn_translate = @import("gcn_translate.zig");
+ 
+ const ProgramPair = gcn_translate.ProgramPair;
+ const registerShaderFor = gcn_translate.registerShaderFor;
+ const translatedGraphicsFor = gcn_translate.translatedGraphicsFor;
++const fragmentInputsFor = gcn_translate.fragmentInputsFor;
+ 
+ /// Full VS blob (2048-byte dump truncated to the parsed ISA extent).
+ /// isa_offset = 0x104, isa_size = 88 (22 dwords).
+ const vs_words = [_]u32{
+     0xbeeb03ff, 0x0000000e, 0xbe92047e, 0xbefe0a7e,
+     0xc0800300, 0xbf8c007f, 0xc2480104, 0xc2400100,
+     0xbf8c007f, 0x7e000210, 0x7e020211, 0x3e000400,
+     0x3e020601, 0xf0800f00, 0x00610000, 0xbefe0412,
+     0xbf8c0f70, 0x5e000300, 0x5e020702, 0xf8001c0f,
+     0x00000100, 0xbf810000,
+@@ -72,10 +73,91 @@ test "gcn_blob.isaBytes extracts the ISA from the real VS blob header" {
+     try std.testing.expectEqual(@as(usize, 88), isa.len);
+ }
+ 
+ test "program-keyed translation rejects mismatched pair" {
+     const program: ProgramPair = .{ .vertex = 0x1000000a88, .pixel = 0x1000000aa4 };
+     registerShaderFor(program, .vertex, &vs_words);
+     registerShaderFor(program, .pixel, &ps_words);
+     try std.testing.expect(translatedGraphicsFor(program) != null);
+     try std.testing.expect(translatedGraphicsFor(.{ .vertex = 1, .pixel = 2 }) == null);
+ }
++
++/// Two OpConstant float values forming the coordinate composite consumed by an
++/// image sample: the hardcoded `(0,0)` UV fallback this task removes.
++fn constantUvOnly(words: []const u32) bool {
++    var float_type: u32 = 0;
++    for (words, 0..) |word, i| {
++        if (word == 0x0003_0015 and i + 2 < words.len and words[i + 2] == 32) {
++            float_type = words[i + 1]; // OpTypeFloat %float 32
++            break;
++        }
++    }
++    if (float_type == 0) return false;
++
++    var constants: [64]u32 = undefined;
++    var nconst: usize = 0;
++    for (words, 0..) |word, i| {
++        // OpConstant: 5 words, result type is the 32-bit float type.
++        if (word != 0x0005_002b or i + 3 >= words.len or words[i + 1] != float_type) continue;
++        if (nconst < constants.len) {
++            constants[nconst] = words[i + 2];
++            nconst += 1;
++        }
++    }
++
++    var composites: [64]u32 = undefined;
++    var ncomp: usize = 0;
++    for (words, 0..) |word, i| {
++        const count: usize = word >> 16;
++        if ((word & 0xffff) != 80 or count < 4 or i + count > words.len) continue; // OpCompositeConstruct
++        var hits: usize = 0;
++        for (words[i + 3 .. i + count]) |operand| {
++            for (constants[0..nconst]) |constant| {
++                if (constant == operand) {
++                    hits += 1;
++                    break;
++                }
++            }
++        }
++        if (hits >= 2 and ncomp < composites.len) {
++            composites[ncomp] = words[i + 2];
++            ncomp += 1;
++        }
++    }
++    if (ncomp == 0) return false;
++
++    for (words, 0..) |word, i| {
++        const op = word & 0xffff;
++        if ((op != 87 and op != 88) or i + 4 >= words.len) continue; // image sample
++        const coordinate = words[i + 4];
++        for (composites[0..ncomp]) |composite| if (composite == coordinate) return true;
++    }
++    return false;
++}
++
++test "real PS fragment inputs come from VS PARAM exports and VINTRP attrs" {
++    // The embedded arrays are named after the OrbShdr header stage field, but
++    // the runtime classifies by EXP target (ps4_title_stubs.stageFromIsa): the
++    // blob exporting POS0 (0x0c) / PARAM0 (0x20) is the VS, and the blob
++    // exporting MRT0 (0x00) with an image sample is the PS.
++    const program: ProgramPair = .{ .vertex = 0x1000000b88, .pixel = 0x1000000ba4 };
++    registerShaderFor(program, .vertex, &ps_words);
++    registerShaderFor(program, .pixel, &vs_words);
++    const inputs = fragmentInputsFor(program).?;
++    try std.testing.expectEqual(@as(u32, 1), inputs.allocated); // VS PARAM0 -> bit 0
++    try std.testing.expectEqual(inputs.allocated, inputs.enabled);
++    const graphics = translatedGraphicsFor(program) orelse return error.TestExpectedGraphics;
++    try std.testing.expect(!constantUvOnly(graphics.fragment_words));
++}
++
++test "VINTRP attr without a VS PARAM export reports null, never a guessed input" {
++    const program: ProgramPair = .{ .vertex = 0x1000000c88, .pixel = 0x1000000ca4 };
++    const ps_with_vintrp = [_]u32{
++        gcn_decode.vintrp(false, 0, 0, 0), // consumes attr 0
++        gcn_decode.vintrp(true, 1, 0, 0),
++        0xbf81_0000,
++    };
++    registerShaderFor(program, .vertex, &[_]u32{0xbf81_0000}); // no PARAM exports
++    registerShaderFor(program, .pixel, &ps_with_vintrp);
++    try std.testing.expect(fragmentInputsFor(program) == null);
++    try std.testing.expect(gcn_translate.lastDiagnostic() != null);
++}
+diff --git a/src/ps4_mode/gcn_translate.zig b/src/ps4_mode/gcn_translate.zig
+index 9d76c64..83827bf 100644
+--- a/src/ps4_mode/gcn_translate.zig
++++ b/src/ps4_mode/gcn_translate.zig
+@@ -15,50 +15,58 @@ const gcn_resources = @import("gcn_resources.zig");
+ 
+ pub const ProgramPair = gcn_resources.ProgramPair;
+ 
+ pub const Stage = enum { vertex, pixel };
+ 
+ pub const TranslatedGraphics = struct {
+     vertex_words: []const u32,
+     fragment_words: []const u32,
+ };
+ 
++/// Which VS PARAM exports the paired PS consumes. Bits are raw VINTRP ATTR /
++/// VS PARAM indices; allocated and enabled are identical because GCN PARAM
++/// exports are always both allocated and enabled.
++pub const FragmentInputs = struct { allocated: u32, enabled: u32 };
++
+ /// PS4-only dynamic scalar layout. One slot per SGPR the GCN program reads plus
+ /// one slot per SMEM destination word, in a deterministic order. The draw path
+ /// uploads values in exactly this order; the writer loads slot N from
+ /// `dynamic_scalar_binding.value_base + N`.
+ pub const ScalarSlot = rdna2.spirv.ScalarRegister;
+ 
+ pub const Error = error{
+     NoShader,
+     UnsupportedInstruction,
+     NoSampledImage,
+ } || std.mem.Allocator.Error || rdna2.Error || rdna2.spirv.Error;
+ 
+ pub const Diagnostic = struct {
+     stage: Stage,
+     reason: []const u8,
+ };
+ 
+ /// Translate a raw GCN word stream into owned SPIR-V words. Unsupported
+ /// instructions are reported as an error instead of being silently dropped.
+ pub fn translateShader(allocator: std.mem.Allocator, stage: Stage, words: []const u32) Error![]u32 {
+-    return translateShaderSlots(allocator, stage, words, null);
++    return translateShaderSlots(allocator, stage, words, null, null);
+ }
+ 
+ /// Same as `translateShader`, but also returns the owned dynamic scalar layout
+ /// used by `options.scalar_registers`. The draw path consumes this layout.
++/// `fragment_inputs` is the paired VS/PS interface; a standalone translation
++/// leaves it null and keeps the legacy all-inputs default.
+ fn translateShaderSlots(
+     allocator: std.mem.Allocator,
+     stage: Stage,
+     words: []const u32,
+     slots_out: ?*[]ScalarSlot,
++    fragment_inputs: ?FragmentInputs,
+ ) Error![]u32 {
+     var seen = gcn_decode.decode(words);
+     while (try seen.next()) |inst| {
+         if (inst.tag() == .unsupported) return error.UnsupportedInstruction;
+     }
+ 
+     var decoded = try gcn_decode.decodeToRdna2(allocator, words);
+     defer decoded.deinit(allocator);
+ 
+     // Real Terraria vertex shaders use IMAGE_SAMPLE with implicit LOD for
+@@ -67,21 +75,21 @@ fn translateShaderSlots(
+     if (stage == .vertex) {
+         for (decoded.program.instructions.items) |*inst| {
+             if (inst.opcode == .image_sample) inst.image_sample_flags.level_zero = true;
+         }
+     }
+ 
+     const slots = try buildScalarSlots(allocator, &decoded.program);
+     var handed_off = false;
+     defer if (!handed_off) allocator.free(slots);
+ 
+-    var options = try buildOptions(allocator, stage, &decoded.program, slots);
++    var options = try buildOptions(allocator, stage, &decoded.program, slots, fragment_inputs);
+     defer options.deinit();
+ 
+     var module = try rdna2.translateProgramSpirv(allocator, &decoded.program, options.options);
+     defer module.deinit(allocator);
+     const spirv_words = try allocator.dupe(u32, module.words);
+     if (slots_out) |out| {
+         out.* = slots;
+         handed_off = true;
+     }
+     return spirv_words;
+@@ -137,21 +145,21 @@ const OptionsBuilder = struct {
+     images: std.ArrayList(rdna2.spirv.SampledImageBinding) = .empty,
+     buffers: std.ArrayList(rdna2.spirv.StorageBufferBinding) = .empty,
+     options: rdna2.spirv.Options = undefined,
+ 
+     fn deinit(self: *OptionsBuilder) void {
+         self.images.deinit(self.allocator);
+         self.buffers.deinit(self.allocator);
+     }
+ };
+ 
+-fn buildOptions(allocator: std.mem.Allocator, stage: Stage, program: *const rdna2.Program, slots: []const ScalarSlot) Error!OptionsBuilder {
++fn buildOptions(allocator: std.mem.Allocator, stage: Stage, program: *const rdna2.Program, slots: []const ScalarSlot, fragment_inputs: ?FragmentInputs) Error!OptionsBuilder {
+     var builder = OptionsBuilder{ .allocator = allocator };
+     errdefer builder.deinit();
+ 
+     for (program.instructions.items) |inst| {
+         if (inst.opcode == .image_sample) {
+             try builder.images.append(allocator, .{
+                 .resource_sgpr = inst.src1.reg,
+                 .sampler_sgpr = inst.src2.reg,
+                 .descriptor_index = rdna2.spirv.sampled_image_2d_descriptor_binding,
+                 .dimension = .two_d,
+@@ -159,33 +167,41 @@ fn buildOptions(allocator: std.mem.Allocator, stage: Stage, program: *const rdna
+         } else if (inst.opcode == .buffer_load_format_xyzw or inst.opcode == .buffer_load_format_xy) {
+             try builder.buffers.append(allocator, .{
+                 .resource_sgpr = inst.src1.reg,
+                 .descriptor_index = @intCast(builder.buffers.items.len),
+                 .stride = 4,
+                 .use_vertex_index = true,
+             });
+         }
+     }
+ 
+-    // Two interpolated PS inputs (TEXCOORD0/COLOR0) is the sprite-shader
+-    // convention; the writer infers parameter_mask/color_export_mask from the
+-    // decoded VINTRP and EXP instructions themselves.
++    // The pixel stage uses the interface derived from the paired VS PARAM
++    // exports and VINTRP attrs. A standalone translation (no registered pair)
++    // keeps the legacy all-inputs default; the writer still infers
++    // parameter_mask/color_export_mask from decoded VINTRP and EXP.
+     // PS4-only: SGPR-backed values are host-updated per draw instead of baked
+     // into OpConstant. Binding 34 is the backend's dedicated dynamic scalar
+     // storage buffer (2 + maximum_storage_images); the fragment stage uses a
+     // disjoint value_base so writeGraphicsScalarValues can fill both stages.
+     const fragment_words_per_stage: u32 = 512 * 16 + 128 * 2;
++    const inputs = if (stage == .pixel and fragment_inputs != null)
++        fragment_inputs.?
++    else
++        FragmentInputs{ .allocated = 0b11, .enabled = 0b11 };
+     builder.options = .{
+         .stage = if (stage == .vertex) .vertex else .fragment,
+         .sampled_images = builder.images.items,
+         .storage_buffers = builder.buffers.items,
+-        .fragment_inputs = .{ .allocated = 0b11, .enabled = 0b11 },
++        .fragment_inputs = .{
++            .allocated = @intCast(inputs.allocated),
++            .enabled = @intCast(inputs.enabled),
++        },
+         .scalar_registers = slots,
+         .vertex_corner_vgprs = if (stage == .vertex) .{ 2, 3 } else null,
+         .vertex_position_corner_override = stage == .vertex,
+         .dynamic_scalar_binding = if (slots.len != 0) .{
+             .binding = 2 + rdna2.spirv.maximum_storage_images,
+             .value_base = if (stage == .vertex) 0 else fragment_words_per_stage,
+         } else null,
+         .specialized_scalar_prefix_end = std.math.maxInt(u32),
+     };
+     return builder;
+@@ -236,20 +252,72 @@ var registry: [max_registrations]ShaderTranslation = [_]ShaderTranslation{.{}} *
+ var next_slot: usize = 0;
+ var diagnostic: ?Diagnostic = null;
+ 
+ fn findEntry(program: ProgramPair) ?usize {
+     for (&registry, 0..) |*entry, i| {
+         if (entry.used and entry.program.vertex == program.vertex and entry.program.pixel == program.pixel) return i;
+     }
+     return null;
+ }
+ 
++/// Derive the fragment-input mask from the VS PARAM exports, then verify that
++/// every VINTRP attribute the PS consumes is actually exported. A mismatch
++/// reports a diagnostic and returns null rather than inventing an input.
++fn fragmentInputsFromIsa(vertex_isa: []const u32, pixel_isa: []const u32) ?FragmentInputs {
++    var mask: u32 = 0;
++    var vs = gcn_decode.decode(vertex_isa);
++    while (true) {
++        const inst = vs.next() catch {
++            diagnostic = .{ .stage = .vertex, .reason = "cannot decode VS PARAM exports" };
++            return null;
++        } orelse break;
++        switch (inst) {
++            .exp => |exported| {
++                if (exported.target >= 0x20) {
++                    mask |= @as(u32, 1) << @intCast(@as(u32, exported.target) - 0x20);
++                }
++            },
++            else => {},
++        }
++    }
++
++    var ps = gcn_decode.decode(pixel_isa);
++    while (true) {
++        const inst = ps.next() catch {
++            diagnostic = .{ .stage = .pixel, .reason = "cannot decode PS VINTRP attrs" };
++            return null;
++        } orelse break;
++        const attr: ?u32 = switch (inst) {
++            .v_interp_p1_f32, .v_interp_p2_f32 => |vintrp| vintrp.attr,
++            else => null,
++        };
++        if (attr) |index| {
++            if (index >= 32 or mask & (@as(u32, 1) << @intCast(index)) == 0) {
++                diagnostic = .{ .stage = .pixel, .reason = "VINTRP attr has no matching VS PARAM export" };
++                return null;
++            }
++        }
++    }
++    return .{ .allocated = mask, .enabled = mask };
++}
++
++/// Fragment-input mask for an exact registered program pair, or null when
++/// either stage is missing or a VINTRP attribute has no VS PARAM export.
++pub fn fragmentInputsFor(program: ProgramPair) ?FragmentInputs {
++    lockGlobal();
++    defer lock.unlock();
++    const index = findEntry(program) orelse return null;
++    const entry = &registry[index];
++    if (entry.vertex_isa == null or entry.pixel_isa == null) return null;
++    return fragmentInputsFromIsa(entry.vertex_isa.?, entry.pixel_isa.?);
++}
++
+ /// Register one stage's ISA for an exact GNM program pair. When both stages of
+ /// that pair are present the pair is (re)translated; a single stage alone never
+ /// produces a usable translation.
+ pub fn registerShaderFor(program: ProgramPair, stage: Stage, words: []const u32) void {
+     const allocator = std.heap.page_allocator;
+     const copy = allocator.dupe(u32, words) catch return;
+ 
+     lockGlobal();
+     defer lock.unlock();
+ 
+@@ -272,27 +340,31 @@ pub fn registerShaderFor(program: ProgramPair, stage: Stage, words: []const u32)
+ 
+     const isa_slot = if (stage == .vertex) &entry.vertex_isa else &entry.pixel_isa;
+     if (isa_slot.*) |old| allocator.free(old);
+     isa_slot.* = copy;
+ 
+     // A change to either stage invalidates the whole pair's translation.
+     entry.freeTranslation(allocator);
+     diagnostic = null;
+     if (entry.vertex_isa == null or entry.pixel_isa == null) return;
+ 
++    // A mismatch declares no inputs (with a diagnostic) instead of reverting
++    // to the guessed all-inputs default.
++    const fragment_inputs = fragmentInputsFromIsa(entry.vertex_isa.?, entry.pixel_isa.?) orelse
++        FragmentInputs{ .allocated = 0, .enabled = 0 };
+     var vertex_slots: []ScalarSlot = &.{};
+-    const vertex_words = translateShaderSlots(allocator, .vertex, entry.vertex_isa.?, &vertex_slots) catch |err| {
++    const vertex_words = translateShaderSlots(allocator, .vertex, entry.vertex_isa.?, &vertex_slots, null) catch |err| {
+         diagnostic = .{ .stage = .vertex, .reason = @errorName(err) };
+         return;
+     };
+     var pixel_slots: []ScalarSlot = &.{};
+-    const pixel_words = translateShaderSlots(allocator, .pixel, entry.pixel_isa.?, &pixel_slots) catch |err| {
++    const pixel_words = translateShaderSlots(allocator, .pixel, entry.pixel_isa.?, &pixel_slots, fragment_inputs) catch |err| {
+         allocator.free(vertex_words);
+         if (vertex_slots.len != 0) allocator.free(vertex_slots);
+         diagnostic = .{ .stage = .pixel, .reason = @errorName(err) };
+         return;
+     };
+ 
+     entry.vertex_spirv = vertex_words;
+     entry.pixel_spirv = pixel_words;
+     entry.vertex_slots = vertex_slots;
+     entry.pixel_slots = pixel_slots;
+@@ -446,23 +518,23 @@ test "dynamic scalar values do not change translated SPIR-V words" {
+     defer decoded.deinit(std.testing.allocator);
+     const slots = try buildScalarSlots(std.testing.allocator, &decoded.program);
+     defer std.testing.allocator.free(slots);
+ 
+     const first_values = try std.testing.allocator.dupe(ScalarSlot, slots);
+     defer std.testing.allocator.free(first_values);
+     const second_values = try std.testing.allocator.dupe(ScalarSlot, slots);
+     defer std.testing.allocator.free(second_values);
+     for (second_values) |*slot| slot.value = 0xdead_beef;
+ 
+-    var first_options = try buildOptions(std.testing.allocator, .vertex, &decoded.program, first_values);
++    var first_options = try buildOptions(std.testing.allocator, .vertex, &decoded.program, first_values, null);
+     defer first_options.deinit();
+-    var second_options = try buildOptions(std.testing.allocator, .vertex, &decoded.program, second_values);
++    var second_options = try buildOptions(std.testing.allocator, .vertex, &decoded.program, second_values, null);
+     defer second_options.deinit();
+     var first_module = try rdna2.translateProgramSpirv(std.testing.allocator, &decoded.program, first_options.options);
+     defer first_module.deinit(std.testing.allocator);
+     var second_module = try rdna2.translateProgramSpirv(std.testing.allocator, &decoded.program, second_options.options);
+     defer second_module.deinit(std.testing.allocator);
+     try std.testing.expectEqualSlices(u32, first_module.words, second_module.words);
+ }
+ 
+ test "unsupported GCN instructions are reported, not silently dropped" {
+     const with_ds = [_]u32{ 0xd800_0000, 0x0000_0000, 0xbf81_0000 };

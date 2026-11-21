@@ -1,0 +1,207 @@
+# Review package: 137128f..HEAD
+
+## Commits
+eaae3a3 feat(ps4_mode): wire PS4-only hook into game_run
+
+## Files changed
+ src/game_run.zig           | 61 ++++++++++++++++++++++++++++++++++++++++++++++
+ src/ps4_mode/game_hook.zig | 30 ++++++++++++++++++++++-
+ 2 files changed, 90 insertions(+), 1 deletion(-)
+
+## Diff
+diff --git a/src/game_run.zig b/src/game_run.zig
+index 645b315..d778da4 100644
+--- a/src/game_run.zig
++++ b/src/game_run.zig
+@@ -11,20 +11,21 @@ const runtime = @import("runtime");
+ const loader = @import("loader");
+ const vulkan = @import("vulkan");
+ const d3d12 = @import("d3d12");
+ const zarchive = @import("zarchive");
+ const renderdoc = @import("renderdoc");
+ const graphics_api = @import("graphics_api.zig");
+ const window = @import("window");
+ const display_mode = @import("display_mode.zig");
+ const performance_mode = @import("performance_mode.zig");
+ const frame_limit = @import("frame_limit.zig");
++const ps4_mode = @import("ps4_mode/root.zig");
+ 
+ fn acquireHostMemory(context: ?*anyopaque, address: u64, size: usize, identity: u64) ?vulkan.GuestMemory.HostMapping {
+     const view = runtime.firmware.libs.agc_submit.pinDirectMemory(context, address, size, identity) orelse return null;
+     return .{ .bytes = view.bytes, .offset = view.offset, .identity = identity, .release = runtime.firmware.libs.agc_submit.releaseDirectMemory };
+ }
+ 
+ comptime {
+     @import("host_memory.zig").exportRuntime();
+     // The native D3D12 object also calls this module's exported byte comparator
+     // in test builds, where main() is not analyzed.
+@@ -188,20 +189,52 @@ fn readTitleIdentifier(io: std.Io, content: std.Io.Dir, storage: []u8) ?[]const
+ fn readTitleIdentifierArchive(reader: *zarchive.Reader, storage: []u8) ?[]const u8 {
+     const savedata = runtime.firmware.savedata;
+     const node = reader.lookup(savedata.title_parameter_path) orelse return null;
+     if (!reader.isFile(node)) return null;
+     if (reader.fileSize(node) > 8192) return null;
+     var document: [8192]u8 = undefined;
+     const size = reader.readAt(node, 0, &document) catch return null;
+     return savedata.findJsonString(document[0..size], "titleId", storage);
+ }
+ 
++/// Reads the small prefixes the PS4 detector needs: param.sfo carries TITLE_ID
++/// and the ELF header carries e_type. Both stay caller-owned stack buffers.
++fn readPs4Blobs(
++    io: std.Io,
++    content: ?std.Io.Dir,
++    archive_reader: ?*zarchive.Reader,
++    executable_name: []const u8,
++    sfo_buffer: []u8,
++    elf_buffer: []u8,
++) struct { sfo: ?[]const u8, elf: ?[]const u8 } {
++    var sfo: ?[]const u8 = null;
++    var elf: ?[]const u8 = null;
++    if (archive_reader) |reader| {
++        if (reader.lookup("sce_sys/param.sfo")) |node| {
++            if (reader.isFile(node)) {
++                const n = reader.readAt(node, 0, sfo_buffer) catch 0;
++                sfo = sfo_buffer[0..n];
++            }
++        }
++        if (reader.lookup(executable_name)) |node| {
++            if (reader.isFile(node)) {
++                const n = reader.readAt(node, 0, elf_buffer) catch 0;
++                elf = elf_buffer[0..n];
++            }
++        }
++    } else if (content) |directory| {
++        sfo = directory.readFile(io, "sce_sys/param.sfo", sfo_buffer) catch null;
++        elf = directory.readFile(io, executable_name, elf_buffer) catch null;
++    }
++    return .{ .sfo = sfo, .elf = elf };
++}
++
+ /// Whether a path names an existing host directory.
+ fn isDirectoryPath(io: std.Io, path: []const u8) bool {
+     const info = std.Io.Dir.cwd().statFile(io, path, .{}) catch return false;
+     return info.kind == .directory;
+ }
+ 
+ /// Opens a ZArchive dump, splitting the path so absolute locations work.
+ fn openTitleArchive(io: std.Io, archive_path: []const u8) !*zarchive.Reader {
+     const dirname = std.fs.path.dirname(archive_path) orelse ".";
+     const basename = std.fs.path.basename(archive_path);
+@@ -571,20 +604,48 @@ fn run(init: std.process.Init) !bool {
+     var content: ?std.Io.Dir = null;
+     defer if (content) |*directory| directory.close(io);
+     if (archive_reader == null) {
+         content = std.Io.Dir.cwd().openDir(io, title_root, .{}) catch |err| {
+             try stderr.print("cannot open {s}: {s}\n", .{ title_root, @errorName(err) });
+             try stderr.flush();
+             return false;
+         };
+     }
+ 
++    // PS4-only hook: resolve the mode once from the runner environment, classify
++    // the content, and lower the driver default-state preamble. When compat is
++    // inactive nothing below changes and the native PS5 path runs as before.
++    {
++        const ps4_policy = init.minimal.environ.getAlloc(allocator, ps4_mode.game_hook.env_mode) catch null;
++        defer if (ps4_policy) |value| allocator.free(value);
++        const ps4_diag = init.minimal.environ.containsUnempty(allocator, ps4_mode.game_hook.env_diag) catch false;
++        ps4_mode.game_hook.seedEnvConfig(ps4_policy, ps4_diag);
++        const ps4_cfg = ps4_mode.game_hook.configFromEnv();
++
++        const executable_name = if (archive_reader != null) archive_executable else std.fs.path.basename(executable_path);
++        var sfo_bytes: [4096]u8 = undefined;
++        var elf_bytes: [64]u8 = undefined;
++        const blobs = readPs4Blobs(io, content, archive_reader, executable_name, &sfo_bytes, &elf_bytes);
++        const detected = ps4_mode.game_hook.decideForBlobs(blobs.sfo, blobs.elf);
++        if (ps4_cfg.enabledFor(detected)) {
++            var line_buffer: [128]u8 = undefined;
++            try out.print("{s}\n", .{ps4_mode.game_hook.startupLine(detected, ps4_cfg, &line_buffer)});
++            try out.flush();
++
++            var ps4_session = ps4_mode.runtime.Session{};
++            var ps4_stats = ps4_mode.bridge.PipelineStats{};
++            ps4_mode.bridge.runBuffer(&ps4_session, blobs.sfo, blobs.elf, ps4_cfg, &.{}, &.{}, &.{}, &ps4_stats);
++            var lowered: [16]ps4_mode.gpu_translate.Lowered = undefined;
++            _ = ps4_mode.bridge.runDefaultState(&lowered, &ps4_stats);
++        }
++    }
++
+     var title_identifier_storage: [runtime.firmware.savedata.maximum_slot_name]u8 = undefined;
+     const title_identifier = if (archive_reader) |reader|
+         readTitleIdentifierArchive(reader, &title_identifier_storage) orelse ""
+     else if (content) |directory|
+         readTitleIdentifier(io, directory, &title_identifier_storage) orelse ""
+     else
+         "";
+     // Demon's Souls ships link-time driver shadows its bundled initializer
+     // cannot satisfy; route it to the live firmware path instead. See
+     // ModuleGraphOptions.ignore_bundled_drivers: big, per-title, deliberate.
+diff --git a/src/ps4_mode/game_hook.zig b/src/ps4_mode/game_hook.zig
+index 6c8c609..6526080 100644
+--- a/src/ps4_mode/game_hook.zig
++++ b/src/ps4_mode/game_hook.zig
+@@ -11,23 +11,36 @@
+ //! ```
+ //!
+ //! Kept dependency-light on purpose: blobs in, verdict out. File/network IO
+ //! stays in the caller, so headless tools and the GUI share this file.
+ 
+ const std = @import("std");
+ const detector = @import("detector.zig");
+ const runtime = @import("runtime.zig");
+ 
+ pub const decideForBlobs = detector.decideFromBlobs;
+-pub const configFromEnv = runtime.configFromEnv;
+ pub const configFrom = runtime.configFrom;
+ 
++/// Once-per-process config. Zig 0.16 has no global `getenv`, so the runner seeds
++/// these values from its environment block before calling `configFromEnv()`.
++var seeded_config: ?runtime.Config = null;
++
++/// Seed the cached env values. `null` policy means PS5_PS4_MODE was unset.
++pub fn seedEnvConfig(policy_value: ?[]const u8, diag: bool) void {
++    seeded_config = configFrom(policy_value, diag);
++}
++
++/// Return the env-derived config seeded by the runner (auto policy if unseeded).
++pub fn configFromEnv() runtime.Config {
++    return seeded_config orelse configFrom(null, false);
++}
++
+ /// Environment override names (single source of truth for docs + launchers).
+ pub const env_mode = "PS5_PS4_MODE";
+ pub const env_diag = "PS5_GNM_DIAG";
+ 
+ /// Log line for startup diagnostics: mode label + whether compat is active.
+ pub fn startupLine(mode: detector.Mode, cfg: runtime.Config, buf: []u8) []const u8 {
+     const active: []const u8 = if (cfg.enabledFor(mode)) "active" else "inactive";
+     const label = mode.label();
+     var n: usize = 0;
+     const prefix = "[ps4_mode] mode=";
+@@ -35,10 +48,25 @@ pub fn startupLine(mode: detector.Mode, cfg: runtime.Config, buf: []u8) []const
+     n += prefix.len;
+     @memcpy(buf[n..][0..label.len], label);
+     n += label.len;
+     const mid = " compat=";
+     @memcpy(buf[n..][0..mid.len], mid);
+     n += mid.len;
+     @memcpy(buf[n..][0..active.len], active);
+     n += active.len;
+     return buf[0..n];
+ }
++
++test "configFromEnv: PS5_PS4_MODE=on enables compat, absent follows auto policy" {
++    // PS5_PS4_MODE=on
++    seedEnvConfig("on", false);
++    const forced = configFromEnv();
++    try std.testing.expect(forced.enabledFor(.ps4_gnm));
++    try std.testing.expect(forced.enabledFor(.ps5_native));
++
++    // PS5_PS4_MODE unset -> auto policy
++    seedEnvConfig(null, false);
++    const automatic = configFromEnv();
++    try std.testing.expectEqual(runtime.Policy.auto, automatic.policy);
++    try std.testing.expect(automatic.enabledFor(.ps4_gnm));
++    try std.testing.expect(!automatic.enabledFor(.ps5_native));
++}

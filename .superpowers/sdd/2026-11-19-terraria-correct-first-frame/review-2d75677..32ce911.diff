@@ -1,0 +1,682 @@
+# Review package: 2d75677..32ce911
+
+## Commits
+32ce911 feat(ps4): carry GPU resources per draw instead of last-DCB-wins
+
+## Files changed
+ src/hle/libs/gnm_compat.zig    |   7 +-
+ src/ps4_mode/gcn_resources.zig | 188 ++++++++++++++++++++++++++++++++---------
+ src/ps4_mode/root.zig          |   1 +
+ src/vulkan/backend.zig         |  49 ++++++-----
+ 4 files changed, 183 insertions(+), 62 deletions(-)
+
+## Diff
+diff --git a/src/hle/libs/gnm_compat.zig b/src/hle/libs/gnm_compat.zig
+index 7bd302e..c1b3676 100644
+--- a/src/hle/libs/gnm_compat.zig
++++ b/src/hle/libs/gnm_compat.zig
+@@ -91,23 +91,24 @@ fn sceGnmSubmitAndFlipCommandBuffers(
+     var i: usize = 0;
+     while (i < dcb_count) : (i += 1) {
+         const addr = addrs[i];
+         const bytes = sizes[i];
+         if (addr == 0 or bytes == 0 or (bytes & 3) != 0) continue;
+         if (!kernel_memory.isGuestRangeAccessible(addr, bytes)) continue;
+         const words: usize = bytes / 4;
+         const stream: [*]const u32 = @ptrFromInt(addr);
+         const slice = stream[0..words];
+         // PS4-only: decode this DCB's GCN shader resources (PS/VS T#/S#/V#
+-        // descriptors and settled USER_DATA words) at the submit boundary and
+-        // publish them for the PS4 draw's descriptor binding. Pure data capture;
+-        // the shared executor and its register checks are untouched.
++        // descriptors and settled USER_DATA words) at the submit boundary as
++        // ordered per-draw snapshots, then publish them so each PS4 draw binds
++        // its own T#/S#/V# resources. Pure data capture; the shared executor and
++        // its register checks are untouched.
+         ps4_mode.gcn_resources.publish(ps4_mode.gcn_resources.capture(slice));
+         if (scanout_address == 0) scanout_address = pm4_sanitize.colorTargetAddress(slice) orelse 0;
+ 
+         // PS4 GCN PM4 is not walkable by the shared RDNA2 parser as-is: an
+         // out-of-range SET_*_REG stops the queue, and a malformed body length
+         // hides the real packets (including draws) behind it. Rebuild a clean
+         // Type-3-only stream here, at the PS4 boundary; the shared executor's
+         // register-range check is never relaxed. GCN DCBs also never write the
+         // AGC context registers that describe render-target size/address-high,
+         // so synthesize those from the guest's own CB registers before handing
+diff --git a/src/ps4_mode/gcn_resources.zig b/src/ps4_mode/gcn_resources.zig
+index 50db5e3..d8e358c 100644
+--- a/src/ps4_mode/gcn_resources.zig
++++ b/src/ps4_mode/gcn_resources.zig
+@@ -16,20 +16,21 @@ const image_layout = @import("image_layout.zig");
+ 
+ /// PM4 fields (kept local so this module stays dependency-free).
+ const kind_shift: u5 = 30;
+ const count_shift: u5 = 16;
+ const count_mask: u32 = 0x3fff;
+ const opcode_shift: u5 = 8;
+ 
+ const opcode_set_context_reg: u8 = 0x69;
+ const opcode_set_sh_reg: u8 = 0x76;
+ const opcode_set_uconfig_reg: u8 = 0x79;
++const opcode_draw_index_auto: u8 = 0x2d;
+ 
+ /// USER_DATA is a row of 16 SGPRs per stage. Bases match gpu.ShaderStage.
+ pub const user_data_words: usize = 16;
+ /// Chronological trace cap; the real Terraria DCB produces 13 bindings.
+ pub const max_bindings: usize = 64;
+ 
+ pub const Stage = enum {
+     pixel,
+     vertex,
+     compute,
+@@ -134,49 +135,88 @@ pub const Resources = struct {
+             .constant_buffer, .sampler => 4,
+             .raw_address => 2,
+         };
+         for (0..n) |k| {
+             if (start + k < user_data_words) out[k] = row[start + k];
+         }
+         return out;
+     }
+ };
+ 
+-/// PS4-only submit-boundary capture. The GNM driver calls `publish` with the
+-/// raw DCB at submit; the PS4 draw reads `captured` to bind T#/S#/V# resources.
+-/// A mutex and value copy keep this safe for the multi-threaded command queue.
++/// The VS/PS program pair a submit binds. Defined here (rather than in a later
++/// task) so every consumer shares one definition.
++pub const ProgramPair = struct { vertex: u64 = 0, pixel: u64 = 0 };
++
++pub const max_draws_per_capture: usize = 8;
++pub const max_capture_queue: usize = 8;
++
++/// Ordered snapshots of `Resources`, one per DRAW_INDEX_AUTO in a DCB. A DCB
++/// with no draw packets keeps its whole-stream result in `draws[0]`.
++pub const Capture = struct {
++    draws: [max_draws_per_capture]Resources = undefined,
++    count: usize = 0,
++};
++
++/// PS4-only submit-boundary capture. `publish` appends a DCB's ordered draw
++/// snapshots to a FIFO; `nextDrawResources` drains them in submit/draw order.
++/// A mutex and value copies keep this safe for the multi-threaded command queue.
+ var captured_lock: std.atomic.Mutex = .unlocked;
+-var captured_resources: Resources = .{};
+-var captured_valid: bool = false;
++var capture_queue: [max_capture_queue]Capture = undefined;
++var capture_head: usize = 0;
++var capture_len: usize = 0;
++var capture_draw_cursor: usize = 0;
+ 
+-/// Publish the resources decoded from one submitted DCB. PS4 submit boundary.
+-pub fn publish(res: Resources) void {
++/// Publish one submitted DCB's ordered per-draw snapshots. PS4 submit boundary.
++pub fn publish(cap: Capture) void {
+     while (!captured_lock.tryLock()) std.atomic.spinLoopHint();
+     defer captured_lock.unlock();
+-    captured_resources = res;
+-    captured_valid = true;
++    if (capture_len == capture_queue.len) {
++        // Ring full: drop the oldest capture and its draw cursor.
++        capture_head = (capture_head + 1) % capture_queue.len;
++        capture_len -= 1;
++        capture_draw_cursor = 0;
++    }
++    const tail = (capture_head + capture_len) % capture_queue.len;
++    capture_queue[tail] = cap;
++    capture_len += 1;
+ }
+ 
+-/// Latest captured resources, or null before the first PS4 submission.
+-pub fn captured() ?Resources {
++/// Consume the next draw snapshot in submit/draw order. Exhausted captures are
++/// dropped while a newer one exists; a final capture with more draws than
++/// snapshots clamps to its last snapshot. Null means nothing was published.
++pub fn nextDrawResources() ?Resources {
+     while (!captured_lock.tryLock()) std.atomic.spinLoopHint();
+     defer captured_lock.unlock();
+-    if (!captured_valid) return null;
+-    return captured_resources;
++    if (capture_len == 0) return null;
++    while (capture_len > 1 and capture_draw_cursor >= capture_queue[capture_head].count) {
++        capture_head = (capture_head + 1) % capture_queue.len;
++        capture_len -= 1;
++        capture_draw_cursor = 0;
++    }
++    const current = &capture_queue[capture_head];
++    if (current.count == 0) return null;
++    if (capture_draw_cursor < current.count) {
++        const out = current.draws[capture_draw_cursor];
++        capture_draw_cursor += 1;
++        return out;
++    }
++    return current.draws[current.count - 1];
+ }
+ 
+ /// Clear captured state (PS4 session reset / tests).
+ pub fn resetCapture() void {
+     while (!captured_lock.tryLock()) std.atomic.spinLoopHint();
+     defer captured_lock.unlock();
+-    captured_resources = .{};
+-    captured_valid = false;
++    capture_queue = undefined;
++    capture_head = 0;
++    capture_len = 0;
++    capture_draw_cursor = 0;
+ }
+ 
+ /// GCN T# tiling_index → the only four layouts image_layout.zig models.
+ fn mapTiling(index: u8) image_layout.Tiling {
+     return switch (index) {
+         8, 9, 10, 11, 12, 31 => .display, // display-linear / display-thin
+         19, 20, 21, 22, 23, 24, 25, 26 => .thick_1d,
+         0...7, 13...18 => .thin_1d,
+         else => .linear,
+     };
+@@ -303,24 +343,35 @@ fn settledFlags(res: *Resources, stage: Stage) *[user_data_words]bool {
+ }
+ 
+ fn stageForRegister(register: u32) ?Stage {
+     inline for (.{ Stage.pixel, Stage.vertex, Stage.compute }) |stage| {
+         const base = stage.userDataBase();
+         if (register >= base and register < base + user_data_words) return stage;
+     }
+     return null;
+ }
+ 
+-/// Walk a GCN DCB and capture shader resource state. `words` is the raw guest
+-/// stream (sanitized or not — SET_SH_REG packets are in range for both).
+-pub fn capture(words: []const u32) Resources {
++/// Copy the running `Resources` into a draw snapshot, up to capacity.
++fn snapshotDraw(cap: *Capture, res: *const Resources) void {
++    if (cap.count >= cap.draws.len) return;
++    cap.draws[cap.count] = res.*;
++    cap.count += 1;
++}
++
++/// Walk a GCN DCB and capture ordered per-draw shader resource snapshots.
++/// `words` is the raw guest stream (sanitized or not — SET_SH_REG packets are
++/// in range for both). The running `Resources` is copied at each
++/// DRAW_INDEX_AUTO; a DCB with no draws keeps its whole-stream result in
++/// `draws[0]`.
++pub fn capture(words: []const u32) Capture {
+     var res = Resources{};
++    var cap = Capture{};
+     var read: usize = 0;
+     while (read < words.len) {
+         const header = words[read];
+         if ((header >> kind_shift) != 3) {
+             read += 1;
+             continue;
+         }
+         const opcode: u8 = @truncate(header >> opcode_shift);
+         const body_len: usize = @as(usize, @intCast((header >> count_shift) & count_mask)) + 1;
+         if (read + 1 + body_len > words.len) {
+@@ -355,25 +406,27 @@ pub fn capture(words: []const u32) Resources {
+                 // Classify only packets wholly inside one stage's row: GNM
+                 // writes a whole V#/T#/S#/pointer in a single packet.
+                 if (stageForRegister(register)) |stage| {
+                     if (register + values.len <= stage.userDataBase() + user_data_words) {
+                         if (format(values)) |descriptor| {
+                             append(&res, stage, register, @intCast(register - stage.userDataBase()), descriptor);
+                         }
+                     }
+                 }
+             },
++            opcode_draw_index_auto => snapshotDraw(&cap, &res),
+             else => {},
+         }
+         read += 1 + body_len;
+     }
+-    return res;
++    if (cap.count == 0) snapshotDraw(&cap, &res);
++    return cap;
+ }
+ 
+ // ---------------------------------------------------------------------------
+ // Tests — driven by Terraria's real captured DCB.
+ // ---------------------------------------------------------------------------
+ 
+ const fixture = @import("terraria_frame_test.zig");
+ const dcb = &fixture.captured_dcb;
+ 
+ fn hasBinding(res: *const Resources, stage: Stage, register: u32, kind: ResourceKind, address: u64) bool {
+@@ -382,51 +435,52 @@ fn hasBinding(res: *const Resources, stage: Stage, register: u32, kind: Resource
+             b.descriptor.kind == kind and b.descriptor.address == address) return true;
+     }
+     return false;
+ }
+ 
+ test "Terraria DCB: recover PS/VS/CS USER_DATA descriptors from real SET_SH_REG packets" {
+     // Sanity: the fixture is the exact 790-dword capture, not a trimmed slice.
+     try std.testing.expectEqual(@as(usize, 790), dcb.len);
+     try std.testing.expectEqual(@as(u32, 0xc005_5800), dcb[0]);
+ 
+-    const res = capture(dcb);
++    const captures = capture(dcb);
++    const res = &captures.draws[captures.count - 1]; // final settled draw
+ 
+     // The DCB really contains SH/UCONFIG/CONTEXT packets; resources come from
+     // SH, the other two are counted only for the register dump.
+     try std.testing.expectEqual(@as(usize, 13), res.sh_reg_packets);
+     try std.testing.expectEqual(@as(usize, 2), res.uconfig_reg_packets);
+     try std.testing.expect(res.context_reg_packets > 0);
+ 
+     // Every classified packet landed inside a stage USER_DATA row.
+     try std.testing.expectEqual(@as(usize, 13), res.count);
+     try std.testing.expectEqual(@as(usize, 0), res.overflow);
+ 
+     // Compute (0x244/0x248/0x24c): three V# buffers, including one that views
+     // the 1920x1080 colour target at base 0x10_168c8000.
+-    try std.testing.expect(hasBinding(&res, .compute, 0x248, .constant_buffer, 0x10_168c8000));
+-    try std.testing.expect(hasBinding(&res, .compute, 0x244, .constant_buffer, 0x10_00000704));
+-    try std.testing.expect(hasBinding(&res, .compute, 0x24c, .constant_buffer, 0x10_0000074c));
++    try std.testing.expect(hasBinding(res, .compute, 0x248, .constant_buffer, 0x10_168c8000));
++    try std.testing.expect(hasBinding(res, .compute, 0x244, .constant_buffer, 0x10_00000704));
++    try std.testing.expect(hasBinding(res, .compute, 0x24c, .constant_buffer, 0x10_0000074c));
+ 
+     // Vertex (0x4c/0x4e/0x54): two 64-bit raw pointers and one 16-byte-stride
+     // constant buffer (4 records = 64 bytes) in each of the two draw blocks.
+-    try std.testing.expect(hasBinding(&res, .vertex, 0x4c, .raw_address, 0x10_1009cbb0));
+-    try std.testing.expect(hasBinding(&res, .vertex, 0x4e, .raw_address, 0x10_10000f5c));
+-    try std.testing.expect(hasBinding(&res, .vertex, 0x4e, .raw_address, 0x10_10000f8c));
+-    try std.testing.expect(hasBinding(&res, .vertex, 0x54, .constant_buffer, 0x10_1009cb60));
+-    try std.testing.expect(hasBinding(&res, .vertex, 0x54, .constant_buffer, 0x10_1009d0a4));
++    try std.testing.expect(hasBinding(res, .vertex, 0x4c, .raw_address, 0x10_1009cbb0));
++    try std.testing.expect(hasBinding(res, .vertex, 0x4e, .raw_address, 0x10_10000f5c));
++    try std.testing.expect(hasBinding(res, .vertex, 0x4e, .raw_address, 0x10_10000f8c));
++    try std.testing.expect(hasBinding(res, .vertex, 0x54, .constant_buffer, 0x10_1009cb60));
++    try std.testing.expect(hasBinding(res, .vertex, 0x54, .constant_buffer, 0x10_1009d0a4));
+ 
+     // Pixel (0x10/0x18): a 4-dword S# sampler and an 8-dword T# image. The
+     // second T# is the guest colour target decoded as 1920x1080 RGBA8.
+-    try std.testing.expect(hasBinding(&res, .pixel, 0x18, .sampler, 0));
+-    try std.testing.expect(hasBinding(&res, .pixel, 0x10, .sampled_image, 0x10_170c0000));
+-    try std.testing.expect(hasBinding(&res, .pixel, 0x10, .sampled_image, 0x10_168c8000));
++    try std.testing.expect(hasBinding(res, .pixel, 0x18, .sampler, 0));
++    try std.testing.expect(hasBinding(res, .pixel, 0x10, .sampled_image, 0x10_170c0000));
++    try std.testing.expect(hasBinding(res, .pixel, 0x10, .sampled_image, 0x10_168c8000));
+ 
+     // Settled USER_DATA row contains the last values written (second draw).
+     try std.testing.expectEqual(@as(u32, 0x10168c80), res.pixel_user_data[4]);
+     try std.testing.expectEqual(@as(u32, 0x10dc77f), res.pixel_user_data[6]);
+     try std.testing.expect(res.wasWritten(.pixel, 12));
+     try std.testing.expect(!res.wasWritten(.pixel, 0));
+     try std.testing.expectEqual(@as(u32, 0x1009d0a4), res.vertex_user_data[8]);
+     try std.testing.expectEqual(@as(u32, 0x10000f8c), res.vertex_user_data[2]);
+     try std.testing.expect(!res.wasWritten(.vertex, 4));
+     try std.testing.expectEqual(@as(u32, 0x168c8000), res.compute_user_data[8]);
+@@ -454,48 +508,102 @@ test "format helpers decode GCN V#/T#/S#/pointer descriptors" {
+     try std.testing.expectEqual(ResourceKind.sampler, s.kind);
+     try std.testing.expectEqual(@as(u64, 0), s.address);
+     try std.testing.expectEqual(null, formatS(&.{ 0, 0, 0, 0 }));
+ 
+     const p = format(&.{ 0x1009cbb0, 0x10 }).?;
+     try std.testing.expectEqual(ResourceKind.raw_address, p.kind);
+     try std.testing.expectEqual(@as(u64, 0x10_1009cbb0), p.address);
+     try std.testing.expectEqual(null, format(&.{ 0x1, 0x2, 0x3 }));
+ }
+ 
+-test "publish/captured/reset expose the latest DCB resources at the submit boundary" {
++test "publish/nextDrawResources/reset drain DCB snapshots at the submit boundary" {
+     resetCapture();
+     defer resetCapture();
+-    try std.testing.expect(captured() == null);
+-
+-    const res = capture(dcb);
+-    publish(res);
+-    const got = captured() orelse return error.TestExpectedResources;
++    try std.testing.expect(nextDrawResources() == null);
++
++    publish(capture(dcb));
++    // The real DCB has two DRAW_INDEX_AUTO packets: first sprite T#, then the
++    // colour target. The FIFO returns them in submit/draw order.
++    const first = nextDrawResources() orelse return error.TestExpectedResources;
++    try std.testing.expect(hasBinding(&first, .pixel, 0x10, .sampled_image, 0x10_170c0000));
++    const got = nextDrawResources() orelse return error.TestExpectedResources;
+     try std.testing.expectEqual(@as(usize, 13), got.count);
+-    // The settled PS USER_DATA row is copied by value, not shared with `res`.
+     try std.testing.expectEqual(@as(u32, 0x10168c80), got.pixel_user_data[4]);
+     try std.testing.expect(hasBinding(&got, .pixel, 0x10, .sampled_image, 0x10_168c8000));
+ 
+     resetCapture();
+-    try std.testing.expect(captured() == null);
++    try std.testing.expect(nextDrawResources() == null);
+ }
+ 
+ test "capture ignores SH packets outside USER_DATA rows and malformed packets" {
+     const words = [_]u32{
+         // SET_SH_REG 0x100 (outside all rows) — counted, not a binding.
+         (@as(u32, 3) << 30) | (@as(u32, 2) << 16) | (@as(u32, 0x76) << 8),
+         0x100,
+         0xdeadbeef,
+         // Truncated SET_SH_REG — skipped.
+         (@as(u32, 3) << 30) | (@as(u32, 8) << 16) | (@as(u32, 0x76) << 8),
+         0x4c,
+         // Real raw pointer in the vertex row.
+         (@as(u32, 3) << 30) | (@as(u32, 2) << 16) | (@as(u32, 0x76) << 8),
+         0x4c,
+         0x1009cbb0,
+         0x10,
+     };
+-    const res = capture(&words);
++    const captures = capture(&words);
++    const res = &captures.draws[0]; // no DRAW_INDEX_AUTO: whole-stream result
+     try std.testing.expectEqual(@as(usize, 2), res.sh_reg_packets);
+     try std.testing.expectEqual(@as(usize, 1), res.count);
+     try std.testing.expectEqual(ResourceKind.raw_address, res.bindings[0].descriptor.kind);
+     try std.testing.expectEqual(@as(u64, 0x10_1009cbb0), res.bindings[0].descriptor.address);
+ }
++
++// --- Ordered per-draw capture fixtures (real dwords from terraria_frame_test.zig) ---
++
++// PS T# SET_SH_REG (0x10..0x17) with the guest sprite texture at 0x10170c0000.
++const sh_t_a = [_]u32{
++    0xc0087600, 0x00000010, 0x10170c00, 0x00a00000,
++    0x0077c2ab, 0x94d00f2e, 0x0055e000, 0x00000000,
++    0x00000000, 0x00000000,
++};
++// Same register window rebound to the 1920x1080 colour target at 0x10168c8000.
++const sh_t_b = [_]u32{
++    0xc0087600, 0x00000010, 0x10168c80, 0x00a00000,
++    0x010dc77f, 0x94a00fac, 0x00efe000, 0x00000000,
++    0x00000000, 0x00000000,
++};
++const draw_auto = [_]u32{ 0xc0012d00, 0x00000004, 0x00000002 };
++
++const dcb_a = sh_t_a ++ draw_auto;
++const dcb_b = sh_t_b ++ draw_auto;
++const dcb_with_two_draws = sh_t_a ++ draw_auto ++ sh_t_b ++ draw_auto;
++
++fn psImage(res: Resources) ?Descriptor {
++    var out: ?Descriptor = null;
++    for (res.bindings[0..res.count]) |binding| {
++        if (binding.stage == .pixel and binding.descriptor.kind == .sampled_image)
++            out = binding.descriptor; // last PS T# write settles the texture
++    }
++    return out;
++}
++
++test "per-draw snapshots keep distinct PS textures" {
++    resetCapture();
++    defer resetCapture();
++    publish(capture(&dcb_a)); // PS T# 0x10170c0000
++    publish(capture(&dcb_b)); // PS T# 0x10168c8000
++    const a = nextDrawResources().?;
++    const b = nextDrawResources().?;
++    try std.testing.expectEqual(@as(u64, 0x10170c0000), psImage(a).?.address);
++    try std.testing.expectEqual(@as(u64, 0x10168c8000), psImage(b).?.address);
++}
++
++test "capture FIFO is ordered for equal program pairs" {
++    resetCapture();
++    defer resetCapture();
++    publish(capture(&dcb_with_two_draws)); // snapshots: T# A, T# B
++    const first = nextDrawResources().?;
++    const second = nextDrawResources().?;
++    try std.testing.expectEqual(@as(u64, 0x10170c0000), psImage(first).?.address);
++    try std.testing.expectEqual(@as(u64, 0x10168c8000), psImage(second).?.address);
++    try std.testing.expect(nextDrawResources() != null); // clamp to last
++}
+diff --git a/src/ps4_mode/root.zig b/src/ps4_mode/root.zig
+index b0320ba..688e4fc 100644
+--- a/src/ps4_mode/root.zig
++++ b/src/ps4_mode/root.zig
+@@ -12,20 +12,21 @@
+ //! The module is intentionally dependency-free (std only) so it compiles and
+ //! tests in isolation; integration call sites are documented per function.
+ 
+ pub const sfo = @import("sfo.zig");
+ pub const detector = @import("detector.zig");
+ pub const gcn_header = @import("gcn_header.zig");
+ pub const gcn_blob = @import("gcn_blob.zig");
+ pub const gnm_packets = @import("gnm_packets.zig");
+ pub const pm4_sanitize = @import("pm4_sanitize.zig");
+ pub const gcn_resources = @import("gcn_resources.zig");
++pub const ProgramPair = gcn_resources.ProgramPair;
+ pub const shader_binding = @import("shader_binding.zig");
+ pub const terraria_frame_test = @import("terraria_frame_test.zig");
+ pub const image_layout = @import("image_layout.zig");
+ pub const compat_hle = @import("compat_hle.zig");
+ pub const runtime = @import("runtime.zig");
+ pub const tessellation = @import("tessellation.zig");
+ pub const gpu_translate = @import("gpu_translate.zig");
+ pub const patches = @import("patches.zig");
+ pub const trophy = @import("trophy.zig");
+ pub const video_out = @import("video_out.zig");
+diff --git a/src/vulkan/backend.zig b/src/vulkan/backend.zig
+index 9f2a579..4867a5c 100644
+--- a/src/vulkan/backend.zig
++++ b/src/vulkan/backend.zig
+@@ -25745,72 +25745,71 @@ pub const Renderer = struct {
+             .{ .vertex_count = 3 },
+         );
+     }
+ 
+     /// PS4-only: fill the dynamic scalar upload from captured GCN USER_DATA and
+     /// a minimal sprite transform. The slot order is owned by `gcn_translate`,
+     /// so the values land at the same indices `rdna2` loads at runtime.
+     fn ps4GraphicsScalars(
+         stage: ps4_mode.gcn_translate.Stage,
+         storage: []gpu.ShaderSpirvScalarRegister,
++        resources: ps4_mode.gcn_resources.Resources,
+     ) []const gpu.ShaderSpirvScalarRegister {
+         const slots = ps4_mode.gcn_translate.scalarSlots(stage);
+         const count = @min(slots.len, storage.len);
+-        const captured = ps4_mode.gcn_resources.captured();
+-        const user_data = if (captured) |res| res.userData(if (stage == .vertex) .vertex else .pixel) else &.{};
++        const user_data = resources.userData(if (stage == .vertex) .vertex else .pixel);
+ 
+         // The real Terraria VS performs three SGPR loads in its straight prolog:
+         // a V# from a raw USER_DATA pointer, then two vertex-attribute reads.
+         // Group SMEM slots by producer PC so values follow that shape without
+         // depending on absolute PCs.
+         var group: usize = 0;
+         var word_in_group: u32 = 0;
+         var previous_pc: ?u32 = null;
+         const step_bits: u32 = @bitCast(@as(f32, 0.25));
+         for (slots[0..count], 0..) |slot, index| {
+             var value: u32 = 0;
+             if (slot.producer_pc) |pc| {
+                 if (previous_pc == null or previous_pc.? != pc) {
+                     group += 1;
+                     word_in_group = 0;
+                     previous_pc = pc;
+                 }
+                 value = switch (group) {
+-                    1 => if (captured) |res| blk: {
++                    1 => blk: {
+                         // V# words from the captured VS constant buffer (USER_DATA 8..12).
+-                        break :blk res.vertex_user_data[8 + word_in_group];
+-                    } else 0,
++                        break :blk resources.vertex_user_data[8 + word_in_group];
++                    },
+                     2 => 0, // UV origin
+                     else => if (word_in_group < 2) step_bits else 0, // UV step
+                 };
+             } else if (slot.register < user_data.len) {
+                 value = user_data[slot.register];
+             }
+             storage[index] = .{
+                 .register = slot.register,
+                 .value = value,
+                 .producer_pc = slot.producer_pc,
+             };
+             if (slot.producer_pc != null) word_in_group += 1;
+         }
+         return storage[0..count];
+     }
+ 
+     /// PS4-only: minimal sampled-image descriptor for the translated Terraria
+-    /// PS, derived from the settled PS T# published at the GNM submit boundary.
+-    /// The captured T# is GCN-encoded; the shared stager wants an RDNA2 view,
+-    /// so only the fields the 2D RGBA8 path reads are filled in.
+-    fn ps4SampledImageDescriptor() ?gpu.resources.ImageDescriptor {
++    /// PS, derived from this draw's settled PS T# captured at the GNM submit
++    /// boundary. The captured T# is GCN-encoded; the shared stager wants an
++    /// RDNA2 view, so only the fields the 2D RGBA8 path reads are filled in.
++    fn ps4SampledImageDescriptor(resources: ps4_mode.gcn_resources.Resources) ?gpu.resources.ImageDescriptor {
+         if (!@atomicLoad(bool, &ps4_compat_enabled, .monotonic)) return null;
+-        const captured = ps4_mode.gcn_resources.captured() orelse return null;
+         var image: ?ps4_mode.gcn_resources.Descriptor = null;
+-        for (captured.bindings[0..captured.count]) |binding| {
++        for (resources.bindings[0..resources.count]) |binding| {
+             if (binding.stage != .pixel or binding.descriptor.kind != .sampled_image) continue;
+             image = binding.descriptor; // last write is the settled PS T#
+         }
+         const tex = image orelse return null;
+         // GCN thin microtile is 256B-swizzled; RDNA2 calls the same family
+         // standard_256b. Display tiling is effectively linear pitch.
+         const tile_mode: gpu.resources.TileMode = switch (tex.tiling) {
+             .thin_1d => .standard_256b,
+             .thick_1d => .standard_4kb,
+             else => .linear,
+@@ -25825,23 +25824,23 @@ pub const Renderer = struct {
+             .tile_mode = tile_mode,
+             .image_type = .color_2d,
+             .dst_select = .{ 4, 5, 6, 7 }, // RDNA2 component selectors: R,G,B,A
+         });
+     }
+ 
+     /// PS4-only: stage the captured PS image and write it into the 2D
+     /// sampled-image bank at binding 1, element 1 — the exact slot the
+     /// translated Terraria PS samples. The caller releases the returned image
+     /// after the draw has been queued. Returns null off the PS4 path.
+-    fn stagePs4GraphicsSampledImage(self: *Renderer) anyerror!?PreparedSampledImage {
++    fn stagePs4GraphicsSampledImage(self: *Renderer, resources: ps4_mode.gcn_resources.Resources) anyerror!?PreparedSampledImage {
+         if (!@atomicLoad(bool, &ps4_compat_enabled, .monotonic)) return null;
+-        const descriptor = ps4SampledImageDescriptor() orelse return null;
++        const descriptor = ps4SampledImageDescriptor(resources) orelse return null;
+         const sampler = try gpu.resources.decodeSamplerDescriptor(&.{ 0, 0, 0, 0 });
+         const prepared = self.stageSampledImage(descriptor, sampler, 1, .two_d, null) catch |err| {
+             std.debug.print("[ps4] sampled image @0x{x} {d}x{d} staging failed: {s}\n", .{
+                 descriptor.address, descriptor.width, descriptor.height, @errorName(err),
+             });
+             return null;
+         };
+         const image_info = vk.DescriptorImageInfo{
+             .sampler = prepared.sampler,
+             .image_view = prepared.view,
+@@ -25872,48 +25871,53 @@ pub const Renderer = struct {
+         }
+         if (prepared.storage_cache_index) |index| self.releaseStorageImage(index);
+         if (prepared.render_target_index) |index| self.releaseRenderTarget(index);
+     }
+ 
+     /// PS4-only graphics replay. When a GCN shader has been translated, draw
+     /// through the real translated SPIR-V; otherwise replay the fixed-color
+     /// probe so the guest frame still materializes. Both use the shared draw
+     /// path and the guest's own decoded color target. PS5 never takes this.
+     fn drawPs4FixedColor(self: *Renderer, state: *const gpu.State, draw: GuestDraw) anyerror!void {
++        // One snapshot per draw, in submit/draw order. Without a published
++        // capture there are no GCN resources to bind, so this draw is not
++        // representable on the PS4 path.
++        const resources = ps4_mode.gcn_resources.nextDrawResources() orelse
++            return Error.UnsupportedGraphicsState;
+         const render_state = gpu.resources.decodeRenderState(state);
+         var target: ?GuestColorTarget = null;
+         for (render_state.color_targets) |candidate| {
+             const color = candidate orelse continue;
+             if (!color.isActive()) continue;
+             target = guestColorTarget(color) catch continue;
+             break;
+         }
+         const guest_target = target orelse return Error.UnsupportedColorTarget;
+         try self.beginFrameDraw();
+         const translated = ps4_mode.gcn_translate.translatedGraphics();
+         const use_real_shader = translated != null;
+         var vertex_storage: [64]gpu.ShaderSpirvScalarRegister = undefined;
+         var fragment_storage: [64]gpu.ShaderSpirvScalarRegister = undefined;
+         const vertex_scalars: []const gpu.ShaderSpirvScalarRegister = if (use_real_shader)
+-            ps4GraphicsScalars(.vertex, &vertex_storage)
++            ps4GraphicsScalars(.vertex, &vertex_storage, resources)
+         else
+             &.{};
+         const fragment_scalars: []const gpu.ShaderSpirvScalarRegister = if (use_real_shader)
+-            ps4GraphicsScalars(.pixel, &fragment_storage)
++            ps4GraphicsScalars(.pixel, &fragment_storage, resources)
+         else
+             &.{};
+         // The translated PS reads a sampled image at binding 1 / element 1.
+         // Stage it after beginFrameDraw selected this batch's descriptor set,
+         // and keep it alive until the draw has been queued.
+         var ps4_sampled: ?PreparedSampledImage = null;
+         defer if (ps4_sampled) |prepared| self.releasePs4GraphicsSampledImage(prepared);
+-        if (use_real_shader) ps4_sampled = try self.stagePs4GraphicsSampledImage();
++        if (use_real_shader) ps4_sampled = try self.stagePs4GraphicsSampledImage(resources);
+         try self.drawGraphicsShadersWithModules(
+             if (translated) |t| t.vertex_words else &graphics_probe_vertex_spirv,
+             if (translated) |t| t.fragment_words else &graphics_probe_fragment_spirv,
+             vertex_scalars,
+             fragment_scalars,
+             GraphicsPipelineState.default(guest_target.descriptor.width, guest_target.descriptor.height),
+             guest_target,
+             &.{},
+             null,
+             false,
+@@ -49500,25 +49504,26 @@ test "PS5 draws never take the PS4 fixed-color fallback" {
+     var state = gpu.State{};
+     try state.writeRegister(.shader, 0x008, 0x1234);
+     try state.writeRegister(.shader, 0x009, 0);
+     try state.writeRegister(.shader, 0x048, 0x5678);
+     try state.writeRegister(.shader, 0x049, 0);
+     try std.testing.expect(gpu.resources.ShaderStage.pixel.programAddress(&state) != null);
+ 
+     // PS5: even with both program registers bound, the fallback is off and the
+     // native guest-draw path is the only one that can run. Captured PS4 GCN
+     // resources never pull a PS5 draw into the fallback either.
++    ps4_mode.gcn_resources.resetCapture();
+     ps4_mode.gcn_resources.publish(ps4_mode.gcn_resources.capture(
+         &ps4_mode.terraria_frame_test.captured_dcb,
+     ));
+     defer ps4_mode.gcn_resources.resetCapture();
+-    try std.testing.expect(ps4_mode.gcn_resources.captured() != null);
++    try std.testing.expect(ps4_mode.gcn_resources.nextDrawResources() != null);
+     ps4_compat_enabled = false;
+     try std.testing.expect(!Renderer.wantsPs4FixedColorDraw(&state));
+ 
+     // PS4: the same state opts in; no program bound means no fallback.
+     ps4_compat_enabled = true;
+     try std.testing.expect(Renderer.wantsPs4FixedColorDraw(&state));
+     var empty = gpu.State{};
+     try std.testing.expect(!Renderer.wantsPs4FixedColorDraw(&empty));
+ }
+ 
+@@ -49543,29 +49548,35 @@ test "PS4 dynamic scalar upload is gated off for PS5 draws" {
+ }
+ 
+ test "PS4 sampled-image staging is gated off for PS5 draws" {
+     const previous = ps4_compat_enabled;
+     defer ps4_compat_enabled = previous;
+     ps4_mode.gcn_resources.resetCapture();
+     defer ps4_mode.gcn_resources.resetCapture();
+     ps4_mode.gcn_resources.publish(ps4_mode.gcn_resources.capture(
+         &ps4_mode.terraria_frame_test.captured_dcb,
+     ));
++    // The second draw rebinds the PS T# to the 1920x1080 colour target.
++    _ = ps4_mode.gcn_resources.nextDrawResources();
++    const resources = ps4_mode.gcn_resources.nextDrawResources() orelse
++        return error.TestExpectedResources;
+ 
+     // PS5: no image descriptor is produced, so no Vulkan descriptor write
+     // happens and the native path is untouched.
+     ps4_compat_enabled = false;
+-    try std.testing.expect(Renderer.ps4SampledImageDescriptor() == null);
++    try std.testing.expect(Renderer.ps4SampledImageDescriptor(resources) == null);
++    var renderer: Renderer = undefined;
++    try std.testing.expect(try Renderer.stagePs4GraphicsSampledImage(&renderer, resources) == null);
+ 
+     // PS4: the same captured DCB yields the settled PS T# view.
+     ps4_compat_enabled = true;
+-    const descriptor = Renderer.ps4SampledImageDescriptor() orelse
++    const descriptor = Renderer.ps4SampledImageDescriptor(resources) orelse
+         return error.TestExpectedSampledImageDescriptor;
+     try std.testing.expectEqual(@as(u64, 0x10_168c8000), descriptor.address);
+     try std.testing.expectEqual(@as(u32, 1920), descriptor.width);
+     try std.testing.expectEqual(@as(u32, 1080), descriptor.height);
+     try std.testing.expectEqual(@as(u16, 56), descriptor.unified_format);
+     try std.testing.expectEqual(gpu.resources.ImageType.color_2d, descriptor.image_type);
+ }
+ 
+ test "compute local size defaults to one and preserves the programmed count" {
+     var state = gpu.State{};

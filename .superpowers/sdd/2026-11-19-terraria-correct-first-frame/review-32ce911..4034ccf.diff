@@ -1,0 +1,420 @@
+# Review package: 32ce911..4034ccf
+
+## Commits
+4034ccf feat(ps4): key translated shaders to the bound GNM program pair
+
+## Files changed
+ src/hle/libs/ps4_title_stubs.zig    |  12 ++-
+ src/ps4_mode/gcn_real_blob_test.zig |  12 +++
+ src/ps4_mode/gcn_translate.zig      | 149 ++++++++++++++++++++++++++++--------
+ src/vulkan/backend.zig              |  11 ++-
+ 4 files changed, 146 insertions(+), 38 deletions(-)
+
+## Diff
+diff --git a/src/hle/libs/ps4_title_stubs.zig b/src/hle/libs/ps4_title_stubs.zig
+index a1e862f..ce1269e 100644
+--- a/src/hle/libs/ps4_title_stubs.zig
++++ b/src/hle/libs/ps4_title_stubs.zig
+@@ -49,32 +49,40 @@ fn stageFromIsa(words: []const u32) ?ps4_mode.gcn_translate.Stage {
+         if ((w >> 26) != 0x3e) continue;
+         const target = (w >> 4) & 0x3f;
+         if (target == 0x0c or target >= 0x20) has_vertex_export = true;
+         if (target < 8) has_pixel_export = true;
+     }
+     if (has_vertex_export and !has_pixel_export) return .vertex;
+     if (has_pixel_export and !has_vertex_export) return .pixel;
+     return null;
+ }
+ 
++/// The exact VS/PS program pair the guest has currently bound. Shader ISA
++/// registrations are keyed by this pair so the draw can look up the matching
++/// translation instead of whichever blob a scan happened to find first.
++fn boundProgram() ps4_mode.ProgramPair {
++    const programs = shader_binding.programs();
++    return .{ .vertex = programs.vertex, .pixel = programs.pixel };
++}
++
+ fn registerRealShaderAt(address: u64) bool {
+     var bytes: [2048]u8 = undefined;
+     if (!agc_submit.readGuestMemory(null, address, &bytes)) return false;
+     const parsed = ps4_mode.gcn_blob.parse(&bytes) catch return false;
+     const isa = ps4_mode.gcn_blob.isaBytes(&bytes, parsed);
+     if (isa.len == 0 or isa.len % 4 != 0) return false;
+     var words: [512]u32 = undefined;
+     const count = isa.len / 4;
+     if (count > words.len) return false;
+     for (0..count) |i| words[i] = std.mem.readInt(u32, isa[i * 4 ..][0..4], .little);
+     const stage = stageFromIsa(words[0..count]) orelse return false;
+-    ps4_mode.gcn_translate.registerShader(stage, words[0..count]);
++    ps4_mode.gcn_translate.registerShaderFor(boundProgram(), stage, words[0..count]);
+     return ps4_mode.gcn_translate.lastDiagnostic() == null;
+ }
+ 
+ fn tryRegisterRealShaders() void {
+     if (@atomicLoad(bool, &real_shaders_attempted, .monotonic)) return;
+     @atomicStore(bool, &real_shaders_attempted, true, .monotonic);
+ 
+     var region: [eboot_scan_len]u8 = undefined;
+     if (!agc_submit.readGuestMemory(null, eboot_scan_base, &region)) return;
+     const magic = "OrbShdr\x07";
+@@ -87,21 +95,21 @@ fn tryRegisterRealShaders() void {
+         var bytes: [2048]u8 = undefined;
+         if (!agc_submit.readGuestMemory(null, address, &bytes)) continue;
+         const parsed = ps4_mode.gcn_blob.parse(&bytes) catch continue;
+         const isa = ps4_mode.gcn_blob.isaBytes(&bytes, parsed);
+         var words: [512]u32 = undefined;
+         const count = isa.len / 4;
+         if (count == 0 or count > words.len) continue;
+         for (0..count) |i| words[i] = std.mem.readInt(u32, isa[i * 4 ..][0..4], .little);
+         const stage = stageFromIsa(words[0..count]) orelse continue;
+         if ((stage == .vertex and vs_ok) or (stage == .pixel and ps_ok)) continue;
+-        ps4_mode.gcn_translate.registerShader(stage, words[0..count]);
++        ps4_mode.gcn_translate.registerShaderFor(boundProgram(), stage, words[0..count]);
+         if (ps4_mode.gcn_translate.lastDiagnostic() != null) continue;
+         if (stage == .vertex) vs_ok = true else ps_ok = true;
+         if (vs_ok and ps_ok) break;
+     }
+ }
+ 
+ fn setPsShader(shader: u64) callconv(abi.guest) void {
+     shader_binding.setPixelShader(shader);
+     tryRegisterRealShaders();
+ }
+diff --git a/src/ps4_mode/gcn_real_blob_test.zig b/src/ps4_mode/gcn_real_blob_test.zig
+index 5e76513..7780657 100644
+--- a/src/ps4_mode/gcn_real_blob_test.zig
++++ b/src/ps4_mode/gcn_real_blob_test.zig
+@@ -8,20 +8,24 @@
+ //!
+ //! This proves the real shader bytes flow through
+ //! gcn_blob.isaBytes -> gcn_decode -> gcn_translate and yield non-empty
+ //! vertex/fragment SPIR-V, instead of only the hand-encoded fixtures.
+ 
+ const std = @import("std");
+ const gcn_blob = @import("gcn_blob.zig");
+ const gcn_decode = @import("gcn_decode.zig");
+ const gcn_translate = @import("gcn_translate.zig");
+ 
++const ProgramPair = gcn_translate.ProgramPair;
++const registerShaderFor = gcn_translate.registerShaderFor;
++const translatedGraphicsFor = gcn_translate.translatedGraphicsFor;
++
+ /// Full VS blob (2048-byte dump truncated to the parsed ISA extent).
+ /// isa_offset = 0x104, isa_size = 88 (22 dwords).
+ const vs_words = [_]u32{
+     0xbeeb03ff, 0x0000000e, 0xbe92047e, 0xbefe0a7e,
+     0xc0800300, 0xbf8c007f, 0xc2480104, 0xc2400100,
+     0xbf8c007f, 0x7e000210, 0x7e020211, 0x3e000400,
+     0x3e020601, 0xf0800f00, 0x00610000, 0xbefe0412,
+     0xbf8c0f70, 0x5e000300, 0x5e020702, 0xf8001c0f,
+     0x00000100, 0xbf810000,
+ };
+@@ -60,10 +64,18 @@ test "gcn_blob.isaBytes extracts the ISA from the real VS blob header" {
+     @memcpy(blob[0..8], "OrbShdr\x07");
+     std.mem.writeInt(u16, blob[14..16], 8, .little); // vertex stage
+     @memcpy(blob[0xa8..0xb0], "Shdr\x07\x00\x01\x00");
+     for (vs_words, 0..) |w, i| std.mem.writeInt(u32, blob[0x104 + i * 4 ..][0..4], w, .little);
+     const parsed = try gcn_blob.parse(&blob);
+     try std.testing.expectEqual(@as(u32, 0x104), parsed.isa_offset);
+     try std.testing.expectEqual(@as(u32, 88), parsed.isa_size);
+     const isa = gcn_blob.isaBytes(&blob, parsed);
+     try std.testing.expectEqual(@as(usize, 88), isa.len);
+ }
++
++test "program-keyed translation rejects mismatched pair" {
++    const program: ProgramPair = .{ .vertex = 0x1000000a88, .pixel = 0x1000000aa4 };
++    registerShaderFor(program, .vertex, &vs_words);
++    registerShaderFor(program, .pixel, &ps_words);
++    try std.testing.expect(translatedGraphicsFor(program) != null);
++    try std.testing.expect(translatedGraphicsFor(.{ .vertex = 1, .pixel = 2 }) == null);
++}
+diff --git a/src/ps4_mode/gcn_translate.zig b/src/ps4_mode/gcn_translate.zig
+index e0f9476..9d76c64 100644
+--- a/src/ps4_mode/gcn_translate.zig
++++ b/src/ps4_mode/gcn_translate.zig
+@@ -4,20 +4,23 @@
+ //! PS4 GCN → SPIR-V translation, reusing the shared `rdna2` writer.
+ //!
+ //! No SPIR-V is emitted here: decoded/spilled GCN words are normalized by
+ //! `gcn_decode`, a small PS4 resource/options builder fills the stub bindings
+ //! the RDNA2 pipeline expects, and `rdna2.translateProgramSpirv` does all the
+ //! emission. Integration seam for the PS4-gated draw path.
+ 
+ const std = @import("std");
+ const rdna2 = @import("rdna2");
+ const gcn_decode = @import("gcn_decode.zig");
++const gcn_resources = @import("gcn_resources.zig");
++
++pub const ProgramPair = gcn_resources.ProgramPair;
+ 
+ pub const Stage = enum { vertex, pixel };
+ 
+ pub const TranslatedGraphics = struct {
+     vertex_words: []const u32,
+     fragment_words: []const u32,
+ };
+ 
+ /// PS4-only dynamic scalar layout. One slot per SGPR the GCN program reads plus
+ /// one slot per SMEM destination word, in a deterministic order. The draw path
+@@ -181,79 +184,161 @@ fn buildOptions(allocator: std.mem.Allocator, stage: Stage, program: *const rdna
+         .vertex_position_corner_override = stage == .vertex,
+         .dynamic_scalar_binding = if (slots.len != 0) .{
+             .binding = 2 + rdna2.spirv.maximum_storage_images,
+             .value_base = if (stage == .vertex) 0 else fragment_words_per_stage,
+         } else null,
+         .specialized_scalar_prefix_end = std.math.maxInt(u32),
+     };
+     return builder;
+ }
+ 
+-// Registered shader state. `registerShader` owns copies of both the ISA and
+-// the translated words; changing either stage invalidates its translation.
++// Registered shader state. One bounded entry per bound GNM program pair; each
++// entry owns copies of both stage ISAs and, once both are present, the
++// translated SPIR-V words and dynamic scalar layouts. Changing either stage
++// invalidates and rebuilds that pair's translation.
+ var lock: std.atomic.Mutex = .unlocked;
+ 
+ fn lockGlobal() void {
+     while (!lock.tryLock()) std.atomic.spinLoopHint();
+ }
+-var vertex_isa: ?[]u32 = null;
+-var pixel_isa: ?[]u32 = null;
+-var vertex_spirv: ?[]u32 = null;
+-var pixel_spirv: ?[]u32 = null;
+-var vertex_slots: []ScalarSlot = &.{};
+-var pixel_slots: []ScalarSlot = &.{};
++
++const max_registrations = 8;
++
++const ShaderTranslation = struct {
++    program: ProgramPair = .{},
++    used: bool = false,
++    vertex_isa: ?[]u32 = null,
++    pixel_isa: ?[]u32 = null,
++    vertex_spirv: ?[]u32 = null,
++    pixel_spirv: ?[]u32 = null,
++    vertex_slots: []ScalarSlot = &.{},
++    pixel_slots: []ScalarSlot = &.{},
++
++    fn freeTranslation(self: *ShaderTranslation, allocator: std.mem.Allocator) void {
++        if (self.vertex_spirv) |words| allocator.free(words);
++        if (self.pixel_spirv) |words| allocator.free(words);
++        if (self.vertex_slots.len != 0) allocator.free(self.vertex_slots);
++        if (self.pixel_slots.len != 0) allocator.free(self.pixel_slots);
++        self.vertex_spirv = null;
++        self.pixel_spirv = null;
++        self.vertex_slots = &.{};
++        self.pixel_slots = &.{};
++    }
++
++    fn deinit(self: *ShaderTranslation, allocator: std.mem.Allocator) void {
++        if (self.vertex_isa) |words| allocator.free(words);
++        if (self.pixel_isa) |words| allocator.free(words);
++        self.freeTranslation(allocator);
++        self.* = .{};
++    }
++};
++
++var registry: [max_registrations]ShaderTranslation = [_]ShaderTranslation{.{}} ** max_registrations;
++var next_slot: usize = 0;
+ var diagnostic: ?Diagnostic = null;
+ 
+-pub fn registerShader(stage: Stage, words: []const u32) void {
++fn findEntry(program: ProgramPair) ?usize {
++    for (&registry, 0..) |*entry, i| {
++        if (entry.used and entry.program.vertex == program.vertex and entry.program.pixel == program.pixel) return i;
++    }
++    return null;
++}
++
++/// Register one stage's ISA for an exact GNM program pair. When both stages of
++/// that pair are present the pair is (re)translated; a single stage alone never
++/// produces a usable translation.
++pub fn registerShaderFor(program: ProgramPair, stage: Stage, words: []const u32) void {
+     const allocator = std.heap.page_allocator;
+     const copy = allocator.dupe(u32, words) catch return;
+ 
+     lockGlobal();
+     defer lock.unlock();
+ 
+-    const isa_slot = if (stage == .vertex) &vertex_isa else &pixel_isa;
+-    const spirv_slot = if (stage == .vertex) &vertex_spirv else &pixel_spirv;
++    const index = findEntry(program) orelse blk: {
++        var free_slot: ?usize = null;
++        for (&registry, 0..) |*entry, i| {
++            if (!entry.used) {
++                free_slot = i;
++                break;
++            }
++        }
++        const slot = free_slot orelse next_slot;
++        next_slot = (slot + 1) % max_registrations;
++        registry[slot].deinit(allocator); // recycle a fresh or evicted slot
++        registry[slot].program = program;
++        registry[slot].used = true;
++        break :blk slot;
++    };
++    var entry = &registry[index];
++
++    const isa_slot = if (stage == .vertex) &entry.vertex_isa else &entry.pixel_isa;
+     if (isa_slot.*) |old| allocator.free(old);
+     isa_slot.* = copy;
+-    if (spirv_slot.*) |old| {
+-        allocator.free(old);
+-        spirv_slot.* = null;
+-    }
+-    const slot_slot = if (stage == .vertex) &vertex_slots else &pixel_slots;
+-    if (slot_slot.*.len != 0) allocator.free(slot_slot.*);
+-    slot_slot.* = &.{};
+ 
++    // A change to either stage invalidates the whole pair's translation.
++    entry.freeTranslation(allocator);
+     diagnostic = null;
+-    var slots: []ScalarSlot = &.{};
+-    const translated = translateShaderSlots(allocator, if (stage == .vertex) .vertex else .pixel, copy, &slots) catch |err| {
+-        diagnostic = .{ .stage = if (stage == .vertex) .vertex else .pixel, .reason = @errorName(err) };
++    if (entry.vertex_isa == null or entry.pixel_isa == null) return;
++
++    var vertex_slots: []ScalarSlot = &.{};
++    const vertex_words = translateShaderSlots(allocator, .vertex, entry.vertex_isa.?, &vertex_slots) catch |err| {
++        diagnostic = .{ .stage = .vertex, .reason = @errorName(err) };
++        return;
++    };
++    var pixel_slots: []ScalarSlot = &.{};
++    const pixel_words = translateShaderSlots(allocator, .pixel, entry.pixel_isa.?, &pixel_slots) catch |err| {
++        allocator.free(vertex_words);
++        if (vertex_slots.len != 0) allocator.free(vertex_slots);
++        diagnostic = .{ .stage = .pixel, .reason = @errorName(err) };
+         return;
+     };
+-    spirv_slot.* = translated;
+-    slot_slot.* = slots;
++
++    entry.vertex_spirv = vertex_words;
++    entry.pixel_spirv = pixel_words;
++    entry.vertex_slots = vertex_slots;
++    entry.pixel_slots = pixel_slots;
+ }
+ 
+-/// Dynamic scalar layout for the last successfully registered stage. The draw
+-/// path fills values in this exact order before `writeGraphicsScalarValues`.
+-pub fn scalarSlots(stage: Stage) []const ScalarSlot {
++/// Test helper: register against the zero program pair.
++pub fn registerShader(stage: Stage, words: []const u32) void {
++    registerShaderFor(.{}, stage, words);
++}
++
++/// Dynamic scalar layout for an exact program pair/stage. The draw path fills
++/// values in this exact order before `writeGraphicsScalarValues`.
++pub fn scalarSlotsFor(program: ProgramPair, stage: Stage) []const ScalarSlot {
+     lockGlobal();
+     defer lock.unlock();
+-    return if (stage == .vertex) vertex_slots else pixel_slots;
++    const index = findEntry(program) orelse return &.{};
++    const entry = &registry[index];
++    return if (stage == .vertex) entry.vertex_slots else entry.pixel_slots;
+ }
+ 
+-/// Returns the translated stage outputs, or null until both a real vertex and
+-/// pixel shader have been registered and translated successfully.
+-pub fn translatedGraphics() ?TranslatedGraphics {
++/// Test helper over the zero program pair.
++pub fn scalarSlots(stage: Stage) []const ScalarSlot {
++    return scalarSlotsFor(.{}, stage);
++}
++
++/// Returns the translated stage outputs for an exact program pair, or null
++/// unless both stages for that pair are present and translated successfully.
++pub fn translatedGraphicsFor(program: ProgramPair) ?TranslatedGraphics {
+     lockGlobal();
+     defer lock.unlock();
+-    if (vertex_spirv == null or pixel_spirv == null) return null;
+-    return .{ .vertex_words = vertex_spirv.?, .fragment_words = pixel_spirv.? };
++    const index = findEntry(program) orelse return null;
++    const entry = &registry[index];
++    if (entry.vertex_spirv == null or entry.pixel_spirv == null) return null;
++    return .{ .vertex_words = entry.vertex_spirv.?, .fragment_words = entry.pixel_spirv.? };
++}
++
++/// Test helper over the zero program pair.
++pub fn translatedGraphics() ?TranslatedGraphics {
++    return translatedGraphicsFor(.{});
+ }
+ 
+ pub fn lastDiagnostic() ?Diagnostic {
+     lockGlobal();
+     defer lock.unlock();
+     return diagnostic;
+ }
+ 
+ // ---- tests ----
+ 
+diff --git a/src/vulkan/backend.zig b/src/vulkan/backend.zig
+index 4867a5c..25f4ebb 100644
+--- a/src/vulkan/backend.zig
++++ b/src/vulkan/backend.zig
+@@ -25743,25 +25743,26 @@ pub const Renderer = struct {
+             false,
+             true,
+             .{ .vertex_count = 3 },
+         );
+     }
+ 
+     /// PS4-only: fill the dynamic scalar upload from captured GCN USER_DATA and
+     /// a minimal sprite transform. The slot order is owned by `gcn_translate`,
+     /// so the values land at the same indices `rdna2` loads at runtime.
+     fn ps4GraphicsScalars(
++        program: ps4_mode.ProgramPair,
+         stage: ps4_mode.gcn_translate.Stage,
+         storage: []gpu.ShaderSpirvScalarRegister,
+         resources: ps4_mode.gcn_resources.Resources,
+     ) []const gpu.ShaderSpirvScalarRegister {
+-        const slots = ps4_mode.gcn_translate.scalarSlots(stage);
++        const slots = ps4_mode.gcn_translate.scalarSlotsFor(program, stage);
+         const count = @min(slots.len, storage.len);
+         const user_data = resources.userData(if (stage == .vertex) .vertex else .pixel);
+ 
+         // The real Terraria VS performs three SGPR loads in its straight prolog:
+         // a V# from a raw USER_DATA pointer, then two vertex-attribute reads.
+         // Group SMEM slots by producer PC so values follow that shape without
+         // depending on absolute PCs.
+         var group: usize = 0;
+         var word_in_group: u32 = 0;
+         var previous_pc: ?u32 = null;
+@@ -25886,30 +25887,32 @@ pub const Renderer = struct {
+         const render_state = gpu.resources.decodeRenderState(state);
+         var target: ?GuestColorTarget = null;
+         for (render_state.color_targets) |candidate| {
+             const color = candidate orelse continue;
+             if (!color.isActive()) continue;
+             target = guestColorTarget(color) catch continue;
+             break;
+         }
+         const guest_target = target orelse return Error.UnsupportedColorTarget;
+         try self.beginFrameDraw();
+-        const translated = ps4_mode.gcn_translate.translatedGraphics();
++        const programs = ps4_mode.shader_binding.programs();
++        const program: ps4_mode.ProgramPair = .{ .vertex = programs.vertex, .pixel = programs.pixel };
++        const translated = ps4_mode.gcn_translate.translatedGraphicsFor(program);
+         const use_real_shader = translated != null;
+         var vertex_storage: [64]gpu.ShaderSpirvScalarRegister = undefined;
+         var fragment_storage: [64]gpu.ShaderSpirvScalarRegister = undefined;
+         const vertex_scalars: []const gpu.ShaderSpirvScalarRegister = if (use_real_shader)
+-            ps4GraphicsScalars(.vertex, &vertex_storage, resources)
++            ps4GraphicsScalars(program, .vertex, &vertex_storage, resources)
+         else
+             &.{};
+         const fragment_scalars: []const gpu.ShaderSpirvScalarRegister = if (use_real_shader)
+-            ps4GraphicsScalars(.pixel, &fragment_storage, resources)
++            ps4GraphicsScalars(program, .pixel, &fragment_storage, resources)
+         else
+             &.{};
+         // The translated PS reads a sampled image at binding 1 / element 1.
+         // Stage it after beginFrameDraw selected this batch's descriptor set,
+         // and keep it alive until the draw has been queued.
+         var ps4_sampled: ?PreparedSampledImage = null;
+         defer if (ps4_sampled) |prepared| self.releasePs4GraphicsSampledImage(prepared);
+         if (use_real_shader) ps4_sampled = try self.stagePs4GraphicsSampledImage(resources);
+         try self.drawGraphicsShadersWithModules(
+             if (translated) |t| t.vertex_words else &graphics_probe_vertex_spirv,

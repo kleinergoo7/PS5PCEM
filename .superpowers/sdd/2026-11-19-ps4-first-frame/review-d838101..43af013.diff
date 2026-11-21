@@ -1,0 +1,260 @@
+# Review package: d838101..HEAD
+
+## Commits
+43af013 feat(ps4): close Terraria import closure
+
+## Files changed
+ build.zig                           |  2 +
+ src/game_run.zig                    |  2 +-
+ src/hle/libs/ps4_terraria_stubs.zig | 96 +++++++++++++++++++++++++++++++++++++
+ src/hle/root.zig                    |  3 ++
+ 4 files changed, 102 insertions(+), 1 deletion(-)
+
+## Diff
+diff --git a/build.zig b/build.zig
+index 8f51942..f1dcafe 100644
+--- a/build.zig
++++ b/build.zig
+@@ -192,20 +192,21 @@ pub fn build(b: *std.Build) void {
+     const hle = b.addModule("hle", .{
+         .root_source_file = b.path("src/hle/root.zig"),
+         .target = target,
+         .optimize = optimize,
+         .imports = &.{
+             .{ .name = "memory", .module = memory },
+             .{ .name = "loader", .module = loader },
+             .{ .name = "gpu", .module = gpu },
+             .{ .name = "input", .module = input },
+             .{ .name = "zarchive", .module = zarchive },
++            .{ .name = "ps4_mode", .module = ps4_mode },
+         },
+     });
+     hle.addIncludePath(libatrac9.path("C/src"));
+     hle.addIncludePath(minimp3.path("."));
+     hle.addIncludePath(faad2.path("include"));
+     hle.addIncludePath(b.path("src/hle/codecs"));
+     hle.addIncludePath(libopus.path("include"));
+ 
+     // Statically linked: title fonts never depend on an installed host DLL or
+     // host font collection. Keep only the outline formats used by Font HLE.
+@@ -647,20 +648,21 @@ pub fn build(b: *std.Build) void {
+             .optimize = optimize,
+             .imports = &.{
+                 .{ .name = "runtime", .module = runtime },
+                 .{ .name = "loader", .module = loader },
+                 .{ .name = "gpu", .module = gpu },
+                 .{ .name = "vulkan", .module = vulkan },
+                 .{ .name = "window", .module = window },
+                 .{ .name = "d3d12", .module = d3d12 },
+                 .{ .name = "zarchive", .module = zarchive },
+                 .{ .name = "renderdoc", .module = renderdoc },
++                .{ .name = "ps4_mode", .module = ps4_mode },
+             },
+         }),
+     });
+     if (target.result.os.tag == .windows) {
+         // Native guest code requires the complete 64 GiB..1008 GiB PS5 user
+         // window. High-entropy ASLR occasionally placed game-run itself in
+         // that range and split it so Unreal could not reserve its 512 GiB
+         // arena. Keep the host image at 2 TiB, outside every guest aperture.
+         game_run.image_base = 0x0200_0000_0000;
+         game_run.root_module.linkSystemLibrary("xinput1_4", .{});
+diff --git a/src/game_run.zig b/src/game_run.zig
+index d778da4..ecc3b35 100644
+--- a/src/game_run.zig
++++ b/src/game_run.zig
+@@ -11,21 +11,21 @@ const runtime = @import("runtime");
+ const loader = @import("loader");
+ const vulkan = @import("vulkan");
+ const d3d12 = @import("d3d12");
+ const zarchive = @import("zarchive");
+ const renderdoc = @import("renderdoc");
+ const graphics_api = @import("graphics_api.zig");
+ const window = @import("window");
+ const display_mode = @import("display_mode.zig");
+ const performance_mode = @import("performance_mode.zig");
+ const frame_limit = @import("frame_limit.zig");
+-const ps4_mode = @import("ps4_mode/root.zig");
++const ps4_mode = @import("ps4_mode");
+ 
+ fn acquireHostMemory(context: ?*anyopaque, address: u64, size: usize, identity: u64) ?vulkan.GuestMemory.HostMapping {
+     const view = runtime.firmware.libs.agc_submit.pinDirectMemory(context, address, size, identity) orelse return null;
+     return .{ .bytes = view.bytes, .offset = view.offset, .identity = identity, .release = runtime.firmware.libs.agc_submit.releaseDirectMemory };
+ }
+ 
+ comptime {
+     @import("host_memory.zig").exportRuntime();
+     // The native D3D12 object also calls this module's exported byte comparator
+     // in test builds, where main() is not analyzed.
+diff --git a/src/hle/libs/ps4_terraria_stubs.zig b/src/hle/libs/ps4_terraria_stubs.zig
+new file mode 100644
+index 0000000..f449e8e
+--- /dev/null
++++ b/src/hle/libs/ps4_terraria_stubs.zig
+@@ -0,0 +1,96 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++// Copyright (C) 2026 kleinergoo7
++
++//! PS4 Terraria first-frame import closure.
++//!
++//! These are the 37 NIDs game-run enumerates as unresolved for Terraria (the
++//! authoritative link queue; the larger module-info MISS list is only a
++//! fallback). Each is registered under its exact PS4 NID via `id_override`, so
++//! no PS5 export is shadowed. Every stub records its NID through
++//! `ps4_mode.hits`, gated by PS5_GNM_DIAG like the other PS4-only wrappers.
++//!
++//! Classification (full table in task-4-report.md): all 37 are benign,
++//! idempotent or status-returning calls from the companion/invitation/audio/
++//! RTC/GNM-driver libraries. None has a shared implementation under its NID,
++//! and none is an allocation/sync/data provider with a shared counterpart to
++//! wrap, so each lands on minimal PS4-specific logic returning SCE_OK (0) —
++//! the deliberate plausible value for these success/status paths, not a blind
++//! default for a value-returning import.
++
++const std = @import("std");
++const abi = @import("../abi.zig");
++const trace = @import("../trace.zig");
++const symbols = @import("../symbols.zig");
++const hits = @import("ps4_mode").hits;
++
++const Entry = struct { lib: []const u8, nid: []const u8 };
++
++const entries = [_]Entry{
++    .{ .lib = "libSceCompanionUtil", .nid = "IPN-FRSrafk" },
++    .{ .lib = "libSceCompanionUtil", .nid = "xb1xlIhf0QY" },
++    .{ .lib = "libSceCompanionUtil", .nid = "H1fYQd5lFAI" },
++    .{ .lib = "libSceCompanionUtil", .nid = "cE5Msy11WhU" },
++    .{ .lib = "libSceInvitationDialog", .nid = "9+g9iOq+7kg" },
++    .{ .lib = "libSceInvitationDialog", .nid = "8XKR6wa64iQ" },
++    .{ .lib = "libSceInvitationDialog", .nid = "B6HVJtDYxEE" },
++    .{ .lib = "libSceInvitationDialog", .nid = "XvA5KS56wcs" },
++    .{ .lib = "libSceInvitationDialog", .nid = "0zU0G+wiVLA" },
++    .{ .lib = "libSceRtc", .nid = "NxEI1KByvCI" },
++    .{ .lib = "libSceNgs2", .nid = "t9T0QM17Kvo" },
++    .{ .lib = "libSceGnmDriver", .nid = "QhnyReteJ1M" },
++    .{ .lib = "libSceGnmDriver", .nid = "jiItzS6+22g" },
++    .{ .lib = "libSceGnmDriver", .nid = "aj3L-iaFmyk" },
++    .{ .lib = "libSceGnmDriver", .nid = "W1Etj-jlW7Y" },
++    .{ .lib = "libSceGnmDriver", .nid = "aPIZJTXC+cU" },
++    .{ .lib = "libSceGnmDriver", .nid = "7qZVNgEu+SY" },
++    .{ .lib = "libSceGnmDriver", .nid = "26PM5Mzl8zc" },
++    .{ .lib = "libSceGnmDriver", .nid = "RU74kek-N0c" },
++    .{ .lib = "libSceGnmDriver", .nid = "iCO804ZgzdA" },
++    .{ .lib = "libSceGnmDriver", .nid = "PVT+fuoS9gU" },
++    .{ .lib = "libSceGnmDriver", .nid = "UoYY0DWMC0U" },
++    .{ .lib = "libSceGnmDriver", .nid = "H7-fgvEutM0" },
++    .{ .lib = "libSceGnmDriver", .nid = "iBt3Oe00Kvc" },
++    .{ .lib = "libSceGnmDriver", .nid = "qpGITzPE+Zc" },
++    .{ .lib = "libSceGnmDriver", .nid = "b08AgtPlHPg" },
++    .{ .lib = "libSceGnmDriver", .nid = "gObODli-OH8" },
++    .{ .lib = "libSceGnmDriver", .nid = "+xuDhxlWRPg" },
++    .{ .lib = "libSceGnmDriver", .nid = "f85orjx7qts" },
++    .{ .lib = "libSceGnmDriver", .nid = "HHo1BAljZO8" },
++    .{ .lib = "libSceGnmDriver", .nid = "jtkqXpAOY6w" },
++    .{ .lib = "libSceGnmDriver", .nid = "u9YKpRRHe-M" },
++    .{ .lib = "libSceGnmDriver", .nid = "4UFagYlfuAM" },
++    .{ .lib = "libSceGnmDriver", .nid = "xeTLfxVIQO4" },
++    .{ .lib = "libSceGnmDriver", .nid = "9thMn+uB1is" },
++    .{ .lib = "libSceGnmDriver", .nid = "d88anrgNoKY" },
++    .{ .lib = "libSceGnmDriver", .nid = "TLV4mswiZ4A" },
++};
++
++/// A per-import thunk: records the hit under this NID, answers SCE_OK.
++fn stubFor(comptime e: Entry) abi.RawEntryPoint {
++    const Impl = struct {
++        fn call() callconv(abi.guest) u64 {
++            hits.record(e.nid);
++            return 0;
++        }
++    };
++    return trace.wrap(e.nid, &Impl.call);
++}
++
++pub fn register(db: *symbols.Database, gpa: std.mem.Allocator) symbols.Error!void {
++    inline for (entries) |e| {
++        try db.add(gpa, .{ .name = e.lib, .version = 1 }, .{ .name = e.lib }, .{
++            .name = "ps4-terraria-stub",
++            .function = stubFor(e),
++            .id_override = e.nid,
++        });
++    }
++}
++
++test "every Terraria NID resolves under its exact PS4 identifier" {
++    var db = symbols.Database{};
++    defer db.deinit(std.testing.allocator);
++    try register(&db, std.testing.allocator);
++    inline for (entries) |e| {
++        try std.testing.expect(db.findById(e.nid, .function) != null);
++    }
++}
+diff --git a/src/hle/root.zig b/src/hle/root.zig
+index 3edee3f..ee76fe6 100644
+--- a/src/hle/root.zig
++++ b/src/hle/root.zig
+@@ -35,20 +35,21 @@ pub const libs = struct {
+     pub const json = @import("libs/json.zig");
+     pub const share = @import("libs/share.zig");
+     pub const kernel_event_queue = @import("libs/kernel_event_queue.zig");
+     pub const kernel_info = @import("libs/kernel_info.zig");
+     pub const kernel_ioctl = @import("libs/kernel_ioctl.zig");
+     pub const agc = @import("libs/agc.zig");
+     pub const agc_submit = @import("libs/agc_submit.zig");
+     pub const gnm_compat = @import("libs/gnm_compat.zig");
+     pub const ps4_heap = @import("libs/ps4_heap.zig");
+     pub const ps4_title_stubs = @import("libs/ps4_title_stubs.zig");
++    pub const ps4_terraria_stubs = @import("libs/ps4_terraria_stubs.zig");
+     pub const kernel_aio = @import("libs/kernel_aio.zig");
+     pub const kernel_mapper = @import("libs/kernel_mapper.zig");
+     pub const kernel_files = @import("libs/kernel_files.zig");
+     pub const kernel_memory = @import("libs/kernel_memory.zig");
+     pub const kernel_runtime = @import("libs/kernel_runtime.zig");
+     pub const kernel_sync = @import("libs/kernel_sync.zig");
+     pub const kernel_threading = @import("libs/kernel_threading.zig");
+     pub const libc_internal = @import("libs/libc_internal.zig");
+     pub const network = @import("libs/network.zig");
+     pub const platform_services = @import("libs/platform_services.zig");
+@@ -103,20 +104,21 @@ pub fn registerAll(db: *Database, gpa: @import("std").mem.Allocator) symbols.Err
+     try libs.png_enc.register(db, gpa);
+     try libs.registry.register(db, gpa);
+     try libs.services.register(db, gpa);
+     try libs.pad.register(db, gpa);
+     try libs.sysmodule.register(db, gpa);
+     try libs.system_service.register(db, gpa);
+     try libs.ult.register(db, gpa);
+     try libs.user_service.register(db, gpa);
+     try libs.ps4_heap.register(db, gpa);
+     try libs.ps4_title_stubs.register(db, gpa);
++    try libs.ps4_terraria_stubs.register(db, gpa);
+ }
+ 
+ test {
+     _ = libs.font;
+     _ = libs.json;
+     _ = @import("font_rasterizer.zig");
+     _ = @import("font_substitutes.zig");
+     _ = @import("font_kerning.zig");
+     _ = libs.audio;
+     _ = @import("audio_fs.zig");
+@@ -157,20 +159,21 @@ test {
+     _ = libs.libc_internal;
+     _ = libs.network;
+     _ = libs.platform_services;
+     _ = libs.registry;
+     _ = libs.services;
+     _ = libs.pad;
+     _ = libs.sysmodule;
+     _ = libs.system_service;
+     _ = libs.ult;
+     _ = libs.user_service;
++    _ = libs.ps4_terraria_stubs;
+     _ = @import("libs/gnm_service_compat.zig");
+ }
+ 
+ // ---------------------------------------------------------------------------
+ // Registration tests
+ //
+ // A library's own test registers that library alone, so it cannot see an
+ // identifier two libraries both claim. These go through `registerAll` and call
+ // what the registry actually hands the dynamic linker, which is the only place
+ // a shadowed binding shows up.

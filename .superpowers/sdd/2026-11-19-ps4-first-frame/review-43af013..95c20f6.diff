@@ -1,0 +1,415 @@
+# Review package: 43af013..HEAD
+
+## Commits
+95c20f6 feat(ps4): close OneShot import closure
+
+## Files changed
+ src/hle/libs/ps4_oneshot_stubs.zig | 195 +++++++++++++++++++++++++++++++++++++
+ src/hle/root.zig                   |   3 +
+ src/loader/image_loader.zig        |  85 ++++++++++++----
+ 3 files changed, 263 insertions(+), 20 deletions(-)
+
+## Diff
+diff --git a/src/hle/libs/ps4_oneshot_stubs.zig b/src/hle/libs/ps4_oneshot_stubs.zig
+new file mode 100644
+index 0000000..2e3a729
+--- /dev/null
++++ b/src/hle/libs/ps4_oneshot_stubs.zig
+@@ -0,0 +1,195 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++// Copyright (C) 2026 kleinergoo7
++
++//! PS4 OneShot first-frame import closure.
++//!
++//! These are the NIDs game-run enumerates as unresolved for OneShot, driven one
++//! failing module at a time (the authoritative link queue; the larger
++//! module-info MISS list is only a fallback and does not cover every PRX). Each
++//! is registered under its exact PS4 NID via `id_override`, so no PS5 export is
++//! shadowed. Every stub records its NID through `ps4_mode.hits`, gated by
++//! PS5_GNM_DIAG like the other PS4-only wrappers.
++//!
++//! Classification (full table in task-5-report.md): every entry is a
++//! status-returning or idempotent call with no HLE export under its PS4 NID, so
++//! each lands on minimal PS4 logic returning SCE_OK — the deliberate plausible
++//! success value for these paths, not a blind zero for a value-returning import.
++//! The one exception, `hHrGoGoNf+s`, is the PS4 alias of the shared
++//! `sceSysmoduleLoadModule`, whose implementation also reports SCE_OK.
++
++const std = @import("std");
++const abi = @import("../abi.zig");
++const trace = @import("../trace.zig");
++const symbols = @import("../symbols.zig");
++const errno = @import("../errno.zig");
++const hits = @import("ps4_mode").hits;
++
++const Entry = struct { lib: []const u8, nid: []const u8 };
++
++const entries = [_]Entry{
++    // libSceSysmodule — PS4 alias of the shared sceSysmoduleLoadModule
++    // (registered under PS5 NID g8cM39EUZ6o); that shared implementation
++    // reports success without mapping another image, so the alias does too.
++    .{ .lib = "libSceSysmodule", .nid = "hHrGoGoNf+s" },
++
++    // libSceAudio3d — status/idempotent audio-engine calls (init, listener and
++    // source state, submit/render) from libfmod; no shared export under these
++    // PS4 NIDs. SCE_OK is the plausible success value for each.
++    .{ .lib = "libSceAudio3d", .nid = "Yq9bfUQ0uJg" },
++    .{ .lib = "libSceAudio3d", .nid = "pZlOm1aF3aA" },
++    .{ .lib = "libSceAudio3d", .nid = "YaaDbDwKpFM" },
++    .{ .lib = "libSceAudio3d", .nid = "9tEwE0GV0qo" },
++    .{ .lib = "libSceAudio3d", .nid = "HbxYY27lK6E" },
++    .{ .lib = "libSceAudio3d", .nid = "lw0qrdSjZt8" },
++    .{ .lib = "libSceAudio3d", .nid = "VEVhZ9qd4ZY" },
++    .{ .lib = "libSceAudio3d", .nid = "1HXxo-+1qCw" },
++    .{ .lib = "libSceAudio3d", .nid = "ucEsi62soTo" },
++
++    // libSceGnmDriver — status/idempotent GNM driver command/state calls. Same
++    // classification as the 26 GnmDriver NIDs stubbed for Terraria (43af013);
++    // the shared GNM/AGC registry uses different PS5 NIDs, so these are PS4-only.
++    .{ .lib = "libSceGnmDriver", .nid = "jRcI8VcgTz4" },
++    .{ .lib = "libSceGnmDriver", .nid = "Ga6r7H6Y0RI" },
++    .{ .lib = "libSceGnmDriver", .nid = "A+uGq+3KFtQ" },
++    .{ .lib = "libSceGnmDriver", .nid = "byXlqupd8cE" },
++    .{ .lib = "libSceGnmDriver", .nid = "tZCSL5ulnB4" },
++    .{ .lib = "libSceGnmDriver", .nid = "fzJdEihTFV4" },
++    .{ .lib = "libSceGnmDriver", .nid = "oL4hGI1PMpw" },
++    .{ .lib = "libSceGnmDriver", .nid = "k7iGTvDQPLQ" },
++    .{ .lib = "libSceGnmDriver", .nid = "nEyFbYUloIM" },
++    .{ .lib = "libSceGnmDriver", .nid = "iFirFzgYsvw" },
++    .{ .lib = "libSceGnmDriver", .nid = "dewXw5roLs0" },
++    .{ .lib = "libSceGnmDriver", .nid = "6YRHhh5mHCs" },
++    .{ .lib = "libSceGnmDriver", .nid = "R6z1xM3pW-w" },
++    .{ .lib = "libSceGnmDriver", .nid = "5udAm+6boVg" },
++    .{ .lib = "libSceGnmDriver", .nid = "ihxrbsoSKWc" },
++    .{ .lib = "libSceGnmDriver", .nid = "Fa3x75OOLRA" },
++    .{ .lib = "libSceGnmDriver", .nid = "UtObDRQiGbs" },
++    .{ .lib = "libSceGnmDriver", .nid = "XiyzNZ9J4nQ" },
++    .{ .lib = "libSceGnmDriver", .nid = "Fwvh++m9IQI" },
++    .{ .lib = "libSceGnmDriver", .nid = "KnldROUkWJY" },
++    .{ .lib = "libSceGnmDriver", .nid = "FFVZcCu3zWU" },
++    .{ .lib = "libSceGnmDriver", .nid = "wED4ZXCFJT0" },
++    .{ .lib = "libSceGnmDriver", .nid = "Kx-h-nWQJ8A" },
++    .{ .lib = "libSceGnmDriver", .nid = "NfvOrNzy6sk" },
++    .{ .lib = "libSceGnmDriver", .nid = "ffrNQOshows" },
++    .{ .lib = "libSceGnmDriver", .nid = "EJapNl2+pgU" },
++    .{ .lib = "libSceGnmDriver", .nid = "X9Omw9dwv5M" },
++    .{ .lib = "libSceGnmDriver", .nid = "+AFvOEXrKJk" },
++    .{ .lib = "libSceGnmDriver", .nid = "5uFKckiJYRM" },
++    .{ .lib = "libSceGnmDriver", .nid = "cFCp0NX8wf0" },
++    .{ .lib = "libSceGnmDriver", .nid = "Z43vKp5k7r0" },
++    .{ .lib = "libSceGnmDriver", .nid = "HlTPoZ-oY7Y" },
++    .{ .lib = "libSceGnmDriver", .nid = "GGsn7jMTxw4" },
++    .{ .lib = "libSceGnmDriver", .nid = "ED9-Fjr8Ta4" },
++    .{ .lib = "libSceGnmDriver", .nid = "thbPcG7E7qk" },
++    .{ .lib = "libSceGnmDriver", .nid = "jHdPvIzlpKc" },
++    .{ .lib = "libSceGnmDriver", .nid = "oYM+YzfCm2Y" },
++    .{ .lib = "libSceGnmDriver", .nid = "4v+otIIdjqg" },
++    .{ .lib = "libSceGnmDriver", .nid = "cUCo8OvArrw" },
++    .{ .lib = "libSceGnmDriver", .nid = "yb2cRhagD1I" },
++    .{ .lib = "libSceGnmDriver", .nid = "im2ZuItabu4" },
++    .{ .lib = "libSceGnmDriver", .nid = "stDSYW2SBVM" },
++    .{ .lib = "libSceGnmDriver", .nid = "nLM2i2+65hA" },
++    .{ .lib = "libSceGnmDriver", .nid = "GNlx+y7xPdE" },
++    .{ .lib = "libSceGnmDriver", .nid = "mLVL7N7BVBg" },
++    .{ .lib = "libSceGnmDriver", .nid = "V31V01UiScY" },
++    .{ .lib = "libSceGnmDriver", .nid = "Kl0Z3LH07QI" },
++    .{ .lib = "libSceGnmDriver", .nid = "MYRtYhojKdA" },
++    .{ .lib = "libSceGnmDriver", .nid = "0BzLGljcwBo" },
++
++    // Second failing module (scePlayStation4.prx): status/idempotent service
++    // calls with no HLE export under these PS4 NIDs. SCE_OK is the plausible
++    // success value for each.
++    // libSceCamera
++    .{ .lib = "libSceCamera", .nid = "2G2C0nmd++M" },
++    .{ .lib = "libSceCamera", .nid = "3i5MEzrC1pg" },
++    .{ .lib = "libSceCamera", .nid = "9EpRYMy7rHU" },
++    .{ .lib = "libSceCamera", .nid = "BHn83xrF92E" },
++    .{ .lib = "libSceCamera", .nid = "HX5524E5tMY" },
++    .{ .lib = "libSceCamera", .nid = "K7W7H4ZRwbc" },
++    .{ .lib = "libSceCamera", .nid = "OMS9LlcrvBo" },
++    .{ .lib = "libSceCamera", .nid = "ObIste7hqdk" },
++    .{ .lib = "libSceCamera", .nid = "P-7MVfzvpsM" },
++    .{ .lib = "libSceCamera", .nid = "QI8GVJUy2ZY" },
++    .{ .lib = "libSceCamera", .nid = "RTDOsWWqdME" },
++    .{ .lib = "libSceCamera", .nid = "VQ+5kAqsE2Q" },
++    .{ .lib = "libSceCamera", .nid = "WVox2rwGuSc" },
++    .{ .lib = "libSceCamera", .nid = "XqYRHc4aw3w" },
++    .{ .lib = "libSceCamera", .nid = "a5xFueMZIMs" },
++    .{ .lib = "libSceCamera", .nid = "bSKEi2PzzXI" },
++    .{ .lib = "libSceCamera", .nid = "c6Fp9M1EXXc" },
++    .{ .lib = "libSceCamera", .nid = "jMv40y2A23g" },
++    .{ .lib = "libSceCamera", .nid = "k3zPIcgFNv0" },
++    .{ .lib = "libSceCamera", .nid = "lhEIsHzB8r4" },
++    .{ .lib = "libSceCamera", .nid = "p6n3Npi3YY4" },
++    .{ .lib = "libSceCamera", .nid = "tslCukqFE+E" },
++    .{ .lib = "libSceCamera", .nid = "wgBMXJJA6K4" },
++    .{ .lib = "libSceCamera", .nid = "zrIUDKZx0iE" },
++    // libSceGnmDriver
++    .{ .lib = "libSceGnmDriver", .nid = "5SHGNwLXBV4" },
++    .{ .lib = "libSceGnmDriver", .nid = "BgM3t3LvcNk" },
++    .{ .lib = "libSceGnmDriver", .nid = "HzMN7ANqYEc" },
++    .{ .lib = "libSceGnmDriver", .nid = "MBMa6EFu4Ko" },
++    .{ .lib = "libSceGnmDriver", .nid = "Q7t4VEYLafI" },
++    .{ .lib = "libSceGnmDriver", .nid = "RX7XCNSaL6I" },
++    .{ .lib = "libSceGnmDriver", .nid = "SXw4dZEkgpA" },
++    .{ .lib = "libSceGnmDriver", .nid = "hsZPf1lON7E" },
++    .{ .lib = "libSceGnmDriver", .nid = "qGP74T5OWJc" },
++    .{ .lib = "libSceGnmDriver", .nid = "rTIV11nMQuM" },
++    // libScePlayGo
++    .{ .lib = "libScePlayGo", .nid = "LosLlHOpNqQ" },
++    // libSceRemoteplay
++    .{ .lib = "libSceRemoteplay", .nid = "mrNh78tBpmg" },
++    .{ .lib = "libSceRemoteplay", .nid = "xQeIryTX7dY" },
++    // libSceSaveData
++    .{ .lib = "libSceSaveData", .nid = "0z45PIH+SNI" },
++    .{ .lib = "libSceSaveData", .nid = "RQOqDbk3bSU" },
++    .{ .lib = "libSceSaveData", .nid = "VwadwBBBJ80" },
++    .{ .lib = "libSceSaveData", .nid = "lU9YRFsgwSU" },
++    // libSceScreenShot
++    .{ .lib = "libSceScreenShot", .nid = "G7KlmIYFIZc" },
++    .{ .lib = "libSceScreenShot", .nid = "ahHhOf+QNkQ" },
++    // libSceSystemService
++    .{ .lib = "libSceSystemService", .nid = "4imyVMxX5-8" },
++    .{ .lib = "libSceSystemService", .nid = "eLWnPuja+Y8" },
++    // libSceUserService
++    .{ .lib = "libSceUserService", .nid = "lUoqwTQu4Go" },
++    // libSceVideoRecording
++    .{ .lib = "libSceVideoRecording", .nid = "KHvkPQJDMLk" },
++    .{ .lib = "libSceVideoRecording", .nid = "OOFxrMY+mfI" },
++    .{ .lib = "libSceVideoRecording", .nid = "bGYkY6q3bIw" },
++    .{ .lib = "libSceVideoRecording", .nid = "fZJQzFK4Gv4" },
++    .{ .lib = "libSceVideoRecording", .nid = "s28dalBwp2g" },
++    .{ .lib = "libSceVideoRecording", .nid = "tWoe9IlGAhs" },
++};
++
++/// A per-import thunk: records the hit under this NID, answers SCE_OK.
++fn stubFor(comptime e: Entry) abi.RawEntryPoint {
++    const Impl = struct {
++        fn call() callconv(abi.guest) u64 {
++            hits.record(e.nid);
++            return errno.ok;
++        }
++    };
++    return trace.wrap(e.nid, &Impl.call);
++}
++
++pub fn register(db: *symbols.Database, gpa: std.mem.Allocator) symbols.Error!void {
++    inline for (entries) |e| {
++        try db.add(gpa, .{ .name = e.lib, .version = 1 }, .{ .name = e.lib }, .{
++            .name = "ps4-oneshot-stub",
++            .function = stubFor(e),
++            .id_override = e.nid,
++        });
++    }
++}
++
++test "every OneShot NID resolves under its exact PS4 identifier" {
++    var db = symbols.Database{};
++    defer db.deinit(std.testing.allocator);
++    try register(&db, std.testing.allocator);
++    inline for (entries) |e| {
++        try std.testing.expect(db.findById(e.nid, .function) != null);
++    }
++}
+diff --git a/src/hle/root.zig b/src/hle/root.zig
+index ee76fe6..b230f5b 100644
+--- a/src/hle/root.zig
++++ b/src/hle/root.zig
+@@ -36,20 +36,21 @@ pub const libs = struct {
+     pub const share = @import("libs/share.zig");
+     pub const kernel_event_queue = @import("libs/kernel_event_queue.zig");
+     pub const kernel_info = @import("libs/kernel_info.zig");
+     pub const kernel_ioctl = @import("libs/kernel_ioctl.zig");
+     pub const agc = @import("libs/agc.zig");
+     pub const agc_submit = @import("libs/agc_submit.zig");
+     pub const gnm_compat = @import("libs/gnm_compat.zig");
+     pub const ps4_heap = @import("libs/ps4_heap.zig");
+     pub const ps4_title_stubs = @import("libs/ps4_title_stubs.zig");
+     pub const ps4_terraria_stubs = @import("libs/ps4_terraria_stubs.zig");
++    pub const ps4_oneshot_stubs = @import("libs/ps4_oneshot_stubs.zig");
+     pub const kernel_aio = @import("libs/kernel_aio.zig");
+     pub const kernel_mapper = @import("libs/kernel_mapper.zig");
+     pub const kernel_files = @import("libs/kernel_files.zig");
+     pub const kernel_memory = @import("libs/kernel_memory.zig");
+     pub const kernel_runtime = @import("libs/kernel_runtime.zig");
+     pub const kernel_sync = @import("libs/kernel_sync.zig");
+     pub const kernel_threading = @import("libs/kernel_threading.zig");
+     pub const libc_internal = @import("libs/libc_internal.zig");
+     pub const network = @import("libs/network.zig");
+     pub const platform_services = @import("libs/platform_services.zig");
+@@ -105,20 +106,21 @@ pub fn registerAll(db: *Database, gpa: @import("std").mem.Allocator) symbols.Err
+     try libs.registry.register(db, gpa);
+     try libs.services.register(db, gpa);
+     try libs.pad.register(db, gpa);
+     try libs.sysmodule.register(db, gpa);
+     try libs.system_service.register(db, gpa);
+     try libs.ult.register(db, gpa);
+     try libs.user_service.register(db, gpa);
+     try libs.ps4_heap.register(db, gpa);
+     try libs.ps4_title_stubs.register(db, gpa);
+     try libs.ps4_terraria_stubs.register(db, gpa);
++    try libs.ps4_oneshot_stubs.register(db, gpa);
+ }
+ 
+ test {
+     _ = libs.font;
+     _ = libs.json;
+     _ = @import("font_rasterizer.zig");
+     _ = @import("font_substitutes.zig");
+     _ = @import("font_kerning.zig");
+     _ = libs.audio;
+     _ = @import("audio_fs.zig");
+@@ -160,20 +162,21 @@ test {
+     _ = libs.network;
+     _ = libs.platform_services;
+     _ = libs.registry;
+     _ = libs.services;
+     _ = libs.pad;
+     _ = libs.sysmodule;
+     _ = libs.system_service;
+     _ = libs.ult;
+     _ = libs.user_service;
+     _ = libs.ps4_terraria_stubs;
++    _ = libs.ps4_oneshot_stubs;
+     _ = @import("libs/gnm_service_compat.zig");
+ }
+ 
+ // ---------------------------------------------------------------------------
+ // Registration tests
+ //
+ // A library's own test registers that library alone, so it cannot see an
+ // identifier two libraries both claim. These go through `registerAll` and call
+ // what the registry actually hands the dynamic linker, which is the only place
+ // a shadowed binding shows up.
+diff --git a/src/loader/image_loader.zig b/src/loader/image_loader.zig
+index 4a8cbe4..be516a5 100644
+--- a/src/loader/image_loader.zig
++++ b/src/loader/image_loader.zig
+@@ -243,41 +243,34 @@ pub fn prepare(
+     if (image.findSegment(.sce_procparam)) |header| {
+         if (header.memsz != 0) {
+             const address = std.math.add(u64, options.load_bias, header.vaddr) catch
+                 return Error.AddressOverflow;
+             const end = std.math.add(u64, address, header.memsz) catch
+                 return Error.AddressOverflow;
+             mapped.process_param_range = .{ .start = address, .end = end };
+         }
+     }
+ 
+-    // Adjacent protection runs are one staging allocation. This also handles
+-    // ELF segments that share their boundary page.
+-    var run_index: usize = 0;
+-    while (run_index < final_runs.items.len) {
+-        const start = final_runs.items[run_index].range.start;
+-        var end = final_runs.items[run_index].range.end;
+-        run_index += 1;
+-        while (run_index < final_runs.items.len and final_runs.items[run_index].range.start == end) {
+-            end = final_runs.items[run_index].range.end;
+-            run_index += 1;
+-        }
+-
+-        try address_space.mapFixed(
+-            start,
+-            end - start,
+-            .read_write,
+-            .module,
+-            null,
+-        );
+-        try mapped.ranges.append(allocator, .{ .start = start, .end = end });
++    // Stage the whole image span writable, including the page gaps between
++    // PT_LOAD segments. PS4 SELF modules keep their GOT/jump-slot table in such
++    // a gap and relocate into it; mapping only the segment pages left those
++    // writes with no target. Only real segment pages receive their final
++    // protection in `link`, so gap pages stay writable and images without a gap
++    // are unaffected.
++    var whole_start: u64 = std.math.maxInt(u64);
++    var whole_end: u64 = 0;
++    for (plans.items) |plan| {
++        whole_start = @min(whole_start, plan.page_range.start);
++        whole_end = @max(whole_end, plan.page_range.end);
+     }
++    try address_space.mapFixed(whole_start, whole_end - whole_start, .read_write, .module, null);
++    try mapped.ranges.append(allocator, .{ .start = whole_start, .end = whole_end });
+ 
+     // Anonymous committed pages start at zero, so copying filesz bytes also
+     // gives every memsz-filesz tail the ELF-required zero fill.
+     for (plans.items) |plan| {
+         const file_bytes = try image.fileRange(plan.header);
+         if (file_bytes.len != 0) try address_space.write(plan.address, file_bytes);
+     }
+ 
+     if (options.tls_registry) |registry| {
+         mapped.tls_registry = registry;
+@@ -480,20 +473,72 @@ test "a load segment is copied at its exact guest address and finalized read-onl
+ 
+     var output: [payload.len]u8 = undefined;
+     try address_space.read(memory.system_managed.start, &output);
+     try testing.expectEqualStrings(payload, &output);
+     try testing.expectError(
+         memory.Error.ProtectionDenied,
+         address_space.write(memory.system_managed.start, "x"),
+     );
+ }
+ 
++test "the page gap between load segments is staged writable" {
++    const payload = "gap stage";
++    const offset = elf.TestImage.payloadOffset(2);
++    const segments = [_]elf.ProgramHeader{
++        .{
++            .type = @intFromEnum(elf.SegmentType.load),
++            .flags = 0x4,
++            .offset = offset,
++            .vaddr = 0,
++            .paddr = 0,
++            .filesz = payload.len,
++            .memsz = memory.page_size,
++            .@"align" = memory.page_size,
++        },
++        .{
++            .type = @intFromEnum(elf.SegmentType.load),
++            .flags = 0x6,
++            .offset = offset,
++            .vaddr = 3 * memory.page_size,
++            .paddr = 0,
++            .filesz = 0,
++            .memsz = memory.page_size,
++            .@"align" = memory.page_size,
++        },
++    };
++
++    var fixture = try elf.TestImage.build(testing.allocator, .sce_dynexec, &segments, payload);
++    defer fixture.deinit(testing.allocator);
++    const image = try elf.parse(fixture.bytes());
++
++    var address_space = try memory.AddressSpace.init(testing.allocator);
++    defer address_space.deinit();
++    var info = dynamic.DynamicInfo{};
++    defer info.deinit(testing.allocator);
++
++    var mapped = try load(
++        testing.allocator,
++        &address_space,
++        image,
++        &info,
++        null,
++        .{ .load_bias = memory.system_managed.start },
++    );
++    defer mapped.deinit();
++
++    // PS4 SELF modules keep their GOT/jump-slot table in the gap between
++    // PT_LOAD segments and relocate into it, so the gap must stay writable.
++    const gap = memory.system_managed.start + 2 * memory.page_size;
++    try testing.expect(address_space.isMapped(gap, 8));
++    try address_space.writeInt(u64, gap, 0x1234_5678);
++}
++
+ test "startup functions resolve direct and array entries in ABI order" {
+     var address_space = try memory.AddressSpace.init(testing.allocator);
+     defer address_space.deinit();
+     const image_base = memory.system_managed.start;
+     const array_address = image_base + memory.page_size;
+     try address_space.mapFixed(
+         image_base,
+         memory.page_size,
+         .read_write,
+         .module,

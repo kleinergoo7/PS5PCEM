@@ -1,0 +1,580 @@
+# Review package: a758925..8c343e6
+
+## Commits
+8c343e6 feat(ps4): draw Terraria from captured V# vertex data
+
+## Files changed
+ src/ps4_mode/gcn_real_blob_test.zig | 205 ++++++++++++++++++++++++++++++++++--
+ src/ps4_mode/gcn_translate.zig      |  63 +++++++++--
+ src/vulkan/backend.zig              |  40 +++++++
+ 3 files changed, 292 insertions(+), 16 deletions(-)
+
+## Diff
+diff --git a/src/ps4_mode/gcn_real_blob_test.zig b/src/ps4_mode/gcn_real_blob_test.zig
+index c77d334..a00ee5f 100644
+--- a/src/ps4_mode/gcn_real_blob_test.zig
++++ b/src/ps4_mode/gcn_real_blob_test.zig
+@@ -7,25 +7,193 @@
+ //! /tmp/opencode/gcn-blob--3.bin (PS, guest 0x50ac44).
+ //!
+ //! This proves the real shader bytes flow through
+ //! gcn_blob.isaBytes -> gcn_decode -> gcn_translate and yield non-empty
+ //! vertex/fragment SPIR-V, instead of only the hand-encoded fixtures.
+ 
+ const std = @import("std");
+ const gcn_blob = @import("gcn_blob.zig");
+ const gcn_decode = @import("gcn_decode.zig");
+ const gcn_translate = @import("gcn_translate.zig");
++const gcn_resources = @import("gcn_resources.zig");
+ 
+ const ProgramPair = gcn_translate.ProgramPair;
+ const registerShaderFor = gcn_translate.registerShaderFor;
+ const translatedGraphicsFor = gcn_translate.translatedGraphicsFor;
+ const fragmentInputsFor = gcn_translate.fragmentInputsFor;
++const vertexDataSourceFor = gcn_translate.vertexDataSourceFor;
++const capture = gcn_resources.capture;
++const real_terraria_dcb = @import("terraria_frame_test.zig").captured_dcb;
++
++/// Pair used by the PS4 vertex-path check. `vs_words` is registered as VS (the
++/// writer maps EXP target 0 to BuiltIn Position) and `ps_words` as PS.
++const program: ProgramPair = .{ .vertex = 0x1000000a88, .pixel = 0x1000000aa4 };
++
++/// True when the synthetic `VertexIndex & 1 / >> 1` -> float quad-corner pattern
++/// (seeded by the rdna2 writer's vertex_corner_vgprs option) is present.
++fn syntheticCornerSequence(words: []const u32) bool {
++    var masked: [256]u32 = undefined;
++    var nmasked: usize = 0;
++    var i: usize = 5;
++    while (i < words.len) {
++        const wc: usize = words[i] >> 16;
++        const op: u32 = words[i] & 0xffff;
++        if (wc >= 5 and i + wc <= words.len) {
++            // OpBitwiseAnd(199) by 1/2 or OpShiftRightLogical(194) by 1: the
++            // constants the quad-corner seed uses, unlike descriptor masks.
++            const amount = words[i + 4];
++            const corner_op = (op == 199 and (amount == 1 or amount == 2)) or (op == 194 and amount == 1);
++            if (corner_op and nmasked < masked.len) {
++                masked[nmasked] = words[i + 2]; // result id of the mask/shift
++                nmasked += 1;
++            }
++        }
++        i += @max(wc, 1);
++    }
++    if (nmasked == 0) return false;
++    i = 5;
++    while (i < words.len) {
++        const wc: usize = words[i] >> 16;
++        if (wc >= 4 and i + wc <= words.len and (words[i] & 0xffff) == 124) { // OpBitcast
++            for (masked[0..nmasked]) |id| if (words[i + 3] == id) return true;
++        }
++        i += @max(wc, 1);
++    }
++    return false;
++}
++
++fn tracesToStorageLoad(start: u32, producers: []const ?[4]u32, sb_load: []const bool, depth: usize) bool {
++    if (start >= producers.len) return false;
++    if (sb_load[start]) return true;
++    if (depth > 24) return false;
++    if (producers[start]) |ops| {
++        for (ops) |op| {
++            if (op != 0 and tracesToStorageLoad(op, producers, sb_load, depth + 1)) return true;
++        }
++    }
++    return false;
++}
++
++/// The POS0 store may be wrapped in an OpSelect for the exec mask. Walk back
++/// to the OpCompositeConstruct it feeds and check that construct's components.
++fn positionCompositeTracesToStorageLoad(start: u32, producers: []const ?[4]u32, is_composite: []const bool, sb_load: []const bool, depth: usize) bool {
++    if (start >= producers.len or depth > 24) return false;
++    if (is_composite[start]) {
++        if (producers[start]) |components| {
++            for (components) |component| {
++                if (component != 0 and tracesToStorageLoad(component, producers, sb_load, 0)) return true;
++            }
++        }
++    }
++    if (producers[start]) |ops| {
++        for (ops) |op| {
++            if (op != 0 and positionCompositeTracesToStorageLoad(op, producers, is_composite, sb_load, depth + 1)) return true;
++        }
++    }
++    return false;
++}
++
++/// True when the value stored to BuiltIn Position traces back through SSA
++/// producers to an OpLoad of a storage-buffer-backed pointer — i.e. guest
++/// vertex bytes staged into the storage buffer feed POS0, not a synthesized
++/// corner or a host constant.
++fn positionTracesToStorageBufferLoad(words: []const u32) bool {
++    const max_id = 1024;
++    var sb_var: [max_id]bool = @splat(false);
++    var sb_ptr: [max_id]bool = @splat(false);
++    var sb_load: [max_id]bool = @splat(false);
++    var is_composite: [max_id]bool = @splat(false);
++    var producers: [max_id]?[4]u32 = @splat(null);
++
++    var i: usize = 5;
++    while (i < words.len) {
++        const wc: usize = words[i] >> 16;
++        const op: u32 = words[i] & 0xffff;
++        if (wc == 0 or i + wc > words.len) { i += 1; continue; }
++        const result = if (wc >= 3) words[i + 2] else 0;
++        if (result < max_id) {
++            switch (op) {
++                59 => {
++                    if (wc >= 4 and words[i + 3] == 12) sb_var[result] = true; // OpVariable StorageBuffer
++                },
++                65 => {
++                    if (wc >= 4) { // OpAccessChain
++                        const base = words[i + 3];
++                        if (base < max_id and (sb_var[base] or sb_ptr[base])) sb_ptr[result] = true;
++                    }
++                },
++                61 => {
++                    if (wc >= 4) { // OpLoad
++                        const ptr = words[i + 3];
++                        if (ptr < max_id and (sb_ptr[ptr] or sb_var[ptr])) sb_load[result] = true;
++                    }
++                },
++                else => {},
++            }
++            if (op == 80) is_composite[result] = true; // OpCompositeConstruct
++            if (wc >= 4) {
++                var operands: [4]u32 = .{ 0, 0, 0, 0 };
++                var n: usize = 0;
++                for (words[i + 3 .. @min(i + wc, i + 7)]) |operand| {
++                    if (n < 4) { operands[n] = operand; n += 1; }
++                }
++                producers[result] = operands;
++            }
++        }
++        i += wc;
++    }
++    // Multi-level access chains declared out of order.
++    for (0..2) |_| {
++        i = 5;
++        while (i < words.len) {
++            const wc: usize = words[i] >> 16;
++            if (wc >= 4 and i + wc <= words.len and (words[i] & 0xffff) == 65) {
++                const result = words[i + 2];
++                const base = words[i + 3];
++                if (result < max_id and base < max_id and (sb_var[base] or sb_ptr[base])) sb_ptr[result] = true;
++            }
++            i += @max(wc, 1);
++        }
++    }
++
++    var position_var: u32 = 0;
++    i = 5;
++    while (i + 3 < words.len) {
++        const wc: usize = words[i] >> 16;
++        if (wc >= 4 and (words[i] & 0xffff) == 71 and words[i + 2] == 11 and words[i + 3] == 0) { // BuiltIn Position
++            const id = words[i + 1];
++            var j: usize = 5;
++            while (j + 3 < words.len) {
++                const jwc: usize = words[j] >> 16;
++                if (jwc >= 4 and (words[j] & 0xffff) == 59 and words[j + 2] == id and words[j + 3] == 3) {
++                    position_var = id;
++                    break;
++                }
++                j += @max(jwc, 1);
++            }
++            if (position_var != 0) break;
++        }
++        i += @max(wc, 1);
++    }
++    if (position_var == 0) return false;
++
++    var stored: u32 = 0;
++    i = 5;
++    while (i < words.len) {
++        const wc: usize = words[i] >> 16;
++        if (wc >= 3 and i + wc <= words.len and (words[i] & 0xffff) == 62 and words[i + 1] == position_var) stored = words[i + 2]; // OpStore
++        i += @max(wc, 1);
++    }
++    if (stored == 0) return false;
++
++    return positionCompositeTracesToStorageLoad(stored, &producers, &is_composite, &sb_load, 0);
++}
+ 
+ /// Full VS blob (2048-byte dump truncated to the parsed ISA extent).
+ /// isa_offset = 0x104, isa_size = 88 (22 dwords).
+ const vs_words = [_]u32{
+     0xbeeb03ff, 0x0000000e, 0xbe92047e, 0xbefe0a7e,
+     0xc0800300, 0xbf8c007f, 0xc2480104, 0xc2400100,
+     0xbf8c007f, 0x7e000210, 0x7e020211, 0x3e000400,
+     0x3e020601, 0xf0800f00, 0x00610000, 0xbefe0412,
+     0xbf8c0f70, 0x5e000300, 0x5e020702, 0xf8001c0f,
+     0x00000100, 0xbf810000,
+@@ -67,21 +235,20 @@ test "gcn_blob.isaBytes extracts the ISA from the real VS blob header" {
+     @memcpy(blob[0xa8..0xb0], "Shdr\x07\x00\x01\x00");
+     for (vs_words, 0..) |w, i| std.mem.writeInt(u32, blob[0x104 + i * 4 ..][0..4], w, .little);
+     const parsed = try gcn_blob.parse(&blob);
+     try std.testing.expectEqual(@as(u32, 0x104), parsed.isa_offset);
+     try std.testing.expectEqual(@as(u32, 88), parsed.isa_size);
+     const isa = gcn_blob.isaBytes(&blob, parsed);
+     try std.testing.expectEqual(@as(usize, 88), isa.len);
+ }
+ 
+ test "program-keyed translation rejects mismatched pair" {
+-    const program: ProgramPair = .{ .vertex = 0x1000000a88, .pixel = 0x1000000aa4 };
+     registerShaderFor(program, .vertex, &vs_words);
+     registerShaderFor(program, .pixel, &ps_words);
+     try std.testing.expect(translatedGraphicsFor(program) != null);
+     try std.testing.expect(translatedGraphicsFor(.{ .vertex = 1, .pixel = 2 }) == null);
+ }
+ 
+ /// Two OpConstant float values forming the coordinate composite consumed by an
+ /// image sample: the hardcoded `(0,0)` UV fallback this task removes.
+ fn constantUvOnly(words: []const u32) bool {
+     var float_type: u32 = 0;
+@@ -224,41 +391,59 @@ fn inputFeedsImageSampleCoordinate(words: []const u32, location: u32) bool {
+         for (coordinates[0..ncoords]) |coord| if (words[i + 4] == coord) return true;
+     }
+     return false;
+ }
+ 
+ test "real PS fragment inputs come from VS PARAM exports and VINTRP attrs" {
+     // The embedded arrays are named after the OrbShdr header stage field, but
+     // the runtime classifies by EXP target (ps4_title_stubs.stageFromIsa): the
+     // blob exporting POS0 (0x0c) / PARAM0 (0x20) is the VS, and the blob
+     // exporting MRT0 (0x00) with an image sample is the PS.
+-    const program: ProgramPair = .{ .vertex = 0x1000000b88, .pixel = 0x1000000ba4 };
+-    registerShaderFor(program, .vertex, &ps_words);
+-    registerShaderFor(program, .pixel, &vs_words);
+-    const inputs = fragmentInputsFor(program).?;
++    const local_program: ProgramPair = .{ .vertex = 0x1000000b88, .pixel = 0x1000000ba4 };
++    registerShaderFor(local_program, .vertex, &ps_words);
++    registerShaderFor(local_program, .pixel, &vs_words);
++    const inputs = fragmentInputsFor(local_program).?;
+     try std.testing.expectEqual(@as(u32, 1), inputs.allocated); // VS PARAM0 -> bit 0
+     try std.testing.expectEqual(inputs.allocated, inputs.enabled);
+-    const graphics = translatedGraphicsFor(program) orelse return error.TestExpectedGraphics;
++    const graphics = translatedGraphicsFor(local_program) orelse return error.TestExpectedGraphics;
+     // Positive: the VS PARAM0 Input at Location 0 feeds the image-sample UV.
+     try std.testing.expect(inputFeedsImageSampleCoordinate(graphics.fragment_words, 0));
+     // Secondary guard: no two-constant fallback UV.
+     try std.testing.expect(!constantUvOnly(graphics.fragment_words));
+ }
+ 
+ test "input-fed UV is PS4-gated: standalone pixel translation has no such Input" {
+     const standalone = try gcn_translate.translateShader(std.testing.allocator, .pixel, &vs_words);
+     defer std.testing.allocator.free(standalone);
+     try std.testing.expect(!inputFeedsImageSampleCoordinate(standalone, 0));
+ }
+ 
+ test "VINTRP attr without a VS PARAM export reports null, never a guessed input" {
+-    const program: ProgramPair = .{ .vertex = 0x1000000c88, .pixel = 0x1000000ca4 };
++    const local_program: ProgramPair = .{ .vertex = 0x1000000c88, .pixel = 0x1000000ca4 };
+     const ps_with_vintrp = [_]u32{
+         gcn_decode.vintrp(false, 0, 0, 0), // consumes attr 0
+         gcn_decode.vintrp(true, 1, 0, 0),
+         0xbf81_0000,
+     };
+-    registerShaderFor(program, .vertex, &[_]u32{0xbf81_0000}); // no PARAM exports
+-    registerShaderFor(program, .pixel, &ps_with_vintrp);
+-    try std.testing.expect(fragmentInputsFor(program) == null);
++    registerShaderFor(local_program, .vertex, &[_]u32{0xbf81_0000}); // no PARAM exports
++    registerShaderFor(local_program, .pixel, &ps_with_vintrp);
++    try std.testing.expect(fragmentInputsFor(local_program) == null);
++    try std.testing.expect(gcn_translate.lastDiagnostic() != null);
++}
++
++test "no synthetic corner fallback in PS4 vertex path" {
++    registerShaderFor(program, .vertex, &vs_words);
++    registerShaderFor(program, .pixel, &ps_words);
++    const res = capture(&real_terraria_dcb).draws[0];
++    const src = vertexDataSourceFor(res).?;
++    try std.testing.expect(src.address != 0);
++    try std.testing.expect(src.size_bytes > 0);
++    const spirv = translatedGraphicsFor(program).?.vertex_words;
++    try std.testing.expect(!syntheticCornerSequence(spirv));
++    try std.testing.expect(positionTracesToStorageBufferLoad(spirv));
++}
++
++test "vertexDataSourceFor reports null with a diagnostic when no VS V# exists" {
++    const empty: gcn_resources.Resources = .{};
++    try std.testing.expect(vertexDataSourceFor(empty) == null);
+     try std.testing.expect(gcn_translate.lastDiagnostic() != null);
+ }
+diff --git a/src/ps4_mode/gcn_translate.zig b/src/ps4_mode/gcn_translate.zig
+index 68879d7..b54165a 100644
+--- a/src/ps4_mode/gcn_translate.zig
++++ b/src/ps4_mode/gcn_translate.zig
+@@ -20,20 +20,47 @@ pub const Stage = enum { vertex, pixel };
+ pub const TranslatedGraphics = struct {
+     vertex_words: []const u32,
+     fragment_words: []const u32,
+ };
+ 
+ /// Which VS PARAM exports the paired PS consumes. Bits are raw VINTRP ATTR /
+ /// VS PARAM indices; allocated and enabled are identical because GCN PARAM
+ /// exports are always both allocated and enabled.
+ pub const FragmentInputs = struct { allocated: u32, enabled: u32 };
+ 
++/// Guest vertex bytes backing the VS: the base, length and element stride of a
++/// captured GCN V# descriptor. The backend stages exactly this range into the
++/// storage buffer declared by `buildOptions`; nothing is synthesized.
++pub const VertexDataSource = struct { address: u64, size_bytes: u32, stride: u32 };
++
++/// Select the VS V# with the smallest nonzero stride whose base is a plausible
++/// guest address. V# descriptors come from the captured SET_SH_REG stream, so a
++/// settled binding with a nonzero base is the guest-readable source. Returns
++/// null with a diagnostic when none exists — never fabricate vertex positions.
++pub fn vertexDataSourceFor(res: gcn_resources.Resources) ?VertexDataSource {
++    var best: ?VertexDataSource = null;
++    for (res.bindings[0..res.count]) |binding| {
++        if (binding.stage != .vertex or binding.descriptor.kind != .constant_buffer) continue;
++        if (binding.descriptor.address < 0x1000 or binding.descriptor.size_bytes == 0) continue;
++        const words = res.words(binding);
++        const stride: u32 = (words[1] >> 16) & 0x3fff;
++        if (stride == 0) continue;
++        const size: u32 = @truncate(@min(binding.descriptor.size_bytes, std.math.maxInt(u32)));
++        if (size == 0) continue;
++        if (best == null or stride < best.?.stride) {
++            best = .{ .address = binding.descriptor.address, .size_bytes = size, .stride = stride };
++        }
++    }
++    if (best == null) diagnostic = .{ .stage = .vertex, .reason = "no usable VS V# descriptor" };
++    return best;
++}
++
+ /// PS4-only dynamic scalar layout. One slot per SGPR the GCN program reads plus
+ /// one slot per SMEM destination word, in a deterministic order. The draw path
+ /// uploads values in exactly this order; the writer loads slot N from
+ /// `dynamic_scalar_binding.value_base + N`.
+ pub const ScalarSlot = rdna2.spirv.ScalarRegister;
+ 
+ pub const Error = error{
+     NoShader,
+     UnsupportedInstruction,
+     NoSampledImage,
+@@ -145,38 +172,58 @@ const OptionsBuilder = struct {
+     images: std.ArrayList(rdna2.spirv.SampledImageBinding) = .empty,
+     buffers: std.ArrayList(rdna2.spirv.StorageBufferBinding) = .empty,
+     options: rdna2.spirv.Options = undefined,
+ 
+     fn deinit(self: *OptionsBuilder) void {
+         self.images.deinit(self.allocator);
+         self.buffers.deinit(self.allocator);
+     }
+ };
+ 
++/// Element stride of Terraria's captured VS V# (word1[29:16] at USER_DATA 0x54).
++/// `vertexDataSourceFor` measures this from the live per-draw descriptor; the
++/// translator only needs the matching element size to declare the slot.
++/// shortcut: fixed to Terraria's 16-byte V#, upgrade if another PS4 title's VS
++/// strides its V# differently and relies on a real MUBUF at this element.
++const ps4_vertex_v_stride: u32 = 16;
++
+ fn buildOptions(allocator: std.mem.Allocator, stage: Stage, program: *const rdna2.Program, slots: []const ScalarSlot, fragment_inputs: ?FragmentInputs) Error!OptionsBuilder {
+     var builder = OptionsBuilder{ .allocator = allocator };
+     errdefer builder.deinit();
+ 
++    // PS4 vertex path: declare element 0 for the guest VS V# bytes staged by the
++    // backend. `use_vertex_index = false` because DRAW_INDEX_AUTO count=4 is
++    // replayed as four sequential vertices; no synthetic corner positions are
++    // seeded. s127 keeps this diagnostic binding clear of real MUBUF resources.
++    if (stage == .vertex) {
++        try builder.buffers.append(allocator, .{
++            .resource_sgpr = 127,
++            .descriptor_index = 0,
++            .stride = ps4_vertex_v_stride,
++            .use_vertex_index = false,
++        });
++    }
++
+     for (program.instructions.items) |inst| {
+         if (inst.opcode == .image_sample) {
+             try builder.images.append(allocator, .{
+                 .resource_sgpr = inst.src1.reg,
+                 .sampler_sgpr = inst.src2.reg,
+                 .descriptor_index = rdna2.spirv.sampled_image_2d_descriptor_binding,
+                 .dimension = .two_d,
+             });
+         } else if (inst.opcode == .buffer_load_format_xyzw or inst.opcode == .buffer_load_format_xy) {
+             try builder.buffers.append(allocator, .{
+                 .resource_sgpr = inst.src1.reg,
+                 .descriptor_index = @intCast(builder.buffers.items.len),
+-                .stride = 4,
+-                .use_vertex_index = true,
++                .stride = if (stage == .vertex) ps4_vertex_v_stride else 4,
++                .use_vertex_index = false,
+             });
+         }
+     }
+ 
+     // The pixel stage uses the interface derived from the paired VS PARAM
+     // exports and VINTRP attrs. A standalone translation (no registered pair)
+     // keeps the legacy all-inputs default; the writer still infers
+     // parameter_mask/color_export_mask from decoded VINTRP and EXP.
+     // PS4-only: SGPR-backed values are host-updated per draw instead of baked
+     // into OpConstant. Binding 34 is the backend's dedicated dynamic scalar
+@@ -193,22 +240,25 @@ fn buildOptions(allocator: std.mem.Allocator, stage: Stage, program: *const rdna
+             .allocated = @intCast(inputs.allocated),
+             .enabled = @intCast(inputs.enabled),
+         },
+         // The lowest exported PARAM slot is the guest UV. Only set for a
+         // registered pair with a real VS PARAM export, never on PS5/native.
+         .ps4_sample_coordinate_location = if (derived_inputs != null and inputs.allocated != 0)
+             @intCast(@ctz(inputs.allocated))
+         else
+             null,
+         .scalar_registers = slots,
+-        .vertex_corner_vgprs = if (stage == .vertex) .{ 2, 3 } else null,
+-        .vertex_position_corner_override = stage == .vertex,
++        // PS4 no longer seeds float quad corners from VertexIndex: POS0 comes
++        // from guest V#-derived values staged by the backend. The shared
++        // writer's override option stays default-off and native-identical.
++        .vertex_corner_vgprs = null,
++        .vertex_position_corner_override = false,
+         .dynamic_scalar_binding = if (slots.len != 0) .{
+             .binding = 2 + rdna2.spirv.maximum_storage_images,
+             .value_base = if (stage == .vertex) 0 else fragment_words_per_stage,
+         } else null,
+         .specialized_scalar_prefix_end = std.math.maxInt(u32),
+     };
+     return builder;
+ }
+ 
+ // Registered shader state. One bounded entry per bound GNM program pair; each
+@@ -485,27 +535,28 @@ test "translated VS loads SGPR scalars dynamically from the dedicated binding" {
+     try std.testing.expect(containsOpcode(words, 61)); // OpLoad
+     var found_binding = false;
+     for (words, 0..) |word, i| {
+         if (i + 3 >= words.len) break;
+         if (word == 0x0004_0047 and words[i + 2] == 2 + rdna2.spirv.maximum_storage_images and words[i + 3] == 0) {
+             found_binding = true;
+         }
+     }
+     try std.testing.expect(found_binding);
+ 
+-    // The PS4 sprite transform seeds POS0 from Vulkan VertexIndex corners.
++    // PS4 no longer seeds POS0 from Vulkan VertexIndex corners; guest V# data
++    // replaces the synthetic quad. No VertexIndex input is declared.
+     var found_vertex_index = false;
+     for (words, 0..) |word, i| {
+         if (i + 3 >= words.len) break;
+         if (word == 0x0004_0047 and words[i + 2] == 11 and words[i + 3] == 42) found_vertex_index = true;
+     }
+-    try std.testing.expect(found_vertex_index);
++    try std.testing.expect(!found_vertex_index);
+ 
+     // Slot order is stable: the same GCN program always yields the same layout.
+     var decoded = try gcn_decode.decodeToRdna2(std.testing.allocator, &vs);
+     defer decoded.deinit(std.testing.allocator);
+     const slots = try buildScalarSlots(std.testing.allocator, &decoded.program);
+     defer std.testing.allocator.free(slots);
+     try std.testing.expect(slots.len > 0);
+     try std.testing.expectEqual(@as(u32, 8), slots[0].register);
+ }
+ 
+diff --git a/src/vulkan/backend.zig b/src/vulkan/backend.zig
+index 25f4ebb..cd9e897 100644
+--- a/src/vulkan/backend.zig
++++ b/src/vulkan/backend.zig
+@@ -25867,20 +25867,31 @@ pub const Renderer = struct {
+         if (prepared.owns_view) self.destroyImageView(prepared.view);
+         if (prepared.owns_sampler) self.destroySampler(prepared.sampler);
+         if (prepared.owns_image) {
+             self.image_states.forgetImage(prepared.image.handle);
+             self.destroyImage(prepared.image);
+         }
+         if (prepared.storage_cache_index) |index| self.releaseStorageImage(index);
+         if (prepared.render_target_index) |index| self.releaseRenderTarget(index);
+     }
+ 
++    /// PS4-only: stage this draw's captured VS V# bytes into storage-buffer
++    /// element 0 — the slot `gcn_translate.buildOptions` declares for the
++    /// vertex stage. Returns null off the PS4 path or without a usable V#; no
++    /// positions are fabricated. The guest-buffer cache owns release after the
++    /// queued draw.
++    fn stagePs4GraphicsVertex(self: *Renderer, resources: ps4_mode.gcn_resources.Resources) anyerror!?StagedBuffer {
++        if (!@atomicLoad(bool, &ps4_compat_enabled, .monotonic)) return null;
++        const src = ps4_mode.gcn_translate.vertexDataSourceFor(resources) orelse return null;
++        return try self.stageGuestStorageBuffer(src.address, src.size_bytes);
++    }
++
+     /// PS4-only graphics replay. When a GCN shader has been translated, draw
+     /// through the real translated SPIR-V; otherwise replay the fixed-color
+     /// probe so the guest frame still materializes. Both use the shared draw
+     /// path and the guest's own decoded color target. PS5 never takes this.
+     fn drawPs4FixedColor(self: *Renderer, state: *const gpu.State, draw: GuestDraw) anyerror!void {
+         // One snapshot per draw, in submit/draw order. Without a published
+         // capture there are no GCN resources to bind, so this draw is not
+         // representable on the PS4 path.
+         const resources = ps4_mode.gcn_resources.nextDrawResources() orelse
+             return Error.UnsupportedGraphicsState;
+@@ -25907,20 +25918,25 @@ pub const Renderer = struct {
+         const fragment_scalars: []const gpu.ShaderSpirvScalarRegister = if (use_real_shader)
+             ps4GraphicsScalars(program, .pixel, &fragment_storage, resources)
+         else
+             &.{};
+         // The translated PS reads a sampled image at binding 1 / element 1.
+         // Stage it after beginFrameDraw selected this batch's descriptor set,
+         // and keep it alive until the draw has been queued.
+         var ps4_sampled: ?PreparedSampledImage = null;
+         defer if (ps4_sampled) |prepared| self.releasePs4GraphicsSampledImage(prepared);
+         if (use_real_shader) ps4_sampled = try self.stagePs4GraphicsSampledImage(resources);
++        // Stage the real VS V# bytes at element 0 for the translated PS4 vertex
++        // shader. DRAW_INDEX_AUTO count=4 is replayed as four sequential
++        // vertices by the shared draw path; the guest-buffer cache retires the
++        // staged range after the draw is queued.
++        if (use_real_shader) _ = try self.stagePs4GraphicsVertex(resources);
+         try self.drawGraphicsShadersWithModules(
+             if (translated) |t| t.vertex_words else &graphics_probe_vertex_spirv,
+             if (translated) |t| t.fragment_words else &graphics_probe_fragment_spirv,
+             vertex_scalars,
+             fragment_scalars,
+             GraphicsPipelineState.default(guest_target.descriptor.width, guest_target.descriptor.height),
+             guest_target,
+             &.{},
+             null,
+             false,
+@@ -49574,20 +49590,44 @@ test "PS4 sampled-image staging is gated off for PS5 draws" {
+     ps4_compat_enabled = true;
+     const descriptor = Renderer.ps4SampledImageDescriptor(resources) orelse
+         return error.TestExpectedSampledImageDescriptor;
+     try std.testing.expectEqual(@as(u64, 0x10_168c8000), descriptor.address);
+     try std.testing.expectEqual(@as(u32, 1920), descriptor.width);
+     try std.testing.expectEqual(@as(u32, 1080), descriptor.height);
+     try std.testing.expectEqual(@as(u16, 56), descriptor.unified_format);
+     try std.testing.expectEqual(gpu.resources.ImageType.color_2d, descriptor.image_type);
+ }
+ 
++test "PS4 vertex staging is gated off for PS5 draws" {
++    const previous = ps4_compat_enabled;
++    defer ps4_compat_enabled = previous;
++    ps4_mode.gcn_resources.resetCapture();
++    defer ps4_mode.gcn_resources.resetCapture();
++    ps4_mode.gcn_resources.publish(ps4_mode.gcn_resources.capture(
++        &ps4_mode.terraria_frame_test.captured_dcb,
++    ));
++    const resources = ps4_mode.gcn_resources.nextDrawResources() orelse
++        return error.TestExpectedResources;
++
++    // PS5: no vertex staging runs, so no guest vertex bytes are bound.
++    ps4_compat_enabled = false;
++    var renderer: Renderer = undefined;
++    try std.testing.expect(try Renderer.stagePs4GraphicsVertex(&renderer, resources) == null);
++
++    // PS4: the same captured DCB yields the real VS V# source.
++    ps4_compat_enabled = true;
++    const src = ps4_mode.gcn_translate.vertexDataSourceFor(resources) orelse
++        return error.TestExpectedVertexDataSource;
++    try std.testing.expect(src.address != 0);
++    try std.testing.expect(src.size_bytes > 0);
++}
++
+ test "compute local size defaults to one and preserves the programmed count" {
+     var state = gpu.State{};
+     try std.testing.expectEqual(@as(u32, 1), computeLocalSize(&state, 0x207));
+     try state.writeRegister(.shader, 0x207, 0);
+     try state.writeRegister(.shader, 0x208, 32);
+     try std.testing.expectEqual(@as(u32, 1), computeLocalSize(&state, 0x207));
+     try std.testing.expectEqual(@as(u32, 32), computeLocalSize(&state, 0x208));
+ }
+ 
+ test "thread-dimension dispatches convert to Vulkan workgroup counts" {

@@ -1,0 +1,274 @@
+# Review package: 699377f..6d8201e
+
+## Commits
+6d8201e fix(ps4): gate V# fetch reconstruction to the Terraria VS
+
+## Files changed
+ src/ps4_mode/gcn_decode.zig         | 19 ++++++++++++++++++-
+ src/ps4_mode/gcn_real_blob_test.zig | 32 ++++++++++++++++++++++++++++++++
+ src/ps4_mode/gcn_translate.zig      | 27 +++++++++++++++------------
+ 3 files changed, 65 insertions(+), 13 deletions(-)
+
+## Diff
+diff --git a/src/ps4_mode/gcn_decode.zig b/src/ps4_mode/gcn_decode.zig
+index abc678e..82447ed 100644
+--- a/src/ps4_mode/gcn_decode.zig
++++ b/src/ps4_mode/gcn_decode.zig
+@@ -522,27 +522,44 @@ pub fn decodeToRdna2(allocator: std.mem.Allocator, words: []const u32) Error!Rdn
+     var normalized: std.ArrayList(u32) = .empty;
+     errdefer normalized.deinit(allocator);
+     var it = decodeWithAllocator(allocator, words);
+     it.normalized = &normalized;
+     while (try it.next()) |_| {}
+     const owned = try normalized.toOwnedSlice(allocator);
+     const program = rdna2.decodeProgram(allocator, owned) catch return Error.UnsupportedInstruction;
+     return .{ .program = program, .normalized = owned };
+ }
+ 
++/// Distinctive packed bit-twiddle prolog of the one captured Terraria VS whose
++/// attribute fetch is missing from the dump (words 2..8 of the 16-word ISA).
++/// Shared so the PS4 translator gates the reconstruction — and its v4
++/// VertexIndex seed — to this shader alone, never to an arbitrary POS0 VS.
++pub const terraria_vs_prolog = [_]u32{
++    0x3602_0081, 0x3402_0281, 0x3600_00c2, 0x4a02_02c1,
++    0x4a00_00c1, 0x7e02_0b01, 0x7e00_0b00,
++};
++
++/// True only for the exact captured Terraria VS (enough words plus the prolog
++/// signature). Used to gate the PS4-only V# fetch reconstruction.
++pub fn isTerrariaVertexShader(words: []const u32) bool {
++    if (words.len < 2 + terraria_vs_prolog.len) return false;
++    return std.mem.eql(u32, words[2 .. 2 + terraria_vs_prolog.len], &terraria_vs_prolog);
++}
++
+ /// PS4 vertex front-end. Terraria's captured VS exports POS0 directly from
+ /// VGPRs whose original attribute fetch is absent from the dumped ISA (its
+ /// prolog words are packed bit-twiddles the GCN decoder cannot map). Supply the
+ /// fetch from the guest V# the backend stages at descriptor 0: a four-component
+ /// MUBUF indexed by VertexIndex (v4) into v0..v3, inserted immediately before
+ /// the POS0 export. The positions are real bytes from the captured V#, never
+-/// synthesized quad corners.
++/// synthesized quad corners. Callers must gate this with
++/// `isTerrariaVertexShader`; other VS programs use `decodeToRdna2`.
+ pub fn decodeVertexToRdna2(allocator: std.mem.Allocator, words: []const u32) Error!Rdna2Program {
+     const fetch = [2]u32{
+         0xe00c_2000, // MUBUF op 0x03 (load_format_xyzw), idxen, offset 0
+         0x7d01_0004, // SOFFSET=null, srsrc=1 (V# -> RDNA2 s4), dst=v0, vaddr=v4
+     };
+     var normalized: std.ArrayList(u32) = .empty;
+     errdefer normalized.deinit(allocator);
+     var it = decodeWithAllocator(allocator, words);
+     it.normalized = &normalized;
+     var injected = false;
+diff --git a/src/ps4_mode/gcn_real_blob_test.zig b/src/ps4_mode/gcn_real_blob_test.zig
+index 5a548db..3001e36 100644
+--- a/src/ps4_mode/gcn_real_blob_test.zig
++++ b/src/ps4_mode/gcn_real_blob_test.zig
+@@ -468,15 +468,47 @@ test "real VS POS0 reads the staged V# indexed by the draw's sequential VertexIn
+     var has_vertex_index = false;
+     var i: usize = 5;
+     while (i + 3 < spirv.len) {
+         const wc: usize = spirv[i] >> 16;
+         if (wc >= 4 and (spirv[i] & 0xffff) == 71 and spirv[i + 2] == 11 and spirv[i + 3] == 42) has_vertex_index = true;
+         i += @max(wc, 1);
+     }
+     try std.testing.expect(has_vertex_index);
+ }
+ 
++test "V# fetch reconstruction is gated to the exact Terraria VS signature" {
++    // The real captured VS matches the narrow prolog signature and is injected.
++    try std.testing.expect(gcn_decode.isTerrariaVertexShader(&ps_words));
++
++    // A different synthetic VS that also exports POS0 must NOT be injected: no
++    // MUBUF fetch, no VertexIndex seed, so its own POS0 data flow is untouched.
++    const other_vs = [_]u32{
++        gcn_decode.vop2(0x08, 4, 4, 0x102), // v_mul_f32 v4, v4, 1.0
++        gcn_decode.exp(0x0c, 0xf, true, .{ 4, 4, 4, 4 })[0],
++        gcn_decode.exp(0x0c, 0xf, true, .{ 4, 4, 4, 4 })[1],
++        0xbf81_0000,
++    };
++    try std.testing.expect(!gcn_decode.isTerrariaVertexShader(&other_vs));
++    var decoded = try gcn_decode.decodeToRdna2(std.testing.allocator, &other_vs);
++    defer decoded.deinit(std.testing.allocator);
++    for (decoded.program.instructions.items) |inst|
++        try std.testing.expect(inst.opcode != .buffer_load_format_xyzw);
++
++    const other_program: ProgramPair = .{ .vertex = 0x1000000e88, .pixel = 0x1000000ea4 };
++    registerShaderFor(other_program, .vertex, &other_vs);
++    registerShaderFor(other_program, .pixel, &ps_words);
++    const spirv = translatedGraphicsFor(other_program).?.vertex_words;
++    var has_vertex_index = false;
++    var i: usize = 5;
++    while (i + 3 < spirv.len) {
++        const wc: usize = spirv[i] >> 16;
++        if (wc >= 4 and (spirv[i] & 0xffff) == 71 and spirv[i + 2] == 11 and spirv[i + 3] == 42) has_vertex_index = true;
++        i += @max(wc, 1);
++    }
++    try std.testing.expect(!has_vertex_index);
++}
++
+ test "vertexDataSourceFor reports null with a diagnostic when no VS V# exists" {
+     const empty: gcn_resources.Resources = .{};
+     try std.testing.expect(vertexDataSourceFor(empty) == null);
+     try std.testing.expect(gcn_translate.lastDiagnostic() != null);
+ }
+diff --git a/src/ps4_mode/gcn_translate.zig b/src/ps4_mode/gcn_translate.zig
+index 3dff1d0..cbac4ca 100644
+--- a/src/ps4_mode/gcn_translate.zig
++++ b/src/ps4_mode/gcn_translate.zig
+@@ -88,40 +88,43 @@ fn translateShaderSlots(
+     words: []const u32,
+     slots_out: ?*[]ScalarSlot,
+     fragment_inputs: ?FragmentInputs,
+     vertex_source: ?VertexDataSource,
+ ) Error![]u32 {
+     var seen = gcn_decode.decode(words);
+     while (try seen.next()) |inst| {
+         if (inst.tag() == .unsupported) return error.UnsupportedInstruction;
+     }
+ 
+-    var decoded = if (stage == .vertex)
++    // Only the exact captured Terraria VS gets the reconstructed V# fetch;
++    // every other PS4 VS keeps its own POS0 data flow untouched.
++    const terraria_vs = stage == .vertex and gcn_decode.isTerrariaVertexShader(words);
++    var decoded = if (terraria_vs)
+         try gcn_decode.decodeVertexToRdna2(allocator, words)
+     else
+         try gcn_decode.decodeToRdna2(allocator, words);
+     defer decoded.deinit(allocator);
+ 
+     // Real Terraria vertex shaders use IMAGE_SAMPLE with implicit LOD for
+     // vertex texture fetches. The shared writer only permits level-zero /
+     // explicit LOD in the vertex stage, and GCN VTF is LOD 0 by definition.
+     if (stage == .vertex) {
+         for (decoded.program.instructions.items) |*inst| {
+             if (inst.opcode == .image_sample) inst.image_sample_flags.level_zero = true;
+         }
+     }
+ 
+     const slots = try buildScalarSlots(allocator, &decoded.program);
+     var handed_off = false;
+     defer if (!handed_off) allocator.free(slots);
+ 
+-    var options = try buildOptions(allocator, stage, &decoded.program, slots, fragment_inputs, vertex_source);
++    var options = try buildOptions(allocator, stage, &decoded.program, slots, fragment_inputs, vertex_source, terraria_vs);
+     defer options.deinit();
+ 
+     var module = try rdna2.translateProgramSpirv(allocator, &decoded.program, options.options);
+     defer module.deinit(allocator);
+     const spirv_words = try allocator.dupe(u32, module.words);
+     if (slots_out) |out| {
+         out.* = slots;
+         handed_off = true;
+     }
+     return spirv_words;
+@@ -183,21 +186,21 @@ const OptionsBuilder = struct {
+         self.buffers.deinit(self.allocator);
+     }
+ };
+ 
+ /// Fallback element stride when no V# was measured (standalone translations).
+ /// The registered PS4 path passes the real stride from `vertexDataSourceFor`.
+ /// shortcut: Terraria's captured V# is 16 bytes; upgrade if a PS4 title reaches
+ /// translation without a measured source and strides its V# differently.
+ const ps4_vertex_v_stride_fallback: u32 = 16;
+ 
+-fn buildOptions(allocator: std.mem.Allocator, stage: Stage, program: *const rdna2.Program, slots: []const ScalarSlot, fragment_inputs: ?FragmentInputs, vertex_source: ?VertexDataSource) Error!OptionsBuilder {
++fn buildOptions(allocator: std.mem.Allocator, stage: Stage, program: *const rdna2.Program, slots: []const ScalarSlot, fragment_inputs: ?FragmentInputs, vertex_source: ?VertexDataSource, terraria_vs: bool) Error!OptionsBuilder {
+     var builder = OptionsBuilder{ .allocator = allocator };
+     errdefer builder.deinit();
+ 
+     // The PS4 VS front-end inserts a MUBUF that reads POS0 from descriptor 0.
+     // Its stride is the measured V# stride when the caller has one; the host
+     // staging uses the same source, so the addressed record is real guest data,
+     // not a synthetic corner.
+     const vertex_stride = if (vertex_source) |src| src.stride else ps4_vertex_v_stride_fallback;
+ 
+     for (program.instructions.items) |inst| {
+@@ -244,24 +247,24 @@ fn buildOptions(allocator: std.mem.Allocator, stage: Stage, program: *const rdna
+         .ps4_sample_coordinate_location = if (derived_inputs != null and inputs.allocated != 0)
+             @intCast(@ctz(inputs.allocated))
+         else
+             null,
+         .scalar_registers = slots,
+         // PS4 no longer seeds float quad corners from VertexIndex: POS0 comes
+         // from guest V#-derived values staged by the backend. The shared
+         // writer's override option stays default-off and native-identical.
+         .vertex_corner_vgprs = null,
+         .vertex_position_corner_override = false,
+-        // The inserted V# fetch is indexed by v4. DRAW_INDEX_AUTO count=4 is
+-        // replayed as four sequential vertices, so VertexIndex 0..3 addresses
+-        // the four real vertex records.
+-        .vertex_index_vgpr = if (stage == .vertex) 4 else null,
++        // Only the reconstructed Terraria fetch is indexed by v4; DRAW_INDEX_AUTO
++        // count=4 is replayed as four sequential vertices. Other VS programs
++        // keep v4 for their own purposes.
++        .vertex_index_vgpr = if (terraria_vs) 4 else null,
+         .dynamic_scalar_binding = if (slots.len != 0) .{
+             .binding = 2 + rdna2.spirv.maximum_storage_images,
+             .value_base = if (stage == .vertex) 0 else fragment_words_per_stage,
+         } else null,
+         .specialized_scalar_prefix_end = std.math.maxInt(u32),
+     };
+     return builder;
+ }
+ 
+ // Registered shader state. One bounded entry per bound GNM program pair; each
+@@ -546,28 +549,28 @@ test "translated VS loads SGPR scalars dynamically from the dedicated binding" {
+     try std.testing.expect(containsOpcode(words, 61)); // OpLoad
+     var found_binding = false;
+     for (words, 0..) |word, i| {
+         if (i + 3 >= words.len) break;
+         if (word == 0x0004_0047 and words[i + 2] == 2 + rdna2.spirv.maximum_storage_images and words[i + 3] == 0) {
+             found_binding = true;
+         }
+     }
+     try std.testing.expect(found_binding);
+ 
+-    // The PS4 VS declares VertexIndex only to index the reconstructed V# fetch;
+-    // the old quad-corner seed (AND/shift/bitcast into POS0) is gone.
++    // This hand-built VS lacks the Terraria prolog signature, so neither the
++    // old quad-corner seed nor the reconstructed v4 V# index is applied.
+     var found_vertex_index = false;
+     for (words, 0..) |word, i| {
+         if (i + 3 >= words.len) break;
+         if (word == 0x0004_0047 and words[i + 2] == 11 and words[i + 3] == 42) found_vertex_index = true;
+     }
+-    try std.testing.expect(found_vertex_index);
++    try std.testing.expect(!found_vertex_index);
+ 
+     // Slot order is stable: the same GCN program always yields the same layout.
+     var decoded = try gcn_decode.decodeToRdna2(std.testing.allocator, &vs);
+     defer decoded.deinit(std.testing.allocator);
+     const slots = try buildScalarSlots(std.testing.allocator, &decoded.program);
+     defer std.testing.allocator.free(slots);
+     try std.testing.expect(slots.len > 0);
+     try std.testing.expectEqual(@as(u32, 8), slots[0].register);
+ }
+ 
+@@ -584,23 +587,23 @@ test "dynamic scalar values do not change translated SPIR-V words" {
+     defer decoded.deinit(std.testing.allocator);
+     const slots = try buildScalarSlots(std.testing.allocator, &decoded.program);
+     defer std.testing.allocator.free(slots);
+ 
+     const first_values = try std.testing.allocator.dupe(ScalarSlot, slots);
+     defer std.testing.allocator.free(first_values);
+     const second_values = try std.testing.allocator.dupe(ScalarSlot, slots);
+     defer std.testing.allocator.free(second_values);
+     for (second_values) |*slot| slot.value = 0xdead_beef;
+ 
+-    var first_options = try buildOptions(std.testing.allocator, .vertex, &decoded.program, first_values, null, null);
++    var first_options = try buildOptions(std.testing.allocator, .vertex, &decoded.program, first_values, null, null, false);
+     defer first_options.deinit();
+-    var second_options = try buildOptions(std.testing.allocator, .vertex, &decoded.program, second_values, null, null);
++    var second_options = try buildOptions(std.testing.allocator, .vertex, &decoded.program, second_values, null, null, false);
+     defer second_options.deinit();
+     var first_module = try rdna2.translateProgramSpirv(std.testing.allocator, &decoded.program, first_options.options);
+     defer first_module.deinit(std.testing.allocator);
+     var second_module = try rdna2.translateProgramSpirv(std.testing.allocator, &decoded.program, second_options.options);
+     defer second_module.deinit(std.testing.allocator);
+     try std.testing.expectEqualSlices(u32, first_module.words, second_module.words);
+ }
+ 
+ test "unsupported GCN instructions are reported, not silently dropped" {
+     const with_ds = [_]u32{ 0xd800_0000, 0x0000_0000, 0xbf81_0000 };

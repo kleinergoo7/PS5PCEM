@@ -1,0 +1,149 @@
+# Review package: eaae3a3..HEAD
+
+## Commits
+d838101 feat(ps4_mode): add PS4-only wrapper hit counters
+
+## Files changed
+ src/ps4_mode/hits.zig | 93 +++++++++++++++++++++++++++++++++++++++++++++++++++
+ src/ps4_mode/root.zig |  2 ++
+ 2 files changed, 95 insertions(+)
+
+## Diff
+diff --git a/src/ps4_mode/hits.zig b/src/ps4_mode/hits.zig
+new file mode 100644
+index 0000000..cc66a9a
+--- /dev/null
++++ b/src/ps4_mode/hits.zig
+@@ -0,0 +1,93 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++// Copyright (C) 2026 kleinergoo7
++
++//! PS4-only wrapper hit counters.
++//!
++//! Every new PS4 wrapper/stub records its own name; `report` renders the
++//! accumulated counts for the PS5_GNM_DIAG diagnostics gate. Kept here so the
++//! PS5 instrumentation in src/hle/trace.zig stays untouched. Names are borrowed
++//! static strings, the same way a trace thunk borrows its entry-point name.
++
++const std = @import("std");
++const game_hook = @import("game_hook.zig");
++
++/// How many distinct wrapper names can be counted at once. Enough for a title's
++/// MISS set while staying a few cache lines of fixed storage.
++pub const capacity: usize = 128;
++
++const Slot = struct {
++    name: []const u8 = &.{},
++    count: u64 = 0,
++};
++
++var slots: [capacity]Slot = [_]Slot{.{}} ** capacity;
++
++/// Recording is gated by PS5_GNM_DIAG: game_run seeds that flag into
++/// `game_hook` before any PS4 wrapper runs. Read once on first use; `setEnabled`
++/// overrides it (tests, or a caller that already parsed the flag).
++var enabled: ?bool = null;
++
++fn isEnabled() bool {
++    return enabled orelse blk: {
++        const on = game_hook.configFromEnv().diag;
++        enabled = on;
++        break :blk on;
++    };
++}
++
++pub fn setEnabled(value: bool) void {
++    enabled = value;
++}
++
++/// Count one hit of `name`. Empty names are ignored; a new name claims the next
++/// free slot. Beyond capacity the hit is dropped rather than displacing data.
++pub fn record(name: []const u8) void {
++    if (name.len == 0 or !isEnabled()) return;
++    for (&slots) |*slot| {
++        if (std.mem.eql(u8, slot.name, name)) {
++            slot.count +%= 1;
++            return;
++        }
++    }
++    for (&slots) |*slot| {
++        if (slot.name.len == 0) {
++            slot.name = name;
++            slot.count = 1;
++            return;
++        }
++    }
++}
++
++/// Render one `"<name> <count>\n"` line per non-empty slot into `buf`, returning
++/// the bytes written. Stops cleanly when `buf` runs out of room.
++pub fn report(buf: []u8) []const u8 {
++    var used: usize = 0;
++    for (slots) |slot| {
++        if (slot.name.len == 0) continue;
++        const line = std.fmt.bufPrint(buf[used..], "{s} {d}\n", .{ slot.name, slot.count }) catch break;
++        used += line.len;
++    }
++    return buf[0..used];
++}
++
++/// Forget all counts so a later report starts from an empty table.
++pub fn reset() void {
++    for (&slots) |*slot| slot.* = .{};
++}
++
++test "two records of one name report count 2, and reset clears it" {
++    setEnabled(true);
++    defer reset();
++
++    reset();
++    record("sceKernelAllocateMemory");
++    record("sceKernelAllocateMemory");
++
++    var buf: [512]u8 = undefined;
++    const text = report(&buf);
++    try std.testing.expect(std.mem.indexOf(u8, text, "sceKernelAllocateMemory 2") != null);
++
++    reset();
++    const cleared = report(&buf);
++    try std.testing.expect(std.mem.indexOf(u8, cleared, "sceKernelAllocateMemory") == null);
++}
+diff --git a/src/ps4_mode/root.zig b/src/ps4_mode/root.zig
+index 3a7ef9e..7693800 100644
+--- a/src/ps4_mode/root.zig
++++ b/src/ps4_mode/root.zig
+@@ -24,20 +24,21 @@ pub const gpu_translate = @import("gpu_translate.zig");
+ pub const patches = @import("patches.zig");
+ pub const trophy = @import("trophy.zig");
+ pub const video_out = @import("video_out.zig");
+ pub const driver_packets = @import("driver_packets.zig");
+ pub const launch = @import("launch.zig");
+ pub const bridge = @import("bridge.zig");
+ pub const gcn_lower = @import("gcn_lower.zig");
+ pub const audio_np = @import("audio_np.zig");
+ pub const submit = @import("submit.zig");
+ pub const game_hook = @import("game_hook.zig");
++pub const hits = @import("hits.zig");
+ 
+ pub const Mode = detector.Mode;
+ pub const Session = runtime.Session;
+ pub const Config = runtime.Config;
+ 
+ /// One-line summary for `--version`-style diagnostics and logs.
+ pub fn describe() []const u8 {
+     return "ps4_mode: GNM/GCN compat (detect+sfo, shader headers, packet translation, tiling, hle table, session)";
+ }
+ 
+@@ -54,11 +55,12 @@ test {
+     _ = patches;
+     _ = trophy;
+     _ = video_out;
+     _ = driver_packets;
+     _ = launch;
+     _ = bridge;
+     _ = gcn_lower;
+     _ = audio_np;
+     _ = submit;
+     _ = game_hook;
++    _ = hits;
+ }

@@ -1,0 +1,340 @@
+# Review package: b6f7e4c..a758925
+
+## Commits
+a758925 fix(ps4): route real-PS sample UV through declared VS PARAM input
+
+## Files changed
+ src/ps4_mode/gcn_real_blob_test.zig | 101 ++++++++++++++++++++++++++++++++++++
+ src/ps4_mode/gcn_translate.zig      |  12 +++--
+ src/rdna2/spirv.zig                 |  33 ++++++++++++
+ 3 files changed, 142 insertions(+), 4 deletions(-)
+
+## Diff
+diff --git a/src/ps4_mode/gcn_real_blob_test.zig b/src/ps4_mode/gcn_real_blob_test.zig
+index 7d031bb..c77d334 100644
+--- a/src/ps4_mode/gcn_real_blob_test.zig
++++ b/src/ps4_mode/gcn_real_blob_test.zig
+@@ -127,35 +127,136 @@ fn constantUvOnly(words: []const u32) bool {
+ 
+     for (words, 0..) |word, i| {
+         const op = word & 0xffff;
+         if ((op != 87 and op != 88) or i + 4 >= words.len) continue; // image sample
+         const coordinate = words[i + 4];
+         for (composites[0..ncomp]) |composite| if (composite == coordinate) return true;
+     }
+     return false;
+ }
+ 
++/// Positive guest-UV check: an Input at `location` is declared, its X/Y are
++/// extracted from an OpLoad and composed into the coordinate consumed by an
++/// image sample. This proves interpolation is wired, not merely that a
++/// constant UV is absent.
++fn inputFeedsImageSampleCoordinate(words: []const u32, location: u32) bool {
++    var inputs: [16]u32 = undefined;
++    var ninputs: usize = 0;
++    for (words, 0..) |word, i| {
++        if (word != 0x0004_0047 or i + 3 >= words.len) continue; // OpDecorate
++        if (words[i + 2] != 30 or words[i + 3] != location) continue; // Location
++        const id = words[i + 1];
++        var is_input = false;
++        for (words, 0..) |vword, j| {
++            // OpVariable <type> <id> Input(1): distinguish from Location-0 color output.
++            if (vword == 0x0004_003b and j + 3 < words.len and words[j + 2] == id and words[j + 3] == 1) {
++                is_input = true;
++                break;
++            }
++        }
++        if (is_input and ninputs < inputs.len) {
++            inputs[ninputs] = id;
++            ninputs += 1;
++        }
++    }
++    if (ninputs == 0) return false;
++
++    var loads: [16]u32 = undefined;
++    var nloads: usize = 0;
++    for (words, 0..) |word, i| {
++        if (word != 0x0004_003d or i + 3 >= words.len) continue; // OpLoad
++        for (inputs[0..ninputs]) |input| {
++            if (words[i + 3] == input and nloads < loads.len) {
++                loads[nloads] = words[i + 2];
++                nloads += 1;
++                break;
++            }
++        }
++    }
++
++    var xs: [16]u32 = undefined;
++    var nxs: usize = 0;
++    var ys: [16]u32 = undefined;
++    var nys: usize = 0;
++    for (words, 0..) |word, i| {
++        if (word != 0x0005_0051 or i + 4 >= words.len) continue; // OpCompositeExtract
++        var from_load = false;
++        for (loads[0..nloads]) |load| {
++            if (words[i + 3] == load) {
++                from_load = true;
++                break;
++            }
++        }
++        if (!from_load) continue;
++        if (words[i + 4] == 0 and nxs < xs.len) {
++            xs[nxs] = words[i + 2];
++            nxs += 1;
++        }
++        if (words[i + 4] == 1 and nys < ys.len) {
++            ys[nys] = words[i + 2];
++            nys += 1;
++        }
++    }
++
++    var coordinates: [16]u32 = undefined;
++    var ncoords: usize = 0;
++    for (words, 0..) |word, i| {
++        if (word != 0x0005_0050 or i + 4 >= words.len) continue; // OpCompositeConstruct
++        var has_x = false;
++        var has_y = false;
++        for (xs[0..nxs]) |x| if (words[i + 3] == x) {
++            has_x = true;
++            break;
++        };
++        for (ys[0..nys]) |y| if (words[i + 4] == y) {
++            has_y = true;
++            break;
++        };
++        if (has_x and has_y and ncoords < coordinates.len) {
++            coordinates[ncoords] = words[i + 2];
++            ncoords += 1;
++        }
++    }
++    if (ncoords == 0) return false;
++
++    for (words, 0..) |word, i| {
++        const op = word & 0xffff;
++        if ((op != 87 and op != 88) or i + 4 >= words.len) continue; // image sample
++        for (coordinates[0..ncoords]) |coord| if (words[i + 4] == coord) return true;
++    }
++    return false;
++}
++
+ test "real PS fragment inputs come from VS PARAM exports and VINTRP attrs" {
+     // The embedded arrays are named after the OrbShdr header stage field, but
+     // the runtime classifies by EXP target (ps4_title_stubs.stageFromIsa): the
+     // blob exporting POS0 (0x0c) / PARAM0 (0x20) is the VS, and the blob
+     // exporting MRT0 (0x00) with an image sample is the PS.
+     const program: ProgramPair = .{ .vertex = 0x1000000b88, .pixel = 0x1000000ba4 };
+     registerShaderFor(program, .vertex, &ps_words);
+     registerShaderFor(program, .pixel, &vs_words);
+     const inputs = fragmentInputsFor(program).?;
+     try std.testing.expectEqual(@as(u32, 1), inputs.allocated); // VS PARAM0 -> bit 0
+     try std.testing.expectEqual(inputs.allocated, inputs.enabled);
+     const graphics = translatedGraphicsFor(program) orelse return error.TestExpectedGraphics;
++    // Positive: the VS PARAM0 Input at Location 0 feeds the image-sample UV.
++    try std.testing.expect(inputFeedsImageSampleCoordinate(graphics.fragment_words, 0));
++    // Secondary guard: no two-constant fallback UV.
+     try std.testing.expect(!constantUvOnly(graphics.fragment_words));
+ }
+ 
++test "input-fed UV is PS4-gated: standalone pixel translation has no such Input" {
++    const standalone = try gcn_translate.translateShader(std.testing.allocator, .pixel, &vs_words);
++    defer std.testing.allocator.free(standalone);
++    try std.testing.expect(!inputFeedsImageSampleCoordinate(standalone, 0));
++}
++
+ test "VINTRP attr without a VS PARAM export reports null, never a guessed input" {
+     const program: ProgramPair = .{ .vertex = 0x1000000c88, .pixel = 0x1000000ca4 };
+     const ps_with_vintrp = [_]u32{
+         gcn_decode.vintrp(false, 0, 0, 0), // consumes attr 0
+         gcn_decode.vintrp(true, 1, 0, 0),
+         0xbf81_0000,
+     };
+     registerShaderFor(program, .vertex, &[_]u32{0xbf81_0000}); // no PARAM exports
+     registerShaderFor(program, .pixel, &ps_with_vintrp);
+     try std.testing.expect(fragmentInputsFor(program) == null);
+diff --git a/src/ps4_mode/gcn_translate.zig b/src/ps4_mode/gcn_translate.zig
+index 83827bf..68879d7 100644
+--- a/src/ps4_mode/gcn_translate.zig
++++ b/src/ps4_mode/gcn_translate.zig
+@@ -176,32 +176,36 @@ fn buildOptions(allocator: std.mem.Allocator, stage: Stage, program: *const rdna
+ 
+     // The pixel stage uses the interface derived from the paired VS PARAM
+     // exports and VINTRP attrs. A standalone translation (no registered pair)
+     // keeps the legacy all-inputs default; the writer still infers
+     // parameter_mask/color_export_mask from decoded VINTRP and EXP.
+     // PS4-only: SGPR-backed values are host-updated per draw instead of baked
+     // into OpConstant. Binding 34 is the backend's dedicated dynamic scalar
+     // storage buffer (2 + maximum_storage_images); the fragment stage uses a
+     // disjoint value_base so writeGraphicsScalarValues can fill both stages.
+     const fragment_words_per_stage: u32 = 512 * 16 + 128 * 2;
+-    const inputs = if (stage == .pixel and fragment_inputs != null)
+-        fragment_inputs.?
+-    else
+-        FragmentInputs{ .allocated = 0b11, .enabled = 0b11 };
++    const derived_inputs = if (stage == .pixel) fragment_inputs else null;
++    const inputs = derived_inputs orelse FragmentInputs{ .allocated = 0b11, .enabled = 0b11 };
+     builder.options = .{
+         .stage = if (stage == .vertex) .vertex else .fragment,
+         .sampled_images = builder.images.items,
+         .storage_buffers = builder.buffers.items,
+         .fragment_inputs = .{
+             .allocated = @intCast(inputs.allocated),
+             .enabled = @intCast(inputs.enabled),
+         },
++        // The lowest exported PARAM slot is the guest UV. Only set for a
++        // registered pair with a real VS PARAM export, never on PS5/native.
++        .ps4_sample_coordinate_location = if (derived_inputs != null and inputs.allocated != 0)
++            @intCast(@ctz(inputs.allocated))
++        else
++            null,
+         .scalar_registers = slots,
+         .vertex_corner_vgprs = if (stage == .vertex) .{ 2, 3 } else null,
+         .vertex_position_corner_override = stage == .vertex,
+         .dynamic_scalar_binding = if (slots.len != 0) .{
+             .binding = 2 + rdna2.spirv.maximum_storage_images,
+             .value_base = if (stage == .vertex) 0 else fragment_words_per_stage,
+         } else null,
+         .specialized_scalar_prefix_end = std.math.maxInt(u32),
+     };
+     return builder;
+diff --git a/src/rdna2/spirv.zig b/src/rdna2/spirv.zig
+index 371028a..56068ec 100644
+--- a/src/rdna2/spirv.zig
++++ b/src/rdna2/spirv.zig
+@@ -442,20 +442,25 @@ pub const Options = struct {
+     /// the low word, independently of the host workgroup size.
+     wave32: bool = false,
+     /// HLSL has no direct BallotFindLSB lowering in SPIRV-Cross. Scan the four
+     /// ballot words with ordinary integer instructions while retaining the
+     /// actual subgroup ballot and guest EXEC predicate.
+     scalarize_ballot_first: bool = false,
+     /// Pixel extent used to normalize FragCoord when the paired vertex PARAM
+     /// interface is unavailable. The backend supplies the active color target.
+     fragment_extent: [2]u32 = .{ 1280, 720 },
+     fragment_inputs: FragmentInputs = .{},
++    /// PS4-only: VINTRP ATTR / VS PARAM slot whose interpolated vec4 drives
++    /// 2D image-sample coordinates. The Input is declared at this Location so
++    /// the paired VS PARAM export supplies it; null leaves every native path
++    /// (and normal VINTRP lowering) unchanged.
++    ps4_sample_coordinate_location: ?u8 = null,
+     layered_rendering: bool = false,
+     /// Optional host feature for raw per-vertex attributes and manual VINTRP.
+     allow_fragment_barycentric: bool = false,
+     fragment_custom_interpolation_mask: u32 = 0,
+     /// Inferred only for VINTRP MOV inputs which need more than flat shading.
+     fragment_per_vertex_mask: u32 = 0,
+     /// VGPR populated from Vulkan's VertexIndex system value before a vertex
+     /// shader starts. Other graphics system values remain explicit future
+     /// stage-interface work rather than silently receiving zero.
+     vertex_index_vgpr: ?u8 = null,
+@@ -1126,20 +1131,21 @@ const Builder = struct {
+     fragment_per_vertex_mask: u32 = 0,
+     fragment_custom_interpolation_mask: u32 = 0,
+     fragment_scalar_input_pointer: u32 = 0,
+     barycentric_inputs: [2]u32 = .{ 0, 0 },
+     vertex_parameter_targets: [32]u32 = @splat(0),
+     /// BuiltIn FragCoord (float4) for fragment UV fallback when PARAM interps
+     /// are not yet wired from the vertex stage.
+     frag_coord_input: u32 = 0,
+     front_face_input: u32 = 0,
+     fragment_inputs: FragmentInputs,
++    ps4_sample_coordinate_location: ?u8 = null,
+     storage_bindings: []const StorageBufferBinding,
+     scalar_memory_bindings: []const ScalarMemoryBinding,
+     flat_memory_bindings: []const FlatMemoryBinding,
+     flat_apertures: FlatApertures,
+     bvh_intersection_mode1: bool,
+     snapshot_unbound_reads: bool,
+     flat_memory_headers: std.ArrayList([3]u32) = .empty,
+     snapshot_lookup_helper: bool = false,
+     snapshot_lookup_function: u32 = 0,
+     helper_functions: std.ArrayList(u32) = .empty,
+@@ -1329,20 +1335,21 @@ const Builder = struct {
+             .wave64_workgroup = options.wave64_workgroup or options.wave32_workgroup,
+             .synchronize_wave64_lds = options.wave64_workgroup and
+                 @as(u64, options.local_size[0]) * options.local_size[1] * options.local_size[2] == 64,
+             .wave_exchange_double_buffer = options.wave_exchange_double_buffer,
+             .converged_workgroup_dispatch = (options.wave64_workgroup or options.wave32_workgroup) and
+                 @as(u64, options.local_size[0]) * options.local_size[1] * options.local_size[2] > @as(u32, if (options.wave32) 32 else 64),
+             .wave32 = options.wave32,
+             .scalarize_ballot_first = options.scalarize_ballot_first,
+             .fragment_extent = options.fragment_extent,
+             .fragment_inputs = options.fragment_inputs,
++            .ps4_sample_coordinate_location = options.ps4_sample_coordinate_location,
+             .fragment_quad_broadcasts = options.fragment_quad_broadcasts,
+             .fragment_per_vertex_mask = options.fragment_per_vertex_mask,
+             .fragment_custom_interpolation_mask = options.fragment_custom_interpolation_mask,
+             .fragment_default_values = options.fragment_default_values,
+             .scalar_specializations = options.scalar_registers,
+             .program_address = options.program_address,
+             .dynamic_scalar_binding = options.dynamic_scalar_binding,
+             .zero_unmapped_flat_loads = options.zero_unmapped_flat_loads,
+             .allow_float64 = options.allow_float64,
+             .allow_image_float32_atomic_min_max = options.allow_image_float32_atomic_min_max,
+@@ -7540,20 +7547,38 @@ const Builder = struct {
+                 const coordinate_z = try self.source(try imageAddressOperand(inst, coordinate_base + 2), .float32);
+                 if (image_dimension == .cube) {
+                     coordinates = try self.cubeSampleCoordinates(coordinate_x, coordinate_y, coordinate_z, true);
+                 } else {
+                     try self.emit(&self.body, 80, &.{ try self.ensureFloatVec3(), coordinates, coordinate_x, coordinate_y, coordinate_z });
+                 }
+             } else {
+                 try self.emit(&self.body, 80, &.{ try self.ensureFloatVec2(), coordinates, coordinate_x, coordinate_y });
+             }
+         }
++        // PS4-only: use the interpolated VS PARAM Input as the sample UV rather
++        // than the host-updated scalar address VGPRs. Default-off for natives.
++        if (self.ps4_sample_coordinate_location) |location| {
++            if (self.stage == .fragment and image_dimension == .two_d and
++                !one_dimensional and !one_dimensional_array)
++            {
++                const variable = self.parameter_variables[location];
++                if (variable == 0) return Error.InvalidStageInterface;
++                const vector = self.id();
++                try self.emit(&self.body, 61, &.{ self.vector4_type, vector, variable }); // OpLoad
++                const u = self.id();
++                const v = self.id();
++                try self.emit(&self.body, 81, &.{ self.float_type, u, vector, 0 }); // OpCompositeExtract
++                try self.emit(&self.body, 81, &.{ self.float_type, v, vector, 1 });
++                coordinates = self.id();
++                try self.emit(&self.body, 80, &.{ try self.ensureFloatVec2(), coordinates, u, v }); // OpCompositeConstruct
++            }
++        }
+         const sampled_image = try self.loadSampledImage(binding, inst);
+         if (inst.image_sample_flags.offset) {
+             coordinates = try self.adjustSampleCoordinates(inst, sampled_image, coordinates, binding);
+         }
+         const sampled = self.id();
+         if (compare) {
+             const dref = try self.source(try imageAddressOperand(inst, dref_index), .float32);
+             if (level_zero or explicit_lod) {
+                 const lod = if (explicit_lod)
+                     try self.source(try imageAddressOperand(inst, lod_index), .float32)
+@@ -13939,20 +13964,28 @@ fn translateInstructions(
+     var uses_gds = false;
+     var scans_wave_mask = false;
+     var uses_lds = false;
+     var uses_barrier = false;
+     var uses_wave_permute = false;
+     for (effective.ngg_lds_exports) |ngg_export| {
+         if (effective.stage == .vertex and effective.vertex_parameter_sources.len == 0 and ngg_export.target >= 0x20 and ngg_export.target < 0x40) {
+             effective.parameter_mask |= @as(u32, 1) << @intCast(ngg_export.target - 0x20);
+         }
+     }
++    // PS4 PS with no VINTRP: still declare the VS PARAM slot the backend
++    // identified so the image sample can consume its interpolated value.
++    if (effective.stage == .fragment) {
++        if (effective.ps4_sample_coordinate_location) |location| {
++            if (location >= 32) return Error.InvalidStageInterface;
++            effective.parameter_mask |= @as(u32, 1) << @intCast(location);
++        }
++    }
+     for (instructions) |candidate| {
+         if (effective.stage == .fragment and candidate.opcode == .exp and candidate.export_valid_mask)
+             effective.uses_fragment_valid_mask = true;
+         if (candidate.opcode == .v_readlane_b32) {
+             if (constantWaveLane(candidate.src1)) |lane| cross_half_read = cross_half_read or lane >= 32;
+         }
+         uses_gds = uses_gds or candidate.gds;
+         uses_barrier = uses_barrier or candidate.opcode == .s_barrier;
+         const lane_permute = candidate.opcode == .ds_permute_b32 or candidate.opcode == .ds_bpermute_b32;
+         uses_wave_permute = uses_wave_permute or lane_permute;
