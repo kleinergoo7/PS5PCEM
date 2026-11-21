@@ -352,7 +352,7 @@ pub const jpegdec_exports = [_]symbols.Export{
     .{ .name = "sceJpegDecParseHeader", .function = trace.wrap("sceJpegDecParseHeader", &services.accept), .expect_id = "LSinoSQH790" },
     .{ .name = "sceJpegDecQueryMemorySize", .function = trace.wrap("sceJpegDecQueryMemorySize", &services.accept), .expect_id = "uNAUmANZMEw" },
     .{ .name = "sceJpegDecCreate", .function = trace.wrap("sceJpegDecCreate", &services.accept), .expect_id = "JPh3Zgg0Zwc" },
-    .{ .name = "sceJpegDecDecode", .function = trace.wrap("sceJpegDecDecode", &services.absent), .expect_id = "1kzQRoWEgSA" },
+    .{ .name = "sceJpegDecDecode", .function = trace.wrap("sceJpegDecDecode", &services.accept), .expect_id = "1kzQRoWEgSA" },
     .{ .name = "sceJpegDecDelete", .function = trace.wrap("sceJpegDecDelete", &services.accept), .expect_id = "Hwh11+m5KoI" },
 };
 

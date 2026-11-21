@@ -2852,6 +2852,63 @@ test "tile and detile round trip every supported 2D swizzle family and element s
     }
 }
 
+test "standard 64kb detiles odd-sized 4bpp textures from image descriptor" {
+    const allocator = std.testing.allocator;
+    const cases = [_][2]u32{ .{ 67, 9 }, .{ 1937, 333 } };
+    for (cases) |dim| {
+        const layout = try Layout.init(.{
+            .tile_mode = .standard_64kb,
+            .width = dim[0],
+            .height = dim[1],
+            .layers = 1,
+        }, 4);
+        const linear = try allocator.alloc(u8, @intCast(layout.staging_bytes));
+        defer allocator.free(linear);
+        const tiled = try allocator.alloc(u8, @intCast(layout.required_source_bytes));
+        defer allocator.free(tiled);
+        const actual = try allocator.alloc(u8, linear.len);
+        defer allocator.free(actual);
+
+        for (linear, 0..) |*byte, index| byte.* = @truncate(index *% 251 +% 17);
+        @memset(tiled, 0);
+        try layout.tile(linear, tiled);
+        var tiled_nz: usize = 0;
+        for (tiled) |b| {
+            if (b != 0) { tiled_nz += 1; break; }
+        }
+        try testing.expect(tiled_nz != 0);
+        @memset(actual, 0);
+        try layout.detile(tiled, actual);
+        try testing.expectEqualSlices(u8, linear, actual);
+
+        // via fromImage, various pitches
+        const pitches = [_]u32{ 0, dim[0], 64, 128, 256, 512 };
+        for (pitches) |pitch| {
+            var image = std.mem.zeroInit(resources.ImageDescriptor, .{ .image_type = .color_2d });
+            image.address = 0x1000000000;
+            image.width = dim[0];
+            image.height = dim[1];
+            image.depth_or_layers = 1;
+            image.pitch = pitch;
+            image.unified_format = 56;
+            image.tile_mode = .standard_64kb;
+            image.last_level = 0;
+            image.max_mip = 0;
+            const tl = TextureLayout.fromImage(image) catch continue;
+            const view = tl.base() catch continue;
+            const t2 = try allocator.alloc(u8, @intCast(view.required_source_bytes));
+            defer allocator.free(t2);
+            const a2 = try allocator.alloc(u8, @intCast(view.stagingBytes() catch continue));
+            defer allocator.free(a2);
+            @memset(t2, 0);
+            view.tile(linear[0..@intCast(view.stagingBytes() catch continue)], t2) catch continue;
+            @memset(a2, 0);
+            view.detile(t2, a2) catch continue;
+            try testing.expectEqualSlices(u8, linear[0..a2.len], a2);
+        }
+    }
+}
+
 test "optimized tile and detile preserve partial pitched blocks and slice offsets" {
     const layout = try Layout.init(.{
         .tile_mode = .standard_4kb,

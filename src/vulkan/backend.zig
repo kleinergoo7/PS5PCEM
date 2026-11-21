@@ -35649,8 +35649,6 @@ pub const Renderer = struct {
                 break :fallback null;
             }) |gpu_linear| {
                 if (self.direct_detile_uploads and !log_verbose_gpu) {
-                    // The detiler emits the packed mip ranges consumed by
-                    // BufferImageCopy. Keep that result on the GPU.
                     detiled_upload = gpu_linear;
                     self.direct_detile_upload_count +|= 1;
                 } else {
@@ -35774,7 +35772,7 @@ pub const Renderer = struct {
                 }
             }
         }
-        if (detiled_upload == null and native_clear == null and (log_verbose_gpu or self.texture_cache_misses <= 4)) std.debug.print(
+        if (detiled_upload == null and native_clear == null and self.texture_cache_misses <= 12) std.debug.print(
             "[vulkan dcb] staged sample {d}x{d}x{d} tile={f} addr=0x{x} mips={d} base={d} nonzero_texels={d}/{d} raw_probe_nz={d} hits={d} first_rgba=({d},{d},{d},{d})\n",
             .{
                 descriptor.width,
@@ -39729,6 +39727,8 @@ pub const Renderer = struct {
     fn latestAliasedDisplayTarget(self: *Renderer, buffer: DisplayBuffer) ?usize {
         var selected: ?usize = null;
         var selected_sequence: u64 = 0;
+        var selected_written: ?usize = null;
+        var selected_written_sequence: u64 = 0;
         for (self.render_targets.items, 0..) |target, index| {
             if (!target.initialized or
                 target.target.descriptor.address == buffer.address or
@@ -39742,8 +39742,14 @@ pub const Renderer = struct {
                 selected = index;
                 selected_sequence = target.last_used_sequence;
             }
+            if (target.gpu_generation != 0 or target.content_generation != 0) {
+                if (selected_written == null or target.last_used_sequence > selected_written_sequence) {
+                    selected_written = index;
+                    selected_written_sequence = target.last_used_sequence;
+                }
+            }
         }
-        return selected;
+        return selected_written orelse selected;
     }
 
     /// Flip of `0x5000860000` has both an RGBA8 G-buffer MRT and an A2B10
@@ -40847,11 +40853,34 @@ pub const Renderer = struct {
                 self.flip_callbacks > 8 and
                 !shouldDumpProgressFrame(self.flip_callbacks, self.capture_extended_progress_frames))
             {
-                if (self.latestPresentableTargetAtAddress(
+                var present_index = self.latestPresentableTargetAtAddress(
                     requested.?.address,
                     requested.?.width,
                     requested.?.height,
-                )) |target_index| {
+                );
+                if (present_index) |idx| {
+                    const t = self.render_targets.items[idx];
+                    if (t.gpu_generation == 0 and t.content_generation == 0) {
+                        if (self.latestAliasedDisplayTarget(requested.?)) |alias| {
+                            present_index = alias;
+                        }
+                    } else if (t.target.descriptor.address == requested.?.address) {
+                        if (self.latestAliasedDisplayTarget(requested.?)) |alias| {
+                            const a = self.render_targets.items[alias];
+                            // The scanout VA can name an initialized-but-unused alias
+                            // while the title renders to a different VA. Prefer the
+                            // target with substantially more GPU write activity.
+                            if (a.gpu_generation > t.gpu_generation or
+                                (a.gpu_generation == t.gpu_generation and a.last_used_sequence > t.last_used_sequence))
+                            {
+                                present_index = alias;
+                            }
+                        }
+                    }
+                } else {
+                    present_index = self.latestAliasedDisplayTarget(requested.?);
+                }
+                if (present_index) |target_index| {
                     const presented = self.presentWindowRenderTarget(target_index, flip) catch |err| {
                         self.last_flip_error = err;
                         return false;

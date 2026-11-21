@@ -2309,23 +2309,45 @@ fn saveDataDirNameSearch(_: u64, result_address: u64) callconv(abi.guest) i32 {
 
 /// PS4-compat directory search. Report no PS4 saves found so the title proceeds
 /// with PS5/native save data paths.
-fn saveDataDirNameSearchPs4(_: u64, _: u64, _: u64, _: u64, _: u64, _: u64) callconv(abi.guest) i32 {
+fn saveDataDirNameSearchPs4(a0: u64, a1: u64, _: u64, _: u64, _: u64, _: u64) callconv(abi.guest) i32 {
     std.log.warn("STUB: sceSaveDataDirNameSearchPs4 reporting no PS4 saves", .{});
-    // Best-effort: if arg1 looks like a DirNameSearch-style result, zero hit counts.
-    // Signature varies; returning OK is the minimal path to unblock boot.
+    _ = a0;
+    // PS4/PS5 dir-name search takes (condition, result). Clear the result only.
+    if (a1 != 0 and kernel_memory.isGuestRangeAccessible(a1, @sizeOf(SaveDataDirNameSearchResult))) {
+        const result: *SaveDataDirNameSearchResult = @ptrFromInt(a1);
+        result.hit_count = 0;
+        result.set_count = 0;
+    }
     return errno.ok;
 }
 
-fn saveDataGetMountInfo(_: u64, info_address: u64, _: u64, _: u64, _: u64, _: u64) callconv(abi.guest) i32 {
-    // Minimal: report OK and zero/fill plausible mount info if the output looks writable.
-    // The exact SceSaveDataMountInfo layout is SDK-version dependent; zeroing the
-    // caller-provided buffer (when size hints are absent) is safer than guessing.
-    // Minecraft passes (mount, info, 0x11/0x1, 0x1, 0, 0); try a conservative clear.
-    if (info_address != 0 and kernel_memory.isGuestRangeAccessible(info_address, 64)) {
+const SaveDataMountInfoCompat = extern struct {
+    blocks: u64 = 0,
+    free_blocks: u64 = 0,
+    mount_status: u32 = 2,
+    reserved0: u32 = 0,
+    mount_point: [16]u8 = [_]u8{0} ** 16,
+    reserved1: [32]u8 = [_]u8{0} ** 32,
+};
+
+fn saveDataGetMountInfo(mount_point_addr: u64, info_address: u64, _: u64, _: u64, _: u64, _: u64) callconv(abi.guest) i32 {
+    // Minimal implementation with a conservative mount info layout. Minecraft
+    // queries mount info after a successful mount; returning ENOSYS caused it
+    // to abort.
+    _ = mount_point_addr;
+    if (info_address == 0) return invalid_argument;
+    if (kernel_memory.isGuestRangeAccessible(info_address, @sizeOf(SaveDataMountInfoCompat))) {
+        const info: *SaveDataMountInfoCompat = @ptrFromInt(info_address);
+        info.* = .{};
+        info.blocks = 0x10000;
+        info.free_blocks = 0x10000;
+        info.mount_status = 2;
+        @memcpy(info.mount_point[0.."/savedata0".len], "/savedata0");
+        return errno.ok;
+    }
+    if (kernel_memory.isGuestRangeAccessible(info_address, 64)) {
         const out: [*]u8 = @ptrFromInt(info_address);
         @memset(out[0..64], 0);
-        // Common layout starts with blocks; set mount status/present hints in the
-        // region games often inspect. Keep it non-fatal if layout differs.
         @memcpy(out[0.."/savedata0".len], "/savedata0");
     }
     return errno.ok;
