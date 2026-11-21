@@ -73,20 +73,6 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    // Experimental PS4 (GNM/GCN) compatibility mode. Dependency-free (std
-    // only) by design: detection, param.sfo parsing, shader-header decode,
-    // packet translation, tiling math, the HLE compat table and the session
-    // live here so they compile and test in isolation. See src/ps4_mode/ and
-    // docs/ps4-mode.md for the integration points into loader/hle/gpu.
-    const ps4_mode = b.addModule("ps4_mode", .{
-        .root_source_file = b.path("src/ps4_mode/root.zig"),
-        .target = target,
-        .optimize = optimize,
-        // The GCN→SPIR-V translator reuses the shared rdna2 writer; the rest
-        // of ps4_mode remains std-only.
-        .imports = &.{.{ .name = "rdna2", .module = mod }},
-    });
-
     // Host renderer foundation. Vulkan is loaded dynamically at runtime, so
     // compiling the emulator does not require SDK headers or loader libraries.
     const vulkan = b.addModule("vulkan", .{
@@ -97,7 +83,6 @@ pub fn build(b: *std.Build) void {
             .{ .name = "gpu", .module = gpu },
             .{ .name = "rdna2", .module = mod },
             .{ .name = "renderdoc", .module = renderdoc },
-            .{ .name = "ps4_mode", .module = ps4_mode },
         },
     });
 
@@ -188,6 +173,17 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .imports = &.{.{ .name = "p2z", .module = p2z }},
+    });
+
+    // Experimental PS4 (GNM/GCN) compatibility mode. Dependency-free (std
+    // only) by design: detection, param.sfo parsing, shader-header decode,
+    // packet translation, tiling math, the HLE compat table and the session
+    // live here so they compile and test in isolation. See src/ps4_mode/ and
+    // docs/ps4-mode.md for the integration points into loader/hle/gpu.
+    const ps4_mode = b.addModule("ps4_mode", .{
+        .root_source_file = b.path("src/ps4_mode/root.zig"),
+        .target = target,
+        .optimize = optimize,
     });
 
     // Firmware emulation: identifier derivation, the symbol registry, and the
