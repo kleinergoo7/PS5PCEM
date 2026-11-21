@@ -142,20 +142,3 @@ No PPM size or pixel summary exists: the file was never written. I did not
 modify `src/gpu/**`, shared HLE implementations, or any PS5 path; no PS4
 boundary file was changed either, because the diagnosis found no PS4 import
 in the failing path to fix. The branch is left unchanged at `542b940`.
-
-## Round 3 — libc shim landed, new wall: empty equeue wait
-
-The PS4-keyed libc I/O exports (committed `1f631bb` + gating `a0bf6ad`) remove
-the null-FILE* fault entirely: 0 guest faults, content loads, and the title now
-submits 3 DCBs (546/283/352 words) through the shared AGC executor.
-
-New measured wall: the guest parks in `sceKernelWaitEqueue(handle=1)` with
-**zero registered events** (temporary diagnostic showed one `createEqueue` and
-`active_regs=0 flip_regs=0`). It called `sceVideoOutOpen(0xff,...) = 1` and
-`sceVideoOutSetFlipRate(1,0)`, but never `sceVideoOutAddFlipEvent`, never
-`sceGnmAddEqEvent`, never a user-event add. All DCBs contain no draws
-(`ignored=1: 0x47`) and `[agc completion] labels=0`. So the wait has no
-producer: the title is blocked on an event it never registered (likely an
-initialization path that expects a driver call we still stub out).
-
-Diagnostics were fully reverted; branch is clean at `a0bf6ad`.
